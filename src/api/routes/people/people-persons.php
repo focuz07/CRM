@@ -1,0 +1,609 @@
+<?php
+
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\model\ChurchCRM\FamilyQuery;
+use ChurchCRM\model\ChurchCRM\ListOptionQuery;
+use ChurchCRM\model\ChurchCRM\Map\PersonTableMap;
+use ChurchCRM\model\ChurchCRM\Person;
+use ChurchCRM\model\ChurchCRM\PersonQuery;
+use ChurchCRM\Service\PersonService;
+use ChurchCRM\Slim\Middleware\Request\Auth\EditRecordsRoleAuthMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Auth\EmailRoleAuthMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\DateTimeUtils;
+use ChurchCRM\Utils\MiscUtils;
+use Propel\Runtime\ActiveQuery\Criteria;
+use Propel\Runtime\Collection\Collection;
+use Propel\Runtime\Propel;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+
+$app->group('/persons', function (RouteCollectorProxy $group): void {
+    $group->get('/roles', 'getAllRolesAPI');
+    $group->get('/roles/', 'getAllRolesAPI');
+    $group->get('/duplicate/emails', 'getEmailDupesAPI')->add(new EditRecordsRoleAuthMiddleware());
+
+    /**
+     * @OA\Get(
+     *     path="/persons/email/without",
+     *     summary="Get people with no personal or work email on record",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="People without any email address",
+     *         @OA\JsonContent(
+     *             @OA\Property(property="count", type="integer"),
+     *             @OA\Property(property="persons", type="array", @OA\Items(type="object"))
+     *         )
+     *     )
+     * )
+     */
+    $group->get('/email/without', function (Request $request, Response $response, array $args): Response {
+        // Pre-load list options to avoid N+1 queries
+        $roleOptions = ListOptionQuery::create()->filterById(2)->find()->toKeyValue('OptionId', 'OptionName');
+        $classificationOptions = ListOptionQuery::create()->filterById(1)->find()->toKeyValue('OptionId', 'OptionName');
+
+        $persons = PersonQuery::create()
+            ->leftJoinWithFamily()
+            ->where('(per_Email IS NULL OR per_Email = "") AND (per_WorkEmail IS NULL OR per_WorkEmail = "")')
+            ->where('Family.DateDeactivated IS NULL')
+            ->filterByLiving()
+            ->find();
+
+        $result = [];
+        foreach ($persons as $person) {
+            $family = $person->getFamily();
+            $age = $person->getNumericAge();
+            $fmrId = $person->getFmrId();
+            $clsId = $person->getClsId();
+            $roleName = $roleOptions[$fmrId] ?? 'Unassigned';
+            $isChild = (stripos($roleName, 'child') !== false) || ($age !== null && $age < 18);
+
+            $result[] = [
+                'Id'             => $person->getId(),
+                'FullName'       => $person->getFullName(),
+                'FamilyId'       => $family ? $family->getId() : null,
+                'FamilyName'     => $family ? $family->getName() : '',
+                'FamilyRole'     => $roleName,
+                'Classification' => $classificationOptions[$clsId] ?? 'Unassigned',
+                'Age'            => $age,
+                'IsChild'        => $isChild,
+            ];
+        }
+
+        return SlimUtils::renderJSON($response, ['count' => count($result), 'persons' => $result]);
+    });
+
+    $group->get('/latest', 'getLatestPersons');
+    $group->get('/updated', 'getUpdatedPersons');
+    $group->get('/birthday', 'getPersonsWithBirthdays');
+
+    /**
+     * @OA\Get(
+     *     path="/persons/search/{query}",
+     *     operationId="searchPersons",
+     *     summary="Search persons by name or email",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="query", in="path", required=true, description="Search term (name or email)", @OA\Schema(type="string", example="John")),
+     *     @OA\Response(response=200, description="Array of matching persons (max 15)",
+     *         @OA\JsonContent(type="array", @OA\Items(type="object",
+     *             @OA\Property(property="id", type="integer"),
+     *             @OA\Property(property="objid", type="integer"),
+     *             @OA\Property(property="text", type="string", example="John Smith"),
+     *             @OA\Property(property="uri", type="string", example="/people/view/42")
+     *         ))
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized")
+     * )
+     */
+    // search person by Name
+    $group->get('/search/{query}', function (Request $request, Response $response, array $args): Response {
+        $query = $args['query'];
+
+        $searchLikeString = '%' . $query . '%';
+        $people = PersonQuery::create()->
+        filterByFirstName($searchLikeString, Criteria::LIKE)->
+        _or()->filterByMiddleName($searchLikeString, Criteria::LIKE)->
+        _or()->filterByLastName($searchLikeString, Criteria::LIKE)->
+        _or()->filterByEmail($searchLikeString, Criteria::LIKE)->
+        filterByLiving()->
+        limit(15)->find();
+
+        $id = 1;
+
+        $return = [];
+        foreach ($people as $person) {
+            $values['id'] = $id++;
+            $values['objid'] = $person->getId();
+            $values['text'] = $person->getFullName();
+            $values['uri'] = $person->getViewURI();
+
+            $return[] = $values;
+        }
+
+        return SlimUtils::renderJSON($response, $return);
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/persons/self-register",
+     *     operationId="getSelfRegisteredPersons",
+     *     summary="List recently self-registered persons still awaiting review",
+     *     description="Returns self-registered persons still awaiting review who are not part of a self-registered family, newest first: individuals from the public form, and people proposed for an existing family in the Member Portal (with FamilyName set).",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="List of self-registered persons",
+     *         @OA\JsonContent(type="object",
+     *             @OA\Property(property="people", type="array", @OA\Items(type="object"))
+     *         )
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized")
+     * )
+     */
+    $group->get('/self-register', function (Request $request, Response $response, array $args): Response {
+        $people = PersonService::selfRegisteredPersonQuery()
+            ->filterByNeedsReview(true)
+            ->orderByDateEntered(Criteria::DESC)
+            ->find();
+
+        $rows = [];
+        foreach ($people as $person) {
+            $family = $person->getFamily();
+            $rows[] = array_merge($person->toArray(), [
+                // Set for someone proposed for an existing family, so staff see
+                // which family they are about to add them to.
+                'FamilyName' => $family === null ? '' : (string) $family->getName(),
+            ]);
+        }
+
+        return SlimUtils::renderJSON($response, ['people' => $rows]);
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/persons/self-register/count",
+     *     summary="Count self-registered families and people reviewed on their own that await review",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="Pending count",
+     *         @OA\JsonContent(@OA\Property(property="count", type="integer"))
+     *     )
+     * )
+     */
+    $group->get('/self-register/count', function (Request $request, Response $response, array $args): Response {
+        $tally = fn (bool $needsReview): int => FamilyQuery::create()->filterByEnteredBy(Person::SELF_REGISTER)->filterByNeedsReview($needsReview)->count()
+            + PersonService::selfRegisteredPersonQuery()->filterByNeedsReview($needsReview)->count();
+        $pending = $tally(true);
+        $approved = $tally(false);
+
+        return SlimUtils::renderJSON($response, ['count' => $pending, 'approved' => $approved, 'total' => $pending + $approved]);
+    });
+
+    /**
+     * @OA\Post(
+     *     path="/persons/self-register/approve",
+     *     summary="Approve several self-registered families and people at once",
+     *     description="Clears the needs-review flag on the listed self-registered families (and their members) and people reviewed on their own (not part of a self-registered family). Ids that are not pending self-registrations are ignored.",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\RequestBody(required=true, @OA\JsonContent(
+     *         @OA\Property(property="families", type="array", @OA\Items(type="integer")),
+     *         @OA\Property(property="persons", type="array", @OA\Items(type="integer"))
+     *     )),
+     *     @OA\Response(response=200, description="Approved",
+     *         @OA\JsonContent(@OA\Property(property="success", type="boolean"), @OA\Property(property="approved", type="integer"))
+     *     ),
+     *     @OA\Response(response=403, description="EditRecords permission required")
+     * )
+     */
+    $group->post('/self-register/approve', function (Request $request, Response $response, array $args): Response {
+        $body = $request->getParsedBody() ?? [];
+        $familyIds = array_values(array_filter(array_map('intval', (array) ($body['families'] ?? []))));
+        $personIds = array_values(array_filter(array_map('intval', (array) ($body['persons'] ?? []))));
+
+        $con = Propel::getWriteConnection(PersonTableMap::DATABASE_NAME);
+        $con->beginTransaction();
+        try {
+            $approved = 0;
+            if ($familyIds) {
+                $pendingFamilyIds = FamilyQuery::create()
+                    ->filterById($familyIds, Criteria::IN)
+                    ->filterByEnteredBy(Person::SELF_REGISTER)
+                    ->filterByNeedsReview(true)
+                    ->select('Id')
+                    ->find($con)
+                    ->toArray();
+                if ($pendingFamilyIds) {
+                    $approved += FamilyQuery::create()->filterById($pendingFamilyIds, Criteria::IN)->update(['NeedsReview' => false], $con);
+                    PersonQuery::create()->filterByFamId($pendingFamilyIds, Criteria::IN)->update(['NeedsReview' => false], $con);
+                }
+            }
+            if ($personIds) {
+                $approved += PersonService::selfRegisteredPersonQuery()
+                    ->filterById($personIds, Criteria::IN)
+                    ->filterByNeedsReview(true)
+                    ->update(['NeedsReview' => false], $con);
+            }
+            $con->commit();
+        } catch (\Throwable $e) {
+            $con->rollBack();
+
+            return SlimUtils::renderErrorJSON($response, gettext('Could not approve the selected registrations'), [], 500, $e, $request);
+        }
+
+        return SlimUtils::renderJSON($response, ['success' => true, 'approved' => $approved]);
+    })->add(new EditRecordsRoleAuthMiddleware());
+});
+
+/**
+ * @OA\Get(
+ *     path="/persons/roles",
+ *     operationId="getAllRoles",
+ *     summary="List all family roles",
+ *     description="Returns all family role options (e.g. Head of Household, Spouse, Child) used when registering persons.",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Array of role objects",
+ *         @OA\JsonContent(type="array", @OA\Items(type="object",
+ *             @OA\Property(property="OptionId", type="integer", example=1),
+ *             @OA\Property(property="OptionName", type="string", example="Head of Household")
+ *         ))
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ */
+function getAllRolesAPI(Request $request, Response $response, array $args): Response
+{
+    $roles = ListOptionQuery::create()->getFamilyRoles();
+
+    return SlimUtils::renderJSON($response, $roles->toArray());
+}
+
+/**
+ * @OA\Get(
+ *     path="/persons/duplicate/emails",
+ *     operationId="getEmailDuplicates",
+ *     summary="Find personal email addresses shared by more than one person",
+ *     description="Compared trimmed and in lower case. Lists the people sharing each address and their families.",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Personal emails used by more than one person",
+ *         @OA\JsonContent(type="object",
+ *             @OA\Property(property="emails", type="array", @OA\Items(type="object",
+ *                 @OA\Property(property="email", type="string", format="email"),
+ *                 @OA\Property(property="people", type="array", @OA\Items(type="object",
+ *                     @OA\Property(property="id", type="integer"),
+ *                     @OA\Property(property="name", type="string")
+ *                 )),
+ *                 @OA\Property(property="families", type="array", @OA\Items(type="object",
+ *                     @OA\Property(property="id", type="integer"),
+ *                     @OA\Property(property="name", type="string")
+ *                 ))
+ *             ))
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ */
+function getEmailDupesAPI(Request $request, Response $response, array $args): Response
+{
+    $emailKey = 'LOWER(TRIM(' . PersonTableMap::COL_PER_EMAIL . '))';
+    $shared = PersonQuery::create()
+        ->withColumn($emailKey, 'EmailKey')
+        ->withColumn('GROUP_CONCAT(' . PersonTableMap::COL_PER_ID . ' ORDER BY ' . PersonTableMap::COL_PER_ID . ')', 'Ids')
+        ->withColumn('MIN(' . PersonTableMap::COL_PER_ID . ')', 'FirstId')
+        ->withColumn('COUNT(*)', 'Sharers')
+        ->where($emailKey . " <> ''")
+        ->groupBy('EmailKey')
+        ->having('Sharers > ?', 1, \PDO::PARAM_INT)
+        ->orderBy('FirstId')
+        ->select(['EmailKey', 'Ids'])
+        ->find();
+
+    $idsByEmail = [];
+    foreach ($shared as $row) {
+        $idsByEmail[$row['EmailKey']] = array_map('intval', explode(',', $row['Ids']));
+    }
+
+    $people = [];
+    if ($idsByEmail !== []) {
+        foreach (PersonQuery::create()->filterById(array_merge(...array_values($idsByEmail)), Criteria::IN)->find() as $person) {
+            $people[(int) $person->getId()] = $person;
+        }
+    }
+
+    $emails = [];
+    foreach ($idsByEmail as $email => $ids) {
+        $sharers = [];
+        $families = [];
+        foreach ($ids as $id) {
+            $person = $people[$id];
+            $sharers[] = ['id' => $id, 'name' => $person->getFullName()];
+            $family = $person->getFamily();
+            if ($family !== null) {
+                $families[(int) $family->getId()] = ['id' => (int) $family->getId(), 'name' => $family->getName()];
+            }
+        }
+        $emails[] = [
+            'email' => $email,
+            'people' => $sharers,
+            'families' => array_values($families),
+        ];
+    }
+
+    return SlimUtils::renderJSON($response, ['emails' => $emails]);
+}
+
+/**
+ * @OA\Get(
+ *     path="/persons/latest",
+ *     operationId="getLatestPersons",
+ *     summary="List the 10 most recently added persons",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Recent persons with family info",
+ *         @OA\JsonContent(type="object",
+ *             @OA\Property(property="people", type="array", @OA\Items(type="object",
+ *                 @OA\Property(property="PersonId", type="integer"),
+ *                 @OA\Property(property="FirstName", type="string"),
+ *                 @OA\Property(property="LastName", type="string"),
+ *                 @OA\Property(property="Email", type="string"),
+ *                 @OA\Property(property="FamilyId", type="integer", nullable=true),
+ *                 @OA\Property(property="Created", type="string", format="date-time")
+ *             ))
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ */
+function getLatestPersons(Request $request, Response $response, array $args): Response
+{
+    $people = PersonQuery::create()
+        ->leftJoinWithFamily()
+        ->orderByDateEntered('DESC')
+        ->limit(10)
+        ->find();
+
+    return SlimUtils::renderJSON($response, buildFormattedPersonList($people));
+}
+
+/**
+ * @OA\Get(
+ *     path="/persons/updated",
+ *     operationId="getUpdatedPersons",
+ *     summary="List the 10 most recently edited persons",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Recently updated persons",
+ *         @OA\JsonContent(type="object",
+ *             @OA\Property(property="people", type="array", @OA\Items(type="object",
+ *                 @OA\Property(property="PersonId", type="integer"),
+ *                 @OA\Property(property="FirstName", type="string"),
+ *                 @OA\Property(property="LastName", type="string"),
+ *                 @OA\Property(property="LastEdited", type="string", format="date-time")
+ *             ))
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ */
+function getUpdatedPersons(Request $request, Response $response, array $args): Response
+{
+    $people = PersonQuery::create()
+        ->leftJoinWithFamily()
+        ->orderByDateLastEdited('DESC')
+        ->limit(10)
+        ->find();
+
+    return SlimUtils::renderJSON($response, buildFormattedPersonList($people));
+}
+
+/**
+ * @OA\Get(
+ *     path="/persons/birthday",
+ *     operationId="getPersonsWithBirthdays",
+ *     summary="List persons with birthdays in a ±7-day window around today",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Persons with upcoming or recent birthdays, sorted by days until birthday",
+ *         @OA\JsonContent(type="object",
+ *             @OA\Property(property="people", type="array", @OA\Items(type="object",
+ *                 @OA\Property(property="PersonId", type="integer"),
+ *                 @OA\Property(property="FirstName", type="string"),
+ *                 @OA\Property(property="LastName", type="string"),
+ *                 @OA\Property(property="Age", type="integer", nullable=true),
+ *                 @OA\Property(property="DaysUntil", type="integer", description="Negative = past, 0 = today, positive = upcoming"),
+ *                 @OA\Property(property="Birthday", type="string", example="March 15")
+ *             ))
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ */
+function getPersonsWithBirthdays(Request $request, Response $response, array $args): Response
+{
+    // Get birthdays for 14-day range: 7 days before to 7 days after today
+    // Use start of today (midnight) to ensure day-boundary comparisons are accurate
+    $today = DateTimeUtils::getStartOfToday();
+    $dates = [];
+    
+    for ($i = -7; $i <= 7; $i++) {
+        $date = (clone $today)->modify("{$i} days");
+        $dates[] = [
+            'month' => (int)$date->format('m'),
+            'day' => (int)$date->format('d'),
+            'offset' => $i,
+        ];
+    }
+    
+    // Build query for all dates in range
+    $people = PersonQuery::create()
+        ->leftJoinWithFamily()
+        ->where('Family.DateDeactivated is null')
+        ->filterByBirthDay(null, Criteria::NOT_EQUAL)
+        ->filterByBirthMonth(null, Criteria::NOT_EQUAL);
+    
+    // Add conditions for each day in range
+    $conditions = [];
+    foreach ($dates as $idx => $dateInfo) {
+        $condName = 'date' . $idx;
+        $people->condition(
+            $condName . '_month',
+            'Person.BirthMonth = ?',
+            $dateInfo['month']
+        );
+        $people->condition(
+            $condName . '_day', 
+            'Person.BirthDay = ?',
+            $dateInfo['day']
+        );
+        $people->combine(
+            [$condName . '_month', $condName . '_day'],
+            'and',
+            $condName
+        );
+        $conditions[] = $condName;
+    }
+    $people->where($conditions, 'or');
+    
+    $results = $people->find();
+    
+    // Build list with age and days until birthday for sorting
+    $formattedList = [];
+    $thisYear = (int) $today->format('Y');
+    
+    foreach ($results as $person) {
+        $formattedPerson = [];
+        $formattedPerson['PersonId'] = $person->getId();
+        $formattedPerson['FirstName'] = $person->getFirstName();
+        $formattedPerson['LastName'] = $person->getLastName();
+        $formattedPerson['FormattedName'] = $person->getFullName();
+        $formattedPerson['HasPhoto'] = $person->getPhoto()->hasUploadedPhoto();
+        
+        // Calculate days until birthday this year (for sorting)
+        $birthMonth = $person->getBirthMonth();
+        $birthDay = $person->getBirthDay();
+        $birthdayThisYear = DateTimeUtils::createDateTime("{$thisYear}-{$birthMonth}-{$birthDay}");
+        $diff = (int) $today->diff($birthdayThisYear)->format('%r%a');
+        
+        // If birthday already passed this year (more than 7 days ago), calculate next year's birthday
+        if ($diff < -7) {
+            $birthdayNextYear = DateTimeUtils::createDateTime(($thisYear + 1) . "-{$birthMonth}-{$birthDay}");
+            $diff = (int) $today->diff($birthdayNextYear)->format('%r%a');
+        }
+        
+        $formattedPerson['DaysUntil'] = $diff;
+
+        // Get age (respects hideAge setting)
+        // Age is the localized long string ("66 years old" / "6 months old"),
+        // kept for back-compat. NumericAge + AgeUnit are the machine-readable
+        // pair the dashboard uses for compact, plural-aware rendering — they
+        // correctly handle infants (months) and singular/plural in any locale.
+        $formattedPerson['Age'] = $person->getAge();
+        $birthDateForAge = $person->getBirthDate();
+        if ($birthDateForAge instanceof \DateTimeImmutable && !$person->hideAge()) {
+            $ageDiff = MiscUtils::ageOn($birthDateForAge, new \DateTimeImmutable('today'));
+            if ($ageDiff !== null && $ageDiff->y < 1) {
+                $formattedPerson['NumericAge'] = $ageDiff->m;
+                $formattedPerson['AgeUnit']    = 'month';
+            } elseif ($ageDiff !== null) {
+                $formattedPerson['NumericAge'] = $ageDiff->y;
+                $formattedPerson['AgeUnit']    = 'year';
+            }
+        }
+
+        // Birthday date for display
+        if ($person->getBirthDate()) {
+            $formattedPerson['Birthday'] = date_format(
+                $person->getBirthDate(),
+                $person->hideAge() ?
+                    SystemConfig::getValue('sDateFormatNoYear') :
+                    SystemConfig::getValue('sDateFormatLong')
+            );
+            $formattedPerson['BirthMonth'] = $birthMonth;
+            $formattedPerson['BirthDay'] = $birthDay;
+        }
+        
+        $formattedList[] = $formattedPerson;
+    }
+    
+    // Sort by days until birthday (ascending: today first, then upcoming, then recent past at end)
+    usort($formattedList, function ($a, $b) {
+        return $a['DaysUntil'] <=> $b['DaysUntil'];
+    });
+    
+    return SlimUtils::renderJSON($response, ['people' => $formattedList]);
+}
+
+function buildFormattedPersonList(Collection $people): array
+{
+    $formattedList = [];
+
+    /** @var Person $person */
+    foreach ($people as $person) {
+        $formattedPerson = [];
+        $formattedPerson['PersonId'] = $person->getId();
+        $formattedPerson['FirstName'] = $person->getFirstName();
+        $formattedPerson['LastName'] = $person->getLastName();
+        $formattedPerson['FormattedName'] = $person->getFullName();
+        $formattedPerson['Email'] = $person->getEmail();
+        $formattedPerson['HasPhoto'] = $person->getPhoto()->hasUploadedPhoto();
+        
+        // Add family information
+        $family = $person->getFamily();
+        if ($family !== null) {
+            $formattedPerson['FamilyId'] = $family->getId();
+            $formattedPerson['FamilyName'] = $family->getName();
+            // Include family status so dashboard can render inactive badges next to family links
+            $formattedPerson['FamilyIsActive'] = $family->isActive();
+            $formattedPerson['FamilyStatusText'] = $family->getStatusText();
+        } else {
+            $formattedPerson['FamilyId'] = null;
+            $formattedPerson['FamilyName'] = null;
+        }
+        
+        $formattedPerson['Created'] = $person->getDateEntered() ? $person->getDateEntered()->format('c') : null; // ISO 8601
+        $formattedPerson['LastEdited'] = $person->getDateLastEdited() ? $person->getDateLastEdited()->format('c') : null; // ISO 8601
+        $formattedPerson['Birthday'] = $person->getBirthDate() ? $person->getBirthDate()->format('F j, Y') : null;
+
+        $formattedList[] = $formattedPerson;
+    }
+
+    return ['people' => $formattedList];
+}
+
+/**
+ * @OA\Get(
+ *     path="/people/emails",
+ *     summary="Get mailing email addresses grouped by classification role",
+ *     description="Returns member email addresses for all active-family people, excluding those with the DoNotEmail property. sToEmailAddress is a system setting added by the composer, not returned here.",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Email addresses for all people and per role",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="emails", type="array", @OA\Items(type="string"),
+ *                 description="All unique member email addresses (does not include sToEmailAddress)"),
+ *             @OA\Property(property="byRole", type="object",
+ *                 description="Emails grouped by classification role name",
+ *                 @OA\AdditionalProperties(type="array", @OA\Items(type="string"))),
+ *             @OA\Property(property="recipients", type="array", description="The same people with ids, for POST /api/email/send",
+ *                 @OA\Items(type="object",
+ *                     @OA\Property(property="personId", type="integer"),
+ *                     @OA\Property(property="familyId", type="integer", nullable=true),
+ *                     @OA\Property(property="name", type="string"),
+ *                     @OA\Property(property="email", type="string")))
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="Email permission required")
+ * )
+ */
+$app->get('/people/emails', function (Request $request, Response $response): Response {
+    try {
+        $personService = new PersonService();
+        return SlimUtils::renderJSON($response, $personService->getMailingEmails());
+    } catch (\Throwable $e) {
+        return SlimUtils::renderErrorJSON($response, gettext('Failed to retrieve email addresses'), [], 500, $e, $request);
+    }
+})->add(EmailRoleAuthMiddleware::class);

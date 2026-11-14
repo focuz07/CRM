@@ -1,0 +1,12 @@
+# Admin MVC application routing
+# Routes all requests to admin/index.php (Slim app)
+
+Options -Indexes
+RewriteEngine On
+
+# Block direct access to PHP files in views/ (must go through index.php Slim app)
+RewriteRule ^views/.*\.php(/|$) - [F,L]
+
+# Pass all requests to the admin Slim application
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^(.*)$ index.php [QSA,L]

@@ -1,0 +1,33 @@
+<?php
+
+require_once __DIR__ . '/../Include/LoadConfigs.php';
+
+use ChurchCRM\Slim\MvcAppFactory;
+use ChurchCRM\Slim\Middleware\Request\Auth\FinanceRoleAuthMiddleware;
+
+$app = MvcAppFactory::create('/finance', [
+    'dashboardUrl' => '/finance/',
+    'dashboardText' => gettext('Back to Finance Dashboard'),
+    'roleMiddleware' => FinanceRoleAuthMiddleware::class,
+]);
+
+// Register routes
+require __DIR__ . '/routes/dashboard.php';
+require __DIR__ . '/routes/reports.php';
+require __DIR__ . '/routes/envelope-report.php';
+require __DIR__ . '/routes/voting-members.php';
+require __DIR__ . '/routes/zero-givers.php';
+require __DIR__ . '/routes/deposit-reports.php';
+require __DIR__ . '/routes/family-pledge-summary.php';
+require __DIR__ . '/routes/pledge-comparison.php';
+require __DIR__ . '/routes/missing-pledges.php';
+require __DIR__ . '/routes/pledge-reminders.php';
+require __DIR__ . '/routes/pledges.php';
+require __DIR__ . '/routes/fund.php';
+require __DIR__ . '/routes/deposits.php';
+require __DIR__ . '/routes/funds.php';
+require __DIR__ . '/routes/statements.php';
+require __DIR__ . '/routes/api/funds-api.php';
+require __DIR__ . '/routes/api/statement-config-api.php';
+
+$app->run();

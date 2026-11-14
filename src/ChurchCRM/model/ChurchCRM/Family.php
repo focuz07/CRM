@@ -1,0 +1,1003 @@
+<?php
+
+namespace ChurchCRM\model\ChurchCRM;
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\data\Countries;
+use ChurchCRM\dto\Photo;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Emails\verify\FamilyVerificationEmail;
+use ChurchCRM\Emails\notifications\NewPersonOrFamilyEmail;
+use ChurchCRM\model\ChurchCRM\Base\Family as BaseFamily;
+use ChurchCRM\model\ChurchCRM\Map\FamilyTableMap;
+use ChurchCRM\PhotoInterface;
+use ChurchCRM\Plugin\Hook\HookManager;
+use ChurchCRM\Plugin\Hooks;
+use ChurchCRM\Slim\Middleware\Api\FamilyEmailDeprecationMiddleware;
+use ChurchCRM\Utils\GeoUtils;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\Utils\LoggerUtils;
+use DateTime;
+use Propel\Runtime\Connection\ConnectionInterface;
+use Propel\Runtime\Exception\PropelException;
+use Propel\Runtime\Map\TableMap;
+
+/**
+ * Skeleton subclass for representing a row from the 'family_fam' table.
+ *
+ *
+ *
+ * You should add additional methods to this class to meet the
+ * application requirements.  This class will only be generated as
+ * long as it does not already exist in the output directory.
+ */
+class Family extends BaseFamily implements PhotoInterface
+{
+    use GeocodedAddress;
+
+    private ?Photo $photo = null;
+    private bool $skipPostUpdateNote = false;
+
+    /**
+     * Snapshot of the persisted row, taken in preUpdate()/preDelete() and
+     * handed to the FAMILY_UPDATED / FAMILY_DELETED listeners afterwards.
+     *
+     * Null means "nothing listening" — the snapshot is skipped when no plugin
+     * has registered for the hook, so installs with no plugins pay nothing.
+     *
+     * @var array<string, mixed>|null
+     */
+    private ?array $hookDataSnapshot = null;
+
+    public function getAddress(): string
+    {
+        $address = [];
+        if (!empty($this->getAddress1())) {
+            $tmp = $this->getAddress1();
+            if (!empty($this->getAddress2())) {
+                $tmp = $tmp . ' ' . $this->getAddress2();
+            }
+            $address[] = $tmp;
+        }
+
+        if (!empty($this->getCity())) {
+            $address[] = $this->getCity() . ',';
+        }
+
+        if (!empty($this->getState())) {
+            $address[] = $this->getState();
+        }
+
+        if (!empty($this->getZip())) {
+            $address[] = $this->getZip();
+        }
+        if (!empty($this->getCountry())) {
+            $address[] = Countries::toName($this->getCountry());
+        }
+
+        return implode(' ', $address);
+    }
+
+    /**
+     * The family's primary (physical) address, part by part. Both this and
+     * {@see self::getSecondaryAddressParts()} use the same six keys — Address1,
+     * Address2, City, State, Zip, Country — so callers can treat them alike.
+     */
+    public function getPrimaryAddressParts(): array
+    {
+        return [
+            'Address1' => trim($this->getAddress1() ?? ''),
+            'Address2' => trim($this->getAddress2() ?? ''),
+            'City'     => trim($this->getCity() ?? ''),
+            'State'    => trim($this->getState() ?? ''),
+            'Zip'      => trim($this->getZip() ?? ''),
+            'Country'  => trim($this->getCountry() ?? ''),
+        ];
+    }
+
+    /**
+     * The family's optional second address, part by part.
+     */
+    public function getSecondaryAddressParts(): array
+    {
+        return [
+            'Address1' => trim($this->getSecondAddress1() ?? ''),
+            'Address2' => trim($this->getSecondAddress2() ?? ''),
+            'City'     => trim($this->getSecondCity() ?? ''),
+            'State'    => trim($this->getSecondState() ?? ''),
+            'Zip'      => trim($this->getSecondZip() ?? ''),
+            'Country'  => trim($this->getSecondCountry() ?? ''),
+        ];
+    }
+
+    /**
+     * True when the family has entered a second address. A street line or a city
+     * is enough — the same tolerance the primary address gets.
+     */
+    public function hasSecondAddress(): bool
+    {
+        $parts = $this->getSecondaryAddressParts();
+
+        return $parts['Address1'] !== '' || $parts['City'] !== '';
+    }
+
+    /**
+     * True when the second address exists and is flagged as where mail goes.
+     * The flag alone is never enough — an empty second address can't receive mail.
+     */
+    public function isSecondAddressMailing(): bool
+    {
+        return $this->hasSecondAddress() && (bool) $this->getSecondIsMailing();
+    }
+
+    /**
+     * The address mail should be sent to: the flagged second address when there is
+     * one, the primary address otherwise. Labels, letters and the directory call
+     * this rather than reading the columns themselves.
+     */
+    public function getMailingAddressParts(): array
+    {
+        return $this->isSecondAddressMailing()
+            ? $this->getSecondaryAddressParts()
+            : $this->getPrimaryAddressParts();
+    }
+
+    /**
+     * True only when a flagged mailing address actually differs from the primary
+     * one, so callers can avoid printing the same address twice.
+     */
+    public function hasDistinctMailingAddress(): bool
+    {
+        if (!$this->isSecondAddressMailing()) {
+            return false;
+        }
+
+        $primary = array_map('mb_strtolower', $this->getPrimaryAddressParts());
+        $second = array_map('mb_strtolower', $this->getSecondaryAddressParts());
+
+        return $primary !== $second;
+    }
+
+    /**
+     * The one postal-block formatter. Reproduces the layout the label reports have
+     * always produced: street lines, then "City, State  Zip", then the country only
+     * when it is foreign to this installation.
+     */
+    public static function formatAddressBlock(array $parts, string $separator = "\n"): string
+    {
+        $lines = [];
+
+        foreach (['Address1', 'Address2'] as $key) {
+            $line = trim((string) ($parts[$key] ?? ''));
+            if ($line !== '') {
+                $lines[] = $line;
+            }
+        }
+
+        $city = trim((string) ($parts['City'] ?? ''));
+        $state = trim((string) ($parts['State'] ?? ''));
+        $zip = trim((string) ($parts['Zip'] ?? ''));
+        if ($city !== '') {
+            // The historical label layout: the comma follows the city and two spaces
+            // set the ZIP off from the state.
+            $stateZip = trim($state . '  ' . $zip);
+            $cityStateZip = $stateZip !== '' ? $city . ', ' . $stateZip : $city;
+        } else {
+            // A city-less address (a PO Box with only a state and ZIP on record) has
+            // nothing for a comma to follow, so the line is just "State Zip".
+            $cityStateZip = trim($state . ' ' . $zip);
+        }
+        if ($cityStateZip !== '') {
+            $lines[] = $cityStateZip;
+        }
+
+        $country = trim((string) ($parts['Country'] ?? ''));
+        if ($country !== '' && Countries::isForeign($country)) {
+            $lines[] = Countries::toName($country);
+        }
+
+        return implode($separator, $lines);
+    }
+
+    /**
+     * The resolved mailing address as a formatted postal block.
+     */
+    public function getMailingAddressLines(string $separator = "\n"): string
+    {
+        return self::formatAddressBlock($this->getMailingAddressParts(), $separator);
+    }
+
+    /**
+     * The second address as a single line, mirroring {@see self::getAddress()}.
+     */
+    public function getSecondaryAddress(): string
+    {
+        $parts = $this->getSecondaryAddressParts();
+        $address = [];
+
+        if ($parts['Address1'] !== '') {
+            $address[] = $parts['Address1'];
+        }
+        if ($parts['Address2'] !== '') {
+            $address[] = $parts['Address2'];
+        }
+        if ($parts['City'] !== '') {
+            $address[] = $parts['City'] . ',';
+        }
+        if ($parts['State'] !== '') {
+            $address[] = $parts['State'];
+        }
+        if ($parts['Zip'] !== '') {
+            $address[] = $parts['Zip'];
+        }
+        if ($parts['Country'] !== '') {
+            $address[] = Countries::toName($parts['Country']);
+        }
+
+        return implode(' ', $address);
+    }
+
+    /**
+     * Order families by the ZIP code their mail is actually addressed to.
+     *
+     * Mailing labels are printed in ZIP order so a bundle can be presorted for the
+     * post office, which only works when the sort key is the ZIP that gets printed
+     * — the flagged second address when a family has one. Callers pass a set that
+     * the database already ordered by the primary ZIP; when no family in that set
+     * has a mailing ZIP of its own the collection is handed back in exactly the
+     * order it arrived, so label ordering is unchanged for every existing install.
+     *
+     * @param iterable<self> $families families ordered by primary ZIP
+     *
+     * @return self[]
+     */
+    public static function sortByMailingZip(iterable $families): array
+    {
+        $sorted = [];
+        $mailingZips = [];
+        $needsResort = false;
+
+        // getMailingAddressParts() is derived, not a cached column, so the sort key
+        // is resolved once per family here rather than on every comparison below.
+        foreach ($families as $family) {
+            $sorted[] = $family;
+            $mailingZip = $family->getMailingAddressParts()['Zip'];
+            $mailingZips[spl_object_id($family)] = $mailingZip;
+            if ($mailingZip !== trim((string) $family->getZip())) {
+                $needsResort = true;
+            }
+        }
+
+        if (!$needsResort) {
+            return $sorted;
+        }
+
+        // usort has been stable since PHP 8.0, so families sharing a ZIP keep the
+        // relative order the database returned them in.
+        usort(
+            $sorted,
+            static fn (self $a, self $b): int => strcasecmp(
+                $mailingZips[spl_object_id($a)],
+                $mailingZips[spl_object_id($b)]
+            )
+        );
+
+        return $sorted;
+    }
+
+    /**
+     * A Family built from a row that a report's own SQL already fetched with
+     * every family_fam column (`SELECT * ... family_fam`), so the report can use
+     * the address methods above without a query per row.
+     *
+     * It is hydrated the way a FamilyQuery result is, but kept out of the
+     * instance pool. Read from it only: never save or delete it.
+     *
+     * @param array<string, mixed> $row keyed by column name (fam_ID, fam_Address1, ...)
+     */
+    public static function readOnlyFromRow(array $row): self
+    {
+        $family = new self();
+        $family->hydrate($row, 0, false, TableMap::TYPE_FIELDNAME);
+
+        return $family;
+    }
+
+    public static function getFamilyViewURIForId(int $id): string
+    {
+        return SystemURLs::getRootPath() . '/people/family/' . $id;
+    }
+
+    public function getViewURI(): string
+    {
+        return self::getFamilyViewURIForId($this->getId());
+    }
+
+    public function getWeddingDay()
+    {
+        if ($this->getWeddingdate() !== null && $this->getWeddingdate() !== '') {
+            return $this->getWeddingdate()->format('d');
+        }
+
+        return '';
+    }
+
+    public function getWeddingMonth()
+    {
+        if ($this->getWeddingdate() !== null && $this->getWeddingdate() !== '') {
+            return $this->getWeddingdate()->format('m');
+        }
+
+        return '';
+    }
+
+    /**
+     * Enforce the one invariant the second address carries: the "this is the
+     * mailing address" flag is meaningless without an address to send mail to,
+     * so it is cleared whenever the second address is empty. Applied here rather
+     * than only in the editor so every write path (editor, CSV import, API
+     * consumers) stores a consistent row.
+     */
+    public function preSave(?ConnectionInterface $con = null): bool
+    {
+        if ($this->getSecondIsMailing() && !$this->hasSecondAddress()) {
+            $this->setSecondIsMailing(false);
+        }
+
+        $this->forgetGeocodeOnAddressChange(
+            [FamilyTableMap::COL_FAM_ADDRESS1, FamilyTableMap::COL_FAM_ADDRESS2, FamilyTableMap::COL_FAM_CITY, FamilyTableMap::COL_FAM_STATE, FamilyTableMap::COL_FAM_ZIP, FamilyTableMap::COL_FAM_COUNTRY],
+            [FamilyTableMap::COL_FAM_LATITUDE, FamilyTableMap::COL_FAM_LONGITUDE, FamilyTableMap::COL_FAM_GEOCODETRIEDAT],
+        );
+
+        return parent::preSave($con);
+    }
+
+    public function postInsert(?ConnectionInterface $con = null): void
+    {
+        $this->createTimeLineNote('create');
+        NewPersonOrFamilyEmail::sendIfConfigured($this);
+
+        HookManager::doAction(Hooks::FAMILY_CREATED, $this);
+    }
+
+    /**
+     * Capture the pre-update state so FAMILY_UPDATED can report what changed.
+     *
+     * select() is used rather than a normal find so the read bypasses object
+     * hydration and the instance pool — findPk() would just hand back $this,
+     * which already holds the new values. Runs on the save connection, inside
+     * the same transaction, before doSave() writes the new row.
+     */
+    public function preUpdate(?ConnectionInterface $con = null): bool
+    {
+        $this->hookDataSnapshot = null;
+
+        if (HookManager::hasAction(Hooks::FAMILY_UPDATED)) {
+            $row = FamilyQuery::create()
+                ->filterById((int) $this->getId())
+                ->select('*')
+                ->findOne($con);
+
+            $this->hookDataSnapshot = is_array($row) ? self::toPhpNameKeys($row) : [];
+        }
+
+        return parent::preUpdate($con);
+    }
+
+    /**
+     * Re-key a select('*') row from "Fully\Qualified\Model.PhpName" to just
+     * "PhpName", so FAMILY_UPDATED's $oldData matches the shape of
+     * FAMILY_DELETED's $familyData (which comes from toArray(TYPE_PHPNAME)).
+     *
+     * @param array<string, mixed> $row
+     *
+     * @return array<string, mixed>
+     */
+    private static function toPhpNameKeys(array $row): array
+    {
+        $keyed = [];
+        foreach ($row as $column => $value) {
+            $lastDot = strrpos((string) $column, '.');
+            $keyed[$lastDot === false ? $column : substr((string) $column, $lastDot + 1)] = $value;
+        }
+
+        return $keyed;
+    }
+
+    public function postUpdate(?ConnectionInterface $con = null): void
+    {
+        if (!empty($this->getDateLastEdited()) && !$this->skipPostUpdateNote) {
+            $this->createTimeLineNote('edit');
+        }
+
+        HookManager::doAction(Hooks::FAMILY_UPDATED, $this, $this->hookDataSnapshot ?? []);
+        $this->hookDataSnapshot = null;
+    }
+
+    /**
+     * Ensure the family's uploaded photo is removed from disk whenever the
+     * record is deleted — on any code path, not just the API route.
+     * See GH issue #1697.
+     */
+    public function preDelete(?ConnectionInterface $con = null): bool
+    {
+        // Snapshot before the photo is unlinked, so FAMILY_DELETED listeners
+        // see the family as it actually was. (The API route unlinks or deletes
+        // the members before it deletes the family, so the derived
+        // FamilyString key reflects that emptied membership — the persisted
+        // family columns are unaffected.)
+        $this->hookDataSnapshot = HookManager::hasAction(Hooks::FAMILY_DELETED)
+            ? $this->toArray()
+            : null;
+
+        $this->getPhoto()->delete();
+
+        return parent::preDelete($con);
+    }
+
+    /**
+     * Fire FAMILY_DELETED for every path that removes a family.
+     *
+     * This lives on the model rather than in the API route, mirroring
+     * Person::postDelete(): Propel calls postDelete() exactly once per
+     * delete(), so every path fires the hook exactly once and no future caller
+     * can forget to.
+     */
+    public function postDelete(?ConnectionInterface $con = null): void
+    {
+        HookManager::doAction(Hooks::FAMILY_DELETED, (int) $this->getId(), $this->hookDataSnapshot ?? []);
+        $this->hookDataSnapshot = null;
+    }
+
+    public function getPeopleSorted(): array
+    {
+        $familyMembersParents = array_merge($this->getHeadPeople(), $this->getSpousePeople());
+        $familyMembersChildren = $this->getChildPeople();
+        $familyMembersOther = $this->getOtherPeople();
+
+        return array_merge($familyMembersParents, $familyMembersChildren, $familyMembersOther);
+    }
+
+    /**
+     * Returns only living (non-deceased) family members.
+     *
+     * @return Person[]
+     */
+    public function getLivingPeople(): array
+    {
+        $living = [];
+        foreach ($this->getPeople() as $person) {
+            if (!$person->isDeceased()) {
+                $living[] = $person;
+            }
+        }
+        return $living;
+    }
+
+    public function getHeadPeople(): array
+    {
+        return $this->getPeopleByRole('sDirRoleHead');
+    }
+
+    public function getSpousePeople(): array
+    {
+        return $this->getPeopleByRole('sDirRoleSpouse');
+    }
+
+    /**
+     * Heads and spouses. Someone proposed for an existing family counts once
+     * staff approve them on Self Registrations; a family that self-registered
+     * is approved as a whole and keeps its adults.
+     *
+     * @return Person[]
+     */
+    public function getAdults(): array
+    {
+        $adults = array_merge($this->getHeadPeople(), $this->getSpousePeople());
+
+        return array_values(array_filter(
+            $adults,
+            fn (Person $person): bool => !self::proposedMemberAwaitsReview((bool) $person->getNeedsReview(), $this->getEnteredBy()),
+        ));
+    }
+
+    /**
+     * Whether a person waits for staff approval as someone proposed for an
+     * existing family. A family that self-registered is approved as a whole.
+     * Takes column values so bulk queries can ask without loading objects.
+     */
+    public static function proposedMemberAwaitsReview(bool $personNeedsReview, ?int $familyEnteredBy): bool
+    {
+        return $personNeedsReview && $familyEnteredBy !== Person::SELF_REGISTER;
+    }
+
+    public function getChildPeople(): array
+    {
+        return $this->getPeopleByRole('sDirRoleChild');
+    }
+
+    /**
+     * @return Person[]
+     */
+    public function getOtherPeople(): array
+    {
+        $roleIds = array_merge(
+            explode(',', SystemConfig::getValue('sDirRoleHead')),
+            explode(
+                ',',
+                SystemConfig::getValue('sDirRoleSpouse')
+            ),
+            explode(',', SystemConfig::getValue('sDirRoleChild'))
+        );
+        $foundPeople = [];
+        foreach ($this->getPeople() as $person) {
+            if (!in_array($person->getFmrId(), $roleIds)) {
+                $foundPeople[] = $person;
+            }
+        }
+
+        return $foundPeople;
+    }
+
+    /**
+     * @return Person[]
+     */
+    private function getPeopleByRole(string $roleConfigName): array
+    {
+        $roleIds = explode(',', SystemConfig::getValue($roleConfigName));
+        $foundPeople = [];
+        foreach ($this->getPeople() as $person) {
+            if (in_array($person->getFmrId(), $roleIds)) {
+                $foundPeople[] = $person;
+            }
+        }
+
+        return $foundPeople;
+    }
+
+    /**
+     * @throws PropelException
+     */
+    public function getEmails(): array
+    {
+        $emails = [];
+        foreach ($this->getPeopleSorted() as $person) {
+            foreach ([$person->getEmail(), $person->getWorkEmail()] as $email) {
+                if (!empty($email)) {
+                    $emails[] = $email;
+                }
+            }
+        }
+
+        return array_values(array_unique($emails));
+    }
+
+    /**
+     * Who receives mail meant for the whole family: the oldest head of
+     * household who can (see getAdultsWithEmail()), else the oldest such spouse.
+     */
+    public function getEmailRecipient(): ?Person
+    {
+        foreach ([$this->getHeadPeople(), $this->getSpousePeople()] as $people) {
+            $candidates = array_values(array_filter($people, fn (Person $person): bool => $this->canReceiveFamilyEmail($person)));
+            if ($candidates !== []) {
+                usort($candidates, fn (Person $a, Person $b): int => self::ageSortKey($a) <=> self::ageSortKey($b));
+
+                return $candidates[0];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Heads of household and spouses who can receive mail for the whole family:
+     * living, active, with their own email, and, as in getAdults(), not awaiting
+     * review unless the whole family registered itself.
+     *
+     * @return Person[]
+     */
+    public function getAdultsWithEmail(): array
+    {
+        return array_values(array_filter(
+            array_merge($this->getHeadPeople(), $this->getSpousePeople()),
+            fn (Person $person): bool => $this->canReceiveFamilyEmail($person)
+        ));
+    }
+
+    private function canReceiveFamilyEmail(Person $person): bool
+    {
+        return $this->isEmailable($person) && trim((string) $person->getEmail()) !== '';
+    }
+
+    /**
+     * Living, active and approved: a deceased or inactive member, or someone
+     * proposed for the family who still awaits staff approval, gets no mail.
+     */
+    public function isEmailable(Person $person): bool
+    {
+        return !$person->isDeceased()
+            && $person->isActive()
+            && ($this->getEnteredBy() === Person::SELF_REGISTER || !$person->getNeedsReview());
+    }
+
+    /**
+     * The order the family email goes in (member sign-in design §10.1).
+     *
+     * @return int[] oldest first; unknown birth-date parts sort last
+     */
+    public static function ageSortKey(Person $person): array
+    {
+        return [
+            (int) $person->getBirthYear() ?: 9999,
+            (int) $person->getBirthMonth() ?: 99,
+            (int) $person->getBirthDay() ?: 99,
+            (int) $person->getId(),
+        ];
+    }
+
+    public function createTimeLineNote($type): void
+    {
+        $note = new Note();
+        $note->setFamId($this->getId());
+        $note->setType($type);
+        $note->setDateEntered(new DateTime());
+
+        switch ($type) {
+            case 'create':
+                $note->setText(gettext('Created'));
+                $note->setEnteredBy($this->getEnteredBy());
+                $note->setDateEntered($this->getDateEntered());
+                break;
+            case 'edit':
+                $note->setText(gettext('Updated'));
+                $note->setEnteredBy($this->getEditedBy());
+                $note->setDateEntered($this->getDateLastEdited());
+                break;
+            case 'verify':
+                $note->setText(gettext('Family Data Verified'));
+                $note->setEnteredBy(AuthenticationManager::getCurrentUser()->getId());
+                break;
+            case 'verify-link':
+                $note->setText(gettext('Verification email sent'));
+                $note->setEnteredBy(AuthenticationManager::getCurrentUser()->getId());
+                break;
+            case 'verify-URL':
+                $note->setText(gettext('Verification URL created'));
+                $note->setEnteredBy(AuthenticationManager::getCurrentUser()->getId());
+                break;
+        }
+
+        $note->save();
+    }
+
+    public function getPhoto(): ?Photo
+    {
+        if (!$this->photo) {
+            $this->photo = new Photo('Family', $this->getId());
+        }
+
+        return $this->photo;
+    }
+
+    public function deletePhoto(): bool
+    {
+        if (AuthenticationManager::getCurrentUser()->isDeleteRecordsEnabled()) {
+            if ($this->getPhoto()->delete()) {
+                $note = new Note();
+                $note->setText(gettext('Profile Image Deleted'));
+                $note->setType('photo');
+                $note->setEntered(AuthenticationManager::getCurrentUser()->getId());
+                $note->setFamId($this->getId());
+                $note->save();
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Save the record without generating the automatic 'Updated' timeline note.
+     * Use when the caller creates a more specific note (e.g. status change) to
+     * avoid a duplicate generic entry. Mirrors the private pattern used by
+     * setImageFromBase64().
+     */
+    public function saveWithoutUpdateNote(?ConnectionInterface $con = null): void
+    {
+        $this->skipPostUpdateNote = true;
+        try {
+            $this->save($con);
+        } finally {
+            $this->skipPostUpdateNote = false;
+        }
+    }
+
+    public function setImageFromBase64($base64): void
+    {
+        $note = new Note();
+        $note->setText(gettext('Profile Image uploaded'));
+        $note->setType('photo');
+        $note->setEntered(AuthenticationManager::getCurrentUser()->getId());
+        $this->getPhoto()->setImageFromBase64($base64);
+        $note->setFamId($this->getId());
+        $note->save();
+
+        $this->setDateLastEdited(new \DateTime());
+        $this->setEditedBy(AuthenticationManager::getCurrentUser()->getId());
+        $this->skipPostUpdateNote = true;
+        try {
+            $this->save();
+        } finally {
+            $this->skipPostUpdateNote = false;
+        }
+    }
+
+    public function verify(): void
+    {
+        $this->createTimeLineNote('verify');
+    }
+
+    public function getFamilyString(bool $booleanIncludeHOH = true): string
+    {
+        $HoH = [];
+        if ($booleanIncludeHOH) {
+            $HoH = $this->getHeadPeople();
+        }
+        if (count($HoH) == 1) {
+            return $this->getName() . ': ' . $HoH[0]->getFirstName() . ' - ' . $this->getAddress();
+        } elseif (count($HoH) > 1) {
+            $HoHs = [];
+            foreach ($HoH as $person) {
+                $HoHs[] = $person->getFirstName();
+            }
+
+            return $this->getName() . ': ' . join(',', $HoHs) . ' - ' . $this->getAddress();
+        } else {
+            return $this->getName() . ' ' . $this->getAddress();
+        }
+    }
+
+    /**
+     * Return the family's status as text ('Active' or 'Inactive').
+     * Presentation (HTML badges) should be handled by the view or client.
+     */
+    public function getStatusText(): string
+    {
+        return $this->isActive() ? gettext('Active') : gettext('Inactive');
+    }
+
+    /**
+     * Return an HTML link for the family name, optionally including the photo button.
+     */
+    public function getLinkHtml(bool $includePhoto = true, bool $strong = true): string
+    {
+        $name = $strong ? '<strong>' . InputUtils::escapeHTML($this->getName()) . '</strong>' : InputUtils::escapeHTML($this->getName());
+        $html = '<a href="' . $this->getViewURI() . '">' . $name . '</a>';
+
+        if ($includePhoto && $this->getPhoto() && $this->getPhoto()->hasUploadedPhoto()) {
+            $html .= ' <button class="btn btn-sm btn-outline-secondary view-family-photo ms-1" data-family-id="' . $this->getId() . '" title="' . gettext('View Photo') . '"><i class="fa-solid fa-camera"></i></button>';
+        }
+
+        return $html;
+    }
+
+    /**
+     * Return a compact City/State string, truncated to a maximum length.
+     */
+    public function getCityStateShort(int $maxLen = 30): string
+    {
+        $city = $this->getCity();
+        $state = $this->getState();
+        $s = trim($city . ($city && $state ? ', ' : '') . $state);
+        if (mb_strlen($s) > $maxLen) {
+            $s = mb_substr($s, 0, $maxLen) . '...';
+        }
+        return InputUtils::escapeHTML($s);
+    }
+
+    /**
+     * Returns true when the family has a street address entered (Address1 is non-empty).
+     * Used to distinguish "no address" from "unverified address" (has address but no geocode).
+     */
+    public function hasAddress(): bool
+    {
+        return !empty(trim($this->getAddress1() ?? ''));
+    }
+
+    /**
+     * Returns a Google Maps directions deep-link for this family's address.
+     * Uses stored lat/lng when available (more accurate); falls back to the address string.
+     * Returns an empty string when no address is set.
+     */
+    public function getDirectionsUrl(): string
+    {
+        if ($this->hasLatitudeAndLongitude()) {
+            return GeoUtils::buildDirectionsUrl('', (float) $this->getLatitude(), (float) $this->getLongitude());
+        }
+        return GeoUtils::buildDirectionsUrl($this->getAddress());
+    }
+
+    /**
+     * Apple Maps companion to {@see self::getDirectionsUrl()}. Used
+     * alongside the Google Maps link so users on iOS/macOS can open
+     * directions natively in the Maps app.
+     */
+    public function getAppleMapsDirectionsUrl(): string
+    {
+        if ($this->hasLatitudeAndLongitude()) {
+            return GeoUtils::buildAppleMapsDirectionsUrl('', (float) $this->getLatitude(), (float) $this->getLongitude());
+        }
+        return GeoUtils::buildAppleMapsDirectionsUrl($this->getAddress());
+    }
+
+    /**
+     * if the latitude or longitude is empty find the lat/lng from the address and update the lat lng for the family.
+     */
+    public function updateLanLng(): void
+    {
+        if (!empty($this->getAddress()) && (!$this->hasLatitudeAndLongitude())) {
+            $latLng = GeoUtils::getLatLong($this->getAddress(), null, null, null, $this->getCountry());
+            if (!empty($latLng['Latitude']) && !empty($latLng['Longitude'])) {
+                $this->setLatitude($latLng['Latitude']);
+                $this->setLongitude($latLng['Longitude']);
+                $this->save();
+            }
+        }
+    }
+
+    public function toArray(string $keyType = TableMap::TYPE_PHPNAME, bool $includeLazyLoadColumns = true, array $alreadyDumpedObjects = [], bool $includeForeignObjects = false): array
+    {
+        $array = parent::toArray($keyType, $includeLazyLoadColumns, $alreadyDumpedObjects, $includeForeignObjects);
+        $emailKey = FamilyTableMap::translateFieldName('Email', TableMap::TYPE_PHPNAME, $keyType);
+        if (FamilyEmailDeprecationMiddleware::isHandling()) {
+            $array[$emailKey] = FamilyEmailDeprecationMiddleware::emailOf($this);
+        } else {
+            unset($array[$emailKey]);
+        }
+        $array['Address'] = $this->getAddress();
+        $array['FamilyString'] = $this->getFamilyString();
+        // Additive, read-only mailing-address resolution (#9743). `Address` stays the
+        // primary/physical address so maps, search and the cart are unaffected.
+        $array['HasSecondAddress'] = $this->hasSecondAddress();
+        $array['SecondAddressIsMailing'] = $this->isSecondAddressMailing();
+        $array['SecondAddress'] = $this->getSecondaryAddress();
+        $array['MailingAddress'] = $this->getMailingAddressParts();
+        $array['MailingAddressLines'] = $this->getMailingAddressLines(', ');
+
+        if (!AuthenticationManager::isUserAuthenticated() || !AuthenticationManager::getCurrentUser()->isFinanceEnabled()) {
+            unset($array['ScanCheck'], $array['ScanCredit'], $array['Envelope']);
+        }
+
+        return $array;
+    }
+
+    public function toSearchArray(): array
+    {
+        return [
+            'Id'          => $this->getId(),
+            'displayName' => $this->getFamilyString(SystemConfig::getBooleanValue('bSearchIncludeFamilyHOH')),
+            'uri'         => SystemURLs::getRootPath() . '/people/family/' . $this->getId(),
+        ];
+    }
+
+    public function isActive(): bool
+    {
+        return empty($this->getDateDeactivated());
+    }
+
+    public function getProperties()
+    {
+        return PropertyQuery::create()
+            ->filterByProClass('f')
+            ->useRecordPropertyQuery()
+            ->filterByRecordId($this->getId())
+            ->find();
+    }
+
+    /**
+     * Addresses a verification email may go to: living, active, approved members.
+     *
+     * @return string[]
+     */
+    public function getVerifyEmails(): array
+    {
+        $emails = [];
+        foreach ($this->getPeopleSorted() as $person) {
+            if ($this->isEmailable($person)) {
+                foreach ([$person->getEmail(), $person->getWorkEmail()] as $email) {
+                    if (!empty($email)) {
+                        $emails[] = $email;
+                    }
+                }
+            }
+        }
+
+        return array_values(array_unique($emails));
+    }
+
+    public function sendVerifyEmail(): bool
+    {
+        if (!$this->isActive()) {
+            throw new \Exception(gettext('Family is inactive'));
+        }
+        if ($this->getNeedsReview()) {
+            throw new \Exception(gettext('Approve this self-registered family before sending it a verification email'));
+        }
+
+        $familyEmails = $this->getVerifyEmails();
+
+        if (empty($familyEmails)) {
+            throw new \Exception(gettext('Family has no emails to use'));
+        }
+
+        $email = new FamilyVerificationEmail($familyEmails, $this->getName());
+        $email->setLogContext(null, (int) $this->getId(), (int) AuthenticationManager::getCurrentUser()->getId());
+        if (!$email->send()) {
+            LoggerUtils::getAppLogger()->error($email->getError());
+
+            throw new \Exception($email->getError());
+        }
+        $this->createTimeLineNote('verify-link');
+
+        return true;
+    }
+
+    public function isSendNewsletter(): bool
+    {
+        return $this->getSendNewsletter() == 'TRUE';
+    }
+
+    public function getSalutation()
+    {
+        $adults = $this->getAdults();
+        $adultsCount = count($adults);
+
+        if ($adultsCount == 1) {
+            return $adults[0]->getFullName();
+        } elseif ($adultsCount == 2) {
+            $firstLastName = $adults[0]->getLastName();
+            $secondLastName = $adults[1]->getLastName();
+            if ($firstLastName == $secondLastName) {
+                return $adults[0]->getFirstName() . ' & ' . $adults[1]->getFirstName() . ' ' . $firstLastName;
+            } else {
+                return $adults[0]->getFullName() . ' & ' . $adults[1]->getFullName();
+            }
+        } else {
+            return $this->getName() . ' Family';
+        }
+    }
+
+    public function getFirstNameSalutation(): string
+    {
+        $names = [];
+        foreach ($this->getPeopleSorted() as $person) {
+            $names[] = $person->getFirstName();
+        }
+
+        return implode(', ', $names);
+    }
+
+    public function checkAgainstCart(): bool
+    {
+        if (!isset($_SESSION['aPeopleCart']) || empty($_SESSION['aPeopleCart'])) {
+            return false;
+        }
+
+        $familyMembers = $this->getPeople();
+        if (empty($familyMembers)) {
+            return false;
+        }
+
+        // Check if ALL family members are in the cart
+        foreach ($familyMembers as $person) {
+            if (!in_array($person->getId(), $_SESSION['aPeopleCart'], false)) {
+                return false; // At least one member is not in cart
+            }
+        }
+
+        return true; // All members are in cart
+    }
+}

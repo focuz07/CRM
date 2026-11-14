@@ -1,0 +1,243 @@
+/// <reference types="cypress" />
+
+/**
+ * API tests for Family endpoints
+ * Tests validate that family phone field removal (fam_CellPhone, fam_WorkPhone)
+ * does not break API functionality
+ */
+describe("API Private Family", () => {
+    describe("GET /api/families/latest - Latest Families", () => {
+        it("Returns 200 with families data", () => {
+            cy.makePrivateAdminAPICall("GET", "/api/families/latest", null, 200).then(
+                (response) => {
+                    // Response should contain families data
+                    expect(response.body).to.exist;
+                },
+            );
+        });
+    });
+
+    describe("GET /api/families/updated - Updated Families", () => {
+        it("Returns 200 with families data", () => {
+            cy.makePrivateAdminAPICall("GET", "/api/families/updated", null, 200).then(
+                (response) => {
+                    expect(response.body).to.exist;
+                },
+            );
+        });
+    });
+
+    describe("GET /api/families/search/{query} - Search Families", () => {
+        it("Returns 200 with matching families", () => {
+            cy.makePrivateAdminAPICall("GET", "/api/families/search/Smith", null, 200).then(
+                (response) => {
+                    expect(response.body).to.have.property("Families");
+                    expect(response.body.Families).to.be.an("array");
+                },
+            );
+        });
+
+        it("Returns empty array for no matches", () => {
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/families/search/ZZZZNONEXISTENT",
+                null,
+                200,
+            ).then((response) => {
+                expect(response.body).to.have.property("Families");
+                expect(response.body.Families).to.be.an("array");
+                expect(response.body.Families).to.have.lengthOf(0);
+            });
+        });
+    });
+
+    describe("GET /api/families/email/without - Families Without Email", () => {
+        it("Returns 200 with count and families array", () => {
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/families/email/without",
+                null,
+                200,
+            ).then((response) => {
+                expect(response.body).to.have.property("count");
+                expect(response.body).to.have.property("families");
+                expect(response.body.families).to.be.an("array");
+                expect(response.body.count).to.be.a("number");
+            });
+        });
+    });
+
+    describe("GET /api/family/{id} - Get Family by ID", () => {
+        it("Returns 200 with family data for valid ID", () => {
+            cy.makePrivateAdminAPICall("GET", "/api/family/1", null, 200).then(
+                (response) => {
+                    expect(response.body).to.have.property("Id");
+                    expect(response.body).to.have.property("Name");
+                    expect(response.body).to.have.property("Address1");
+                    expect(response.body).to.have.property("HomePhone");
+                    expect(response.body).to.have.property("Email");
+                    // Verify removed fields are NOT present
+                    expect(response.body).to.not.have.property("CellPhone");
+                    expect(response.body).to.not.have.property("WorkPhone");
+                },
+            );
+        });
+
+        it("Returns error for non-existent family", () => {
+            // AbstractEntityMiddleware returns 404 Not Found for missing entity
+            cy.makePrivateAdminAPICall("GET", "/api/family/99999", null, 404);
+        });
+
+        // Optional second family address + mailing flag (#9743). Additive keys only —
+        // `Address` must keep meaning the primary/physical address.
+        it("Exposes the second-address keys, resolving MailingAddress to the primary when unflagged", () => {
+            cy.makePrivateAdminAPICall("GET", "/api/family/1", null, 200).then((response) => {
+                expect(response.body).to.have.property("SecondAddress1");
+                expect(response.body).to.have.property("SecondAddress2");
+                expect(response.body).to.have.property("SecondCity");
+                expect(response.body).to.have.property("SecondState");
+                expect(response.body).to.have.property("SecondZip");
+                expect(response.body).to.have.property("SecondCountry");
+                expect(response.body).to.have.property("SecondIsMailing");
+                expect(response.body).to.have.property("HasSecondAddress");
+                expect(response.body).to.have.property("SecondAddressIsMailing");
+                expect(response.body).to.have.property("MailingAddress");
+
+                // Seeded families have no second address, so mailing resolves to the primary.
+                expect(response.body.HasSecondAddress).to.be.false;
+                expect(response.body.SecondAddressIsMailing).to.be.false;
+                expect(response.body.MailingAddress.Address1).to.equal(response.body.Address1);
+                expect(response.body.MailingAddress.City).to.equal(response.body.City);
+            });
+        });
+    });
+
+    describe("GET /api/family/{id}/nav - Family Navigation", () => {
+        it("Returns 200 with prev/next family IDs", () => {
+            cy.makePrivateAdminAPICall("GET", "/api/family/2/nav", null, 200).then(
+                (response) => {
+                    // Response should have navigation info
+                    expect(response.body).to.exist;
+                },
+            );
+        });
+    });
+
+    describe("GET /api/families/anniversaries - Family Anniversaries", () => {
+        it("Returns 200 with anniversary data", () => {
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/families/anniversaries",
+                null,
+                200,
+            ).then((response) => {
+                expect(response.body).to.exist;
+            });
+        });
+    });
+
+    describe("GET /api/families/self-register - Self-Registered Families", () => {
+        it("Returns 200 with the seeded self-registered families", () => {
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/families/self-register",
+                null,
+                200,
+            ).then((response) => {
+                expect(response.body).to.have.property("families");
+                expect(response.body.families).to.be.an("array");
+                // seed.sql seeds self-registered (fam_EnteredBy = -1) families
+                expect(response.body.families.length).to.be.greaterThan(0);
+
+                const family = response.body.families[0];
+                expect(family).to.have.property("Id");
+                expect(family).to.have.property("FamilyString");
+                expect(family).to.have.property("DateEntered");
+            });
+        });
+    });
+
+    describe("POST /api/family/{familyId}/approve-review - Approve Self-Registered Family", () => {
+        it("Rejects a user without EditRecords", () => {
+            cy.makePrivateNoPermAPICall(
+                "POST",
+                "/api/family/23/approve-review",
+                null,
+                403,
+            );
+        });
+
+        it("Clears the family's needs-review flag and cascades to its members", () => {
+            // seed.sql family 23 (Turner) is self-registered (fam_EnteredBy = -1)
+            // with members 115 and 116, all still pending review.
+
+            // First: assert family 23 IS in the pending list
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/families/self-register",
+                null,
+                200,
+            ).then((response) => {
+                const ids = response.body.families.map((f) => f.Id);
+                expect(ids).to.include(23);
+            });
+
+            // Then approve and verify removal
+            cy.makePrivateAdminAPICall(
+                "POST",
+                "/api/family/23/approve-review",
+                null,
+                200,
+            ).then((response) => {
+                expect(response.body).to.have.property("success", true);
+            });
+
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/families/self-register",
+                null,
+                200,
+            ).then((response) => {
+                const ids = response.body.families.map((f) => f.Id);
+                expect(ids).to.not.include(23);
+            });
+
+            cy.makePrivateAdminAPICall("GET", "/api/person/116", null, 200).then((response) => {
+                expect(response.body.NeedsReview).to.equal(false);
+            });
+        });
+
+        it("Rejects approving a family that is not a pending self-registration", () => {
+            // family 1 (Campbell) is staff-created
+            cy.makePrivateAdminAPICall("POST", "/api/family/1/approve-review", null, 400);
+        });
+    });
+
+    describe("GET /api/families/self-verify - Self-Verified Families", () => {
+        it("Returns 200 with families array", () => {
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/families/self-verify",
+                null,
+                200,
+            ).then((response) => {
+                expect(response.body).to.have.property("families");
+                expect(response.body.families).to.be.an("array");
+            });
+        });
+    });
+
+    describe("POST /api/family/{id}/activate/{status} - Activate/Deactivate Family", () => {
+        it("Activate endpoint responds without error", () => {
+            cy.makePrivateAdminAPICall(
+                "POST",
+                "/api/family/1/activate/true",
+                null,
+                200,
+            ).then((response) => {
+                expect(response.body).to.have.property("success");
+                expect(response.body.success).to.be.true;
+            });
+        });
+    });
+});

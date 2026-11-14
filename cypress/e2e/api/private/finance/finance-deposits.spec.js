@@ -1,0 +1,374 @@
+/// <reference types="cypress" />
+
+describe("API Private Deposit Operations", () => {
+    let depositID = 1; // Use existing deposit ID for testing
+
+    describe("Deposit Retrieval Operations", () => {
+        it("Get all deposits", () => {
+            // Test retrieving all deposits
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits`,
+                null,
+                200
+            ).then((resp) => {
+                expect(resp.body).to.be.an("object");
+                expect(resp.body).to.have.property("Deposits");
+                expect(resp.body.Deposits).to.be.an("array");
+                // Each deposit should have properties like Id, Type, Comment, Date (capitalized by Propel)
+                if (resp.body.Deposits.length > 0) {
+                    const deposit = resp.body.Deposits[0];
+                    expect(deposit).to.have.property("Id");
+                }
+            });
+        });
+
+        it("Get specific deposit by ID", () => {
+            // Test retrieving a specific deposit
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/${depositID}`,
+                null,
+                [200, 404]
+            ).then((resp) => {
+                if (resp.status === 200) {
+                    expect(resp.body).to.have.property("Id");
+                    expect(resp.body).to.have.property("Type");
+                }
+            });
+        });
+
+        it("Get deposit pledges/payments", () => {
+            // Test retrieving pledges in a deposit
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/${depositID}/pledges`,
+                null,
+                [200, 404]
+            ).then((resp) => {
+                if (resp.status === 200) {
+                    expect(resp.body).to.be.an("array");
+                }
+            });
+        });
+
+        it("Get deposit CSV export", () => {
+            // Test exporting deposit as CSV
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/${depositID}/csv`,
+                null,
+                [200, 404]
+            ).then((resp) => {
+                if (resp.status === 200) {
+                    expect(resp.body).to.exist;
+                }
+            });
+        });
+
+        it("Get deposit PDF export", () => {
+            // Test generating deposit PDF
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/${depositID}/pdf`,
+                null,
+                [200, 404]
+            ).then((response) => {
+                if (response.status === 200) {
+                    expect(response.headers["content-type"]).to.include("application/pdf");
+                }
+            });
+        });
+
+        it("Get deposit OFX format", () => {
+            // Test getting deposit in OFX format
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/${depositID}/ofx`,
+                null,
+                [200, 404]
+            ).then((resp) => {
+                if (resp.status === 200) {
+                    expect(resp.body).to.have.property("content");
+                }
+            });
+        });
+    });
+
+    describe("Deposit CRUD Operations", () => {
+        it("Create new deposit", () => {
+            // Test creating a new deposit
+            const today = new Date().toISOString().split("T")[0];
+            cy.makePrivateAdminAPICall(
+                "POST",
+                `/api/deposits`,
+                {
+                    depositType: "Bank",
+                    depositComment: "Test Deposit",
+                    depositDate: today,
+                },
+                200
+            ).then((resp) => {
+                expect(resp.body).to.exist;
+                expect(resp.body).to.have.property("Id");
+            });
+        });
+
+        it("Update existing deposit", () => {
+            // Test updating a deposit
+            const today = new Date().toISOString().split("T")[0];
+            cy.makePrivateAdminAPICall(
+                "POST",
+                `/api/deposits/${depositID}`,
+                {
+                    depositType: "Bank",
+                    depositComment: "Updated Test Deposit",
+                    depositDate: today,
+                    depositClosed: false,
+                },
+                [200, 404]
+            );
+        });
+
+        it("Delete deposit", () => {
+            // Test deleting a deposit
+            cy.makePrivateAdminAPICall(
+                "DELETE",
+                `/api/deposits/9999`,
+                null,
+                [200, 404]
+            );
+        });
+
+        it("Get deposit dashboard data", () => {
+            // Test getting dashboard data for deposits
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/dashboard`,
+                null,
+                200
+            ).then((resp) => {
+                expect(resp.body).to.be.an("array");
+            });
+        });
+    });
+
+    describe("Deposit Operations", () => {
+        it("Closing a card deposit deletes only uncleared payments", () => {
+            const today = new Date().toISOString().split("T")[0];
+            const payment = (depositId, type) => ({
+                type,
+                iMethod: "CASH",
+                Date: today,
+                FamilyID: "1",
+                FYID: 29,
+                DepositID: depositId,
+                tScanString: "",
+                FundSplit: JSON.stringify([
+                    { FundID: "1", Amount: 15, NonDeductible: 0, Comment: "" },
+                ]),
+            });
+
+            cy.makePrivateAdminAPICall("POST", "/api/deposits", {
+                depositType: "CreditCard",
+                depositComment: "Close cleanup",
+                depositDate: today,
+            }, 200).then((created) => {
+                const id = created.body.Id;
+                cy.makePrivateAdminAPICall("POST", "/api/payments/pledges", payment(id, "Payment"), 200);
+                cy.makePrivateAdminAPICall("POST", "/api/payments/pledges", payment(id, "Pledge"), 200);
+                cy.makePrivateAdminAPICall("POST", `/api/deposits/${id}`, {
+                    depositType: "CreditCard",
+                    depositComment: "Closed",
+                    depositDate: today,
+                    depositClosed: true,
+                }, 200);
+                cy.makePrivateAdminAPICall("GET", `/api/deposits/${id}/payments`, null, 200).then((payments) => {
+                    expect(payments.body).to.have.length(0);
+                });
+                cy.makePrivateAdminAPICall("GET", `/api/deposits/${id}/pledges`, null, 200).then((pledges) => {
+                    expect(pledges.body.length).to.be.greaterThan(0);
+                });
+            });
+        });
+
+        it("Closing a bank deposit keeps uncleared payments", () => {
+            const today = new Date().toISOString().split("T")[0];
+            cy.makePrivateAdminAPICall("POST", "/api/deposits", {
+                depositType: "Bank",
+                depositComment: "Bank close",
+                depositDate: today,
+            }, 200).then((created) => {
+                const id = created.body.Id;
+                cy.makePrivateAdminAPICall("POST", "/api/payments/pledges", {
+                    type: "Payment",
+                    iMethod: "CASH",
+                    Date: today,
+                    FamilyID: "1",
+                    FYID: 29,
+                    DepositID: id,
+                    tScanString: "",
+                    FundSplit: JSON.stringify([
+                        { FundID: "1", Amount: 12, NonDeductible: 0, Comment: "" },
+                    ]),
+                }, 200);
+                cy.makePrivateAdminAPICall("POST", `/api/deposits/${id}`, {
+                    depositType: "Bank",
+                    depositComment: "Bank closed",
+                    depositDate: today,
+                    depositClosed: true,
+                }, 200);
+                cy.makePrivateAdminAPICall("GET", `/api/deposits/${id}/payments`, null, 200).then((payments) => {
+                    expect(payments.body.length).to.be.greaterThan(0);
+                });
+            });
+        });
+    });
+
+    describe("Middleware Validation Tests", () => {
+        it("Rejects missing depositType with 400", () => {
+            const today = new Date().toISOString().split("T")[0];
+            cy.makePrivateAdminAPICall(
+                "POST",
+                `/api/deposits`,
+                { depositComment: "No type given", depositDate: today },
+                400
+            ).then((resp) => {
+                expect(resp.body).to.have.property("error");
+                expect(resp.body).to.have.property("allowed");
+                expect(resp.body.allowed).to.include("Bank");
+            });
+        });
+
+        it("Rejects invalid depositType with 400", () => {
+            const today = new Date().toISOString().split("T")[0];
+            cy.makePrivateAdminAPICall(
+                "POST",
+                `/api/deposits`,
+                { depositType: "Cash", depositDate: today },
+                400
+            ).then((resp) => {
+                expect(resp.body).to.have.property("error");
+                expect(resp.body.error).to.include("Cash");
+                expect(resp.body).to.have.property("allowed");
+            });
+        });
+
+        it("Sanitizes XSS in depositComment before saving", () => {
+            const today = new Date().toISOString().split("T")[0];
+            cy.makePrivateAdminAPICall(
+                "POST",
+                `/api/deposits`,
+                {
+                    depositType: "Bank",
+                    depositComment: "<script>alert('xss')</script>Test",
+                    depositDate: today,
+                },
+                200
+            ).then((resp) => {
+                expect(resp.body).to.have.property("Comment");
+                expect(resp.body.Comment).to.not.include("<script>");
+            });
+        });
+    });
+
+    describe("Data Structure Validation", () => {
+        it("Verify deposit data structure", () => {
+            // Ensure deposit operations return proper structure
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits`,
+                null,
+                200
+            ).then((resp) => {
+                expect(resp.body).to.be.an("object");
+                expect(resp.body).to.have.property("Deposits");
+                expect(resp.body.Deposits).to.be.an("array");
+                if (resp.body.Deposits.length > 0) {
+                    const deposit = resp.body.Deposits[0];
+                    expect(deposit).to.have.property("Id");
+                    expect(deposit).to.have.property("Type");
+                    expect(deposit).to.have.property("Comment");
+                    expect(deposit).to.have.property("Date");
+                }
+            });
+        });
+
+        it("Verify pledge/payment data structure", () => {
+            // Ensure pledge retrieval returns proper structure
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/${depositID}/pledges`,
+                null,
+                [200, 404]
+            ).then((resp) => {
+                if (resp.status === 200) {
+                    expect(resp.body).to.be.an("array");
+                    if (resp.body.length > 0) {
+                        const pledge = resp.body[0];
+                        expect(pledge).to.have.property("GroupKey");
+                        expect(pledge).to.have.property("sumAmount");
+                        // Phase 4: *_formatted siblings must be present
+                        expect(pledge).to.have.property("sumAmount_formatted");
+                        expect(pledge.sumAmount_formatted).to.be.a("string");
+                    }
+                }
+            });
+        });
+    });
+
+    describe("Open Deposit Count Badge Endpoint", () => {
+        it("Get open deposit count - Finance enabled user", () => {
+            // Test that authenticated users with Finance enabled can get the open deposit count
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/open-count`,
+                null,
+                200
+            ).then((resp) => {
+                expect(resp.body).to.be.an("object");
+                expect(resp.body).to.have.property("count");
+                expect(resp.body.count).to.be.a("number");
+                expect(resp.body.count).to.be.gte(0);
+            });
+        });
+
+        it("Verify open deposit count is accurate", () => {
+            // Test that the count returned matches actual open deposits in the database
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/open-count`,
+                null,
+                200
+            ).then((openResp) => {
+                const expectedCount = openResp.body.count;
+                // Verify against the full deposit list (count deposits where Closed is false/0)
+                cy.makePrivateAdminAPICall(
+                    "GET",
+                    `/api/deposits`,
+                    null,
+                    200
+                ).then((allResp) => {
+                    const openDeposits = allResp.body.Deposits.filter(d => !d.Closed);
+                    expect(openDeposits.length).to.equal(expectedCount);
+                });
+            });
+        });
+
+        it("Response structure matches dashboard badge requirements", () => {
+            // Test that the response structure is correct for the badge loader
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/deposits/open-count`,
+                null,
+                200
+            ).then((resp) => {
+                // Verify the response has exactly the expected keys and types
+                expect(Object.keys(resp.body)).to.deep.equal(["count"]);
+                expect(resp.body.count).to.be.a("number").and.gte(0);
+                expect(resp.headers).to.have.property("content-type");
+                expect(resp.headers["content-type"]).to.include("application/json");
+            });
+        });
+    });
+});

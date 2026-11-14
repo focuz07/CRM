@@ -1,0 +1,56 @@
+name: 🐛 Bug report
+description: Something isn't working in ChurchCRM
+title: "Bug: "
+type: Bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve ChurchCRM! 💙 Only the first three fields are required.
+
+        Easiest way: **Support → Report an Issue** inside ChurchCRM fills in your system info for you. Need help first? [Ask on Discord](https://discord.gg/tuWyFzj3Nj). Security problem? [Report it privately](https://github.com/ChurchCRM/CRM/security/advisories/new).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Tell us what you did, what you expected, and what you saw instead.
+      placeholder: When I click Save on the Family edit page I get a 500 error and my changes are lost.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce (optional)
+      placeholder: |
+        1. Open a family
+        2. Click Edit
+        3. Click Save
+
+  - type: input
+    id: version
+    attributes:
+      label: ChurchCRM version
+      description: Shown in the page footer.
+      placeholder: "e.g. 7.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: web-server
+    attributes:
+      label: Web server (optional)
+      description: Helps with 404s and redirect loops, which depend on it.
+      options:
+        - Apache
+        - nginx
+        - LiteSpeed
+        - Caddy
+        - Other / not sure
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else? (optional)
+      description: Screenshots, error messages, or logs (Admin → System Maintenance → System Logs). Please remove private data first.

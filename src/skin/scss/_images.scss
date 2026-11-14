@@ -1,0 +1,30 @@
+// Lazy-loaded entity images (webpack/avatar-loader.ts toggles .loading/.loaded/.error)
+img[data-image-entity-type] {
+  background: linear-gradient(90deg, var(--tblr-bg-surface-secondary) 0%, var(--tblr-border-color) 50%, var(--tblr-bg-surface-secondary) 100%);
+  background-size: 200% 100%;
+  min-height: 50px;
+  min-width: 50px;
+  object-fit: cover;
+}
+
+img[data-image-entity-type].loading {
+  opacity: 0.7;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+img[data-image-entity-type].loaded {
+  opacity: 1;
+  transition: opacity 0.3s ease-in-out;
+  background: transparent;
+}
+
+img[data-image-entity-type].error {
+  background: #ffebee;
+  border: 2px dashed #ef5350;
+  opacity: 0.8;
+}

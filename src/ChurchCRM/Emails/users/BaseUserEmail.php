@@ -1,0 +1,59 @@
+<?php
+
+namespace ChurchCRM\Emails\users;
+
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Emails\BaseEmail;
+use ChurchCRM\model\ChurchCRM\User;
+
+abstract class BaseUserEmail extends BaseEmail
+{
+    protected User $user;
+
+    public function __construct(User $user)
+    {
+        parent::__construct([$user->getEmail()]);
+        $this->setLogContext((int) $user->getPersonId());
+        $this->user = $user;
+        $this->mail->Subject = $this->getSubSubject();
+        $this->mail->isHTML(true);
+        $this->mail->msgHTML($this->buildMessage());
+    }
+
+    abstract protected function getSubSubject(): string;
+
+    /** Account emails add the "you received this because of activity on your account" note. */
+    protected function getTemplateName(): string
+    {
+        return 'AccountEmail.html.twig';
+    }
+
+    public function getTokens(): array
+    {
+        $myTokens = [
+            'toName' => $this->user->getPerson()->getFirstName(),
+            'userName'        => $this->user->getUserName(),
+            'userNameText'    => gettext('Email/Username'),
+            'body'            => $this->buildMessageBody(),
+        ];
+
+        return array_merge($this->getCommonTokens(), $myTokens);
+    }
+
+    protected function getFullURL(): string
+    {
+        return SystemURLs::getURL() . '/session/begin?username=' . rawurlencode($this->user->getUserName());
+    }
+
+    protected function getButtonText(): string
+    {
+        return $this->user->getUserName();
+    }
+
+    protected function getPreheader(): string
+    {
+        return $this->getSubSubject();
+    }
+
+    abstract protected function buildMessageBody(): string;
+}

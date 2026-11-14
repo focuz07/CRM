@@ -1,0 +1,265 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\model\ChurchCRM\Family;
+use ChurchCRM\model\ChurchCRM\Person;
+use ChurchCRM\Service\UserService;
+use ChurchCRM\Utils\InputUtils;
+
+require SystemURLs::getDocumentRoot() . '/Include/Header.php';
+
+// Initialize UserService
+$userService = new UserService();
+
+// Get all users and statistics
+$rsUsers = $userService->getAllUsers();
+$userStats = $userService->getUserStats();
+$userSettingsConfig = $userService->getUserSettingsConfig();
+
+$bEmailEnabled = SystemConfig::isEmailEnabled();
+
+?>
+<div class="container-fluid">
+    <?php if (!$bEmailEnabled) { ?>
+    <div class="alert alert-warning d-flex align-items-center" role="alert">
+        <i class="fa-solid fa-triangle-exclamation me-2 fs-3"></i>
+        <div class="flex-grow-1">
+            <strong><?= gettext('Email is disabled') ?></strong>
+            <div class="text-secondary"><?= gettext('Password reset emails and new-account welcome emails will not be sent until email is configured. Users will not receive credentials automatically.') ?></div>
+        </div>
+        <a href="<?= SystemURLs::getRootPath() ?>/admin/email" class="btn btn-warning ms-3">
+            <i class="fa-solid fa-envelope me-1"></i><?= gettext('Set up Email') ?>
+        </a>
+    </div>
+    <?php } ?>
+    <!-- Stat Cards Row -->
+<div class="row mb-3">
+    <div class="col-6 col-lg-3">
+        <div class="card card-sm">
+            <div class="card-body">
+                <div class="row align-items-center">
+                    <div class="col-auto">
+                        <span class="bg-info text-white avatar rounded-circle">
+                            <i class="fa-solid fa-users icon"></i>
+                        </span>
+                    </div>
+                    <div class="col">
+                        <div class="fw-medium"><?= $userStats['total'] ?></div>
+                        <div class="text-body-secondary"><?= gettext('Total Users') ?></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="card card-sm">
+            <div class="card-body">
+                <div class="row align-items-center">
+                    <div class="col-auto">
+                        <span class="bg-success text-white avatar rounded-circle">
+                            <i class="fa-solid fa-user-check icon"></i>
+                        </span>
+                    </div>
+                    <div class="col">
+                        <div class="fw-medium"><?= $userStats['active'] ?></div>
+                        <div class="text-body-secondary"><?= gettext('Active Users') ?></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="card card-sm">
+            <div class="card-body">
+                <div class="row align-items-center">
+                    <div class="col-auto">
+                        <span class="bg-warning text-white avatar rounded-circle">
+                            <i class="fa-solid fa-lock icon"></i>
+                        </span>
+                    </div>
+                    <div class="col">
+                        <div class="fw-medium"><?= $userStats['locked'] ?></div>
+                        <div class="text-body-secondary"><?= gettext('Locked Users') ?></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="card card-sm">
+            <div class="card-body">
+                <div class="row align-items-center">
+                    <div class="col-auto">
+                        <span class="bg-primary text-white avatar rounded-circle">
+                            <i class="fa-solid fa-shield-halved icon"></i>
+                        </span>
+                    </div>
+                    <div class="col">
+                        <div class="fw-medium"><?= $userStats['twoFactor'] ?></div>
+                        <div class="text-body-secondary"><?= gettext('2FA Enabled') ?></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- System Settings Panel Component -->
+<link rel="stylesheet" href="<?= SystemURLs::assetVersioned('/skin/v2/system-settings-panel.min.css') ?>">
+<script src="<?= SystemURLs::assetVersioned('/skin/v2/system-settings-panel.min.js') ?>" nonce="<?= SystemURLs::getCSPNonce() ?>"></script>
+
+<div class="card">
+    <div class="card-header d-flex align-items-center">
+        <h3 class="card-title"><i class="fa-solid fa-list me-2"></i><?= gettext('Users') ?></h3>
+        <div class="card-tools ms-auto">
+            <span class="badge bg-info text-white"><?= $userStats['total'] ?> <?= gettext('total') ?></span>
+        </div>
+    </div>
+    <div class="card-body border-bottom py-2 text-body-secondary small">
+        <span class="me-3"><i class="fa-solid fa-circle-check text-danger me-1"></i><?= gettext('Admin') ?></span>
+        <span><i class="fa-solid fa-cog text-azure me-1"></i><?= gettext('Custom') ?></span>
+    </div>
+    <div class="card-body overflow-visible">
+        <table class="table table-hover w-100" id="user-listing-table">
+                <thead>
+                    <tr>
+                        <th><?= gettext('Name') ?></th>
+                        <th><?= gettext('Login Name') ?></th>
+                        <th class="text-center"><?= gettext('Access') ?></th>
+                        <th class="text-center"><?= gettext('Last Login') ?></th>
+                        <th class="text-center"><?= gettext('Failed Logins') ?></th>
+                        <th class="text-center"><?= gettext('Status') ?></th>
+                        <th class="text-center">2FA</th>
+                        <th class="text-center no-export w-1"><?= gettext('Actions') ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($rsUsers as $user) { ?>
+                        <tr>
+                            <td>
+                                <a href="<?= SystemURLs::getRootPath() ?>/v2/user/<?= $user->getId() ?>"><?= InputUtils::escapeHTML($user->getPerson()->getFullName()) ?></a>
+                            </td>
+                            <td>
+                                <code><?= InputUtils::escapeHTML($user->getUserName()) ?></code>
+                            </td>
+                            <td class="text-center">
+                                <?php if ($user->isAdmin()): ?>
+                                <i class="fa-solid fa-circle-check text-danger fs-4" title="<?= gettext('Administrator') ?>"></i>
+                                <?php else: ?>
+                                <i class="fa-solid fa-cog text-azure fs-4" title="<?= gettext('Custom permissions') ?>"></i>
+                                <?php endif; ?>
+                            </td>
+                            <td class="text-center"><?= $user->getLastLogin(SystemConfig::getValue('sDateTimeFormat')) ?></td>
+                            <td class="text-center">
+                                <?php if ($user->getFailedLogins() > 0) { ?>
+                                    <span class="badge text-white <?= $user->isLocked() ? 'bg-danger' : 'bg-warning' ?>"><?= $user->getFailedLogins() ?></span>
+                                <?php } else { ?>
+                                    <span class="text-body-secondary">—</span>
+                                <?php } ?>
+                            </td>
+                            <td class="text-center">
+                                <?php $locked = $user->isLocked(); $mustChange = $user->getNeedPasswordChange(); $signInBlockedLabel = $user->getSignInBlockedLabel(); ?>
+                                <?php if ($signInBlockedLabel !== null): ?>
+                                    <span class="badge rounded-pill bg-secondary text-white me-1" data-cy="sign-in-blocked-badge" data-sign-in-blocked="<?= InputUtils::escapeAttribute($user->getSignInBlockedReason()) ?>" title="<?= InputUtils::escapeAttribute(gettext('The linked person may not sign in, so this account cannot sign in')) ?>"><i class="fa-solid fa-user-slash me-1"></i><?= InputUtils::escapeHTML($signInBlockedLabel) ?></span>
+                                <?php endif; ?>
+                                <?php if ($locked): ?>
+                                    <span class="badge rounded-pill bg-danger text-white me-1" title="<?= InputUtils::escapeAttribute(gettext('Account locked due to too many failed login attempts')) ?>"><i class="fa-solid fa-lock me-1"></i><?= gettext('Locked') ?></span>
+                                <?php endif; ?>
+                                <?php if ($mustChange): ?>
+                                    <span class="badge rounded-pill bg-warning text-white" title="<?= InputUtils::escapeAttribute(gettext('User must change their password at next login')) ?>"><i class="fa-solid fa-key me-1"></i><?= gettext('Must change password') ?></span>
+                                <?php endif; ?>
+                                <?php if (!$locked && !$mustChange && $signInBlockedLabel === null): ?>
+                                    <span class="text-body-secondary">—</span>
+                                <?php endif; ?>
+                            </td>
+                            <td class="text-center">
+                                <?php if ($user->is2FactorAuthEnabled()) { ?>
+                                    <span class="badge rounded-pill bg-success text-white"><i class="fa-solid fa-circle-check me-1"></i><?= gettext('Enabled') ?></span>
+                                <?php } else { ?>
+                                    <span class="badge rounded-pill bg-danger text-white"><i class="fa-solid fa-circle-xmark me-1"></i><?= gettext('Disabled') ?></span>
+                                <?php } ?>
+                            </td>
+                            <td class="w-1">
+                                <div class="dropdown">
+                                    <button class="btn btn-sm btn-ghost-secondary" type="button" data-bs-toggle="dropdown" data-bs-display="static" aria-expanded="false">
+                                        <i class="fa-solid fa-ellipsis-vertical"></i>
+                                    </button>
+                                    <div class="dropdown-menu dropdown-menu-end">
+                                        <a class="dropdown-item" href="<?= SystemURLs::getRootPath() ?>/admin/system/users/<?= $user->getId() ?>/edit">
+                                            <i class="fa-solid fa-pencil me-2"></i><?= gettext('Edit User') ?>
+                                        </a>
+                                        <a class="dropdown-item" href="<?= SystemURLs::getRootPath() ?>/v2/user/<?= $user->getId() ?>">
+                                            <i class="fa-solid fa-eye me-2"></i><?= gettext('View Details') ?>
+                                        </a>
+                                        <?php if ($user->getPerson() !== null) { ?>
+                                        <a class="dropdown-item" href="<?= Person::getViewURIForId($user->getId()) ?>">
+                                            <i class="fa-solid fa-user me-2"></i><?= gettext('View Person') ?>
+                                        </a>
+                                        <?php if ((int) $user->getPerson()->getFamId() > 0) { ?>
+                                        <a class="dropdown-item" href="<?= Family::getFamilyViewURIForId((int) $user->getPerson()->getFamId()) ?>">
+                                            <i class="fa-solid fa-users me-2"></i><?= gettext('View Family') ?>
+                                        </a>
+                                        <?php } ?>
+                                        <?php } ?>
+                                        <div class="dropdown-divider"></div>
+                                        <a class="dropdown-item" href="<?= SystemURLs::getRootPath() ?>/admin/system/user/<?= $user->getId() ?>/changePassword">
+                                            <i class="fa-solid fa-wrench me-2"></i><?= gettext('Change Password') ?>
+                                        </a>
+                                        <?php if ($bEmailEnabled && $user->getId() != AuthenticationManager::getCurrentUser()->getId() && !empty($user->getEmail())) { ?>
+                                            <a class="dropdown-item js-reset-user-password" href="#" data-user_id="<?= (int) $user->getId() ?>" data-user_name="<?= InputUtils::escapeAttribute($user->getPerson()->getFullName()) ?>">
+                                                <i class="fa-solid fa-paper-plane me-2"></i><?= gettext('Reset Password via Email') ?>
+                                            </a>
+                                        <?php } ?>
+                                        <?php if ($user->getFailedLogins() > 0) { ?>
+                                            <a class="dropdown-item js-reset-login-count" href="#" data-user_id="<?= (int) $user->getId() ?>" data-user_name="<?= InputUtils::escapeAttribute($user->getPerson()->getFullName()) ?>">
+                                                <i class="fa-solid fa-eraser me-2"></i><?= gettext('Reset Failed Logins') ?>
+                                            </a>
+                                        <?php } ?>
+                                        <?php if ($user->is2FactorAuthEnabled()) { ?>
+                                            <a class="dropdown-item js-disable-2fa" href="#" data-user_id="<?= (int) $user->getId() ?>" data-user_name="<?= InputUtils::escapeAttribute($user->getPerson()->getFullName()) ?>">
+                                                <i class="fa-solid fa-shield-halved me-2"></i><?= gettext('Disable 2FA') ?>
+                                            </a>
+                                        <?php } ?>
+                                        <?php if ($user->getId() != AuthenticationManager::getCurrentUser()->getId()) { ?>
+                                            <div class="dropdown-divider"></div>
+                                            <a class="dropdown-item text-danger js-delete-user" href="#" data-user_id="<?= (int) $user->getId() ?>" data-user_name="<?= InputUtils::escapeAttribute($user->getPerson()->getFullName()) ?>">
+                                                <i class="fa-solid fa-trash me-2"></i><?= gettext('Delete User') ?>
+                                            </a>
+                                        <?php } ?>
+                                    </div>
+                                </div>
+                            </td>
+                        </tr>
+                    <?php
+                    } ?>
+                </tbody>
+            </table>
+    </div>
+
+</div>
+<!-- /.box -->
+
+<script src="<?= SystemURLs::assetVersioned('/skin/js/users.js') ?>"></script>
+<script nonce="<?= SystemURLs::getCSPNonce() ?>">
+$(document).ready(function() {
+    // Initialize the user settings panel
+    window.CRM.settingsPanel.init({
+        container: '#userSettingsPanel',
+        title: <?= InputUtils::jsonEncodeForScript(gettext('Quick Settings')) ?>,
+        icon: 'fa-solid fa-user-gear',
+        headerClass: 'bg-primary',
+        settings: <?= InputUtils::jsonEncodeForScript($userSettingsConfig) ?>,
+        onSave: function() {
+            // Reload page after settings save to reflect changes
+            setTimeout(function() {
+                window.location.reload();
+            }, 1500);
+        }
+    });
+});
+</script>
+</div>
+<?php
+require SystemURLs::getDocumentRoot() . '/Include/Footer.php';

@@ -1,0 +1,190 @@
+<?php
+
+use ChurchCRM\Service\DatabaseVersionService;
+use ChurchCRM\Service\UpgradeAPIService;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\LoggerUtils;
+use ChurchCRM\Utils\PathUtils;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+
+$app->group('/api/upgrade', function (RouteCollectorProxy $group): void {
+    /**
+     * @OA\Get(
+     *     path="/api/upgrade/preview",
+     *     operationId="upgradePreview",
+     *     summary="Get upgrade preview: release notes and path without downloading",
+     *     tags={"Admin"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(
+     *         response=200,
+     *         description="Upgrade preview data",
+     *         @OA\JsonContent(type="object",
+     *             @OA\Property(property="installedVersion", type="string"),
+     *             @OA\Property(property="nextVersion", type="string", nullable=true),
+     *             @OA\Property(property="latestVersion", type="string"),
+     *             @OA\Property(property="nextReleaseNotes", type="string"),
+     *             @OA\Property(property="nextChangelogUrl", type="string", nullable=true),
+     *             @OA\Property(property="releasesAhead", type="integer"),
+     *             @OA\Property(property="upgradePath", type="array", @OA\Items(type="object")),
+     *             @OA\Property(property="latestReleaseNotes", type="string", description="Release notes for the latest known GitHub release; empty if release notes are unavailable or GitHub could not be reached"),
+     *             @OA\Property(property="latestChangelogUrl", type="string", description="Changelog URL for the latest known release")
+     *         )
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Forbidden — Admin role required"),
+     *     @OA\Response(response=500, description="Error fetching preview")
+     * )
+     */
+    $group->get('/preview', function (Request $request, Response $response, array $args): Response {
+        try {
+            $preview = UpgradeAPIService::getUpgradePreview();
+            return SlimUtils::renderJSON($response, $preview);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON($response, gettext('Failed to fetch upgrade preview'), [], 500, $e, $request);
+        }
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/api/upgrade/download-latest-release",
+     *     operationId="downloadLatestRelease",
+     *     summary="Download the latest release from GitHub (or a specific version)",
+     *     tags={"Admin"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="version", in="query", required=false, @OA\Schema(type="string"), description="Target version (e.g. 7.2.1). Omit for latest."),
+     *     @OA\Response(
+     *         response=200,
+     *         description="Release file downloaded",
+     *         @OA\JsonContent(type="object",
+     *             @OA\Property(property="fileName", type="string"),
+     *             @OA\Property(property="fullPath", type="string"),
+     *             @OA\Property(property="releaseNotes", type="string"),
+     *             @OA\Property(property="sha1", type="string")
+     *         )
+     *     ),
+     *     @OA\Response(response=400, description="Error downloading release"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Forbidden — Admin role required")
+     * )
+     */
+    $group->get('/download-latest-release', function (Request $request, Response $response, array $args): Response {
+        try {
+            $databaseBlock = DatabaseVersionService::getUpgradeBlockMessage();
+            if ($databaseBlock !== null) {
+                return SlimUtils::renderErrorJSON($response, $databaseBlock, [], 400, null, $request);
+            }
+            $queryParams = $request->getQueryParams();
+            $version = isset($queryParams['version']) ? trim((string) $queryParams['version']) : null;
+            // Basic version format validation to prevent path traversal / injection
+            if ($version !== null && !preg_match('/^\d+\.\d+\.\d+(?:-[\w.]+)?$/', $version)) {
+                return SlimUtils::renderErrorJSON($response, gettext('Invalid version format'), [], 400, null, $request);
+            }
+            $upgradeFile = UpgradeAPIService::downloadLatestRelease($version ?: null);
+            return SlimUtils::renderJSON($response, $upgradeFile);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON($response, gettext('Failed to download latest release'), [], 400, $e, $request);
+        }
+    });
+
+    /**
+     * @OA\Post(
+     *     path="/api/upgrade/do-upgrade",
+     *     operationId="doUpgrade",
+     *     summary="Apply the system upgrade",
+     *     tags={"Admin"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\RequestBody(
+     *         required=true,
+     *         @OA\JsonContent(type="object",
+     *             @OA\Property(property="fullPath", type="string", description="Full path to the upgrade file"),
+     *             @OA\Property(property="sha1", type="string", description="SHA1 hash for verification")
+     *         )
+     *     ),
+     *     @OA\Response(response=200, description="Upgrade applied successfully"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Forbidden — Admin role required"),
+     *     @OA\Response(response=500, description="Error applying upgrade")
+     * )
+     */
+    $group->post('/do-upgrade', function (Request $request, Response $response, array $args): Response {
+        try {
+            $databaseBlock = DatabaseVersionService::getUpgradeBlockMessage();
+            if ($databaseBlock !== null) {
+                return SlimUtils::renderErrorJSON($response, $databaseBlock, [], 400, null, $request);
+            }
+            $input = $request->getParsedBody();
+            $fullPath = $input['fullPath'] ?? null;
+            $sha1 = $input['sha1'] ?? null;
+            if (!$fullPath || !$sha1) {
+                return SlimUtils::renderErrorJSON($response, gettext('Missing required fields: fullPath and sha1'), [], 400, null, $request);
+            }
+            // Prevent path traversal: ensure the file is inside the system temp directory
+            $realPath = PathUtils::resolveRealPathWithin($fullPath, sys_get_temp_dir());
+            if ($realPath === null) {
+                return SlimUtils::renderErrorJSON($response, gettext('Invalid file path'), [], 400, null, $request);
+            }
+            // Guard against stray PHP output (warnings/notices from the legacy
+            // migration scripts the upgrade runs) leaking into the response body
+            // ahead of the JSON, which corrupts it and surfaces client-side as a
+            // "parsererror" even though the upgrade itself succeeded. Anything
+            // captured here is logged, never sent to the client.
+            ob_start();
+            try {
+                UpgradeAPIService::doUpgrade($realPath, $sha1);
+            } finally {
+                $strayOutput = ob_get_clean();
+                if ($strayOutput !== false && trim($strayOutput) !== '') {
+                    LoggerUtils::getAppLogger()->warning('Discarded unexpected output during upgrade apply', ['output' => $strayOutput]);
+                }
+            }
+            return SlimUtils::renderJSON($response, ['success' => true, 'databaseUpgradePending' => true]);
+        } catch (\Throwable $e) {
+            // Return a localized, user-safe error message and log full details server-side
+            // Exception details (including file paths) are logged by SlimUtils::renderErrorJSON
+            return SlimUtils::renderErrorJSON(
+                $response,
+                gettext('Failed to apply upgrade. Please check the server logs for details.'),
+                [],
+                500,
+                $e,
+                $request
+            );
+        }
+    });
+
+    /**
+     * @OA\Post(
+     *     path="/api/upgrade/refresh-upgrade-info",
+     *     operationId="refreshUpgradeInfo",
+     *     summary="Refresh upgrade information from GitHub",
+     *     description="Forces a fresh check of available updates from GitHub and updates session state.",
+     *     tags={"Admin"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(
+     *         response=200,
+     *         description="Upgrade information refreshed",
+     *         @OA\JsonContent(type="object",
+     *             @OA\Property(property="data", type="object"),
+     *             @OA\Property(property="message", type="string")
+     *         )
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Forbidden — Admin role required"),
+     *     @OA\Response(response=500, description="Error refreshing upgrade information")
+     * )
+     */
+    $group->post('/refresh-upgrade-info', function (Request $request, Response $response, array $args): Response {
+        try {
+            $updateData = UpgradeAPIService::refreshUpgradeInfo();
+
+            return SlimUtils::renderJSON($response, [
+                'data' => $updateData,
+                'message' => gettext('Upgrade information refreshed successfully')
+            ]);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON($response, gettext('Failed to refresh upgrade information'), [], 500, $e, $request);
+        }
+    });
+});

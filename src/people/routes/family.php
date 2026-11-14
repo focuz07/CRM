@@ -1,0 +1,246 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\PeopleCustomField;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\model\ChurchCRM\FamilyCustomMasterQuery;
+use ChurchCRM\model\ChurchCRM\FamilyCustomQuery;
+use ChurchCRM\model\ChurchCRM\FamilyQuery;
+use ChurchCRM\model\ChurchCRM\Map\PledgeTableMap;
+use ChurchCRM\model\ChurchCRM\PledgeQuery;
+use ChurchCRM\model\ChurchCRM\PropertyQuery;
+use ChurchCRM\Service\CustomFieldService;
+use ChurchCRM\Service\FinancialService;
+use ChurchCRM\Service\PersonSignInService;
+use ChurchCRM\Service\TimelineService;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\FiscalYearUtils;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\view\PageHeader;
+use Propel\Runtime\ActiveQuery\Criteria;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+use Slim\Views\PhpRenderer;
+
+$app->group('/family', function (RouteCollectorProxy $group): void {
+    $group->get('/not-found', 'viewFamilyNotFound');
+    $group->get('/{id}', 'viewFamily');
+    $group->get('/', 'listFamilies');
+    $group->get('', 'listFamilies');
+});
+
+/**
+ * List families with filtering options (active, inactive, by city/state, geocoded status).
+ *
+ * @param Request $request HTTP request
+ * @param Response $response HTTP response
+ * @param array $args Route arguments
+ * @return Response Rendered family list page
+ */
+function listFamilies(Request $request, Response $response, array $args): Response
+{
+    $renderer = new PhpRenderer(__DIR__ . '/../views/');
+    $sMode = 'Active';
+
+    $queryParams = $request->getQueryParams();
+
+    $familyActiveStatus = 'active';
+    if (!empty($queryParams['mode'])) {
+        $modeVal = strtolower(InputUtils::legacyFilterInput($queryParams['mode']));
+        if ($modeVal === 'inactive') {
+            $familyActiveStatus = 'inactive';
+        } elseif ($modeVal === 'all') {
+            $familyActiveStatus = 'all';
+        } else {
+            $familyActiveStatus = 'active';
+        }
+    }
+    if (isset($queryParams['familyActiveStatus'])) {
+        $familyActiveStatus = strtolower(InputUtils::legacyFilterInput($queryParams['familyActiveStatus']));
+    } elseif (isset($queryParams['active'])) {
+        $familyActiveStatus = ($queryParams['active'] === '0' || $queryParams['active'] === 'false') ? 'inactive' : 'active';
+    }
+
+    $filterCity = '';
+    if (!empty($queryParams['City'])) {
+        $filterCity = InputUtils::legacyFilterInput($queryParams['City']);
+    }
+
+    $filterState = '';
+    if (!empty($queryParams['State'])) {
+        $filterState = InputUtils::legacyFilterInput($queryParams['State']);
+    }
+
+    $filterGeocoded = '';
+    if (!empty($queryParams['geocoded'])) {
+        $filterGeocoded = InputUtils::legacyFilterInput($queryParams['geocoded']);
+    }
+
+    $familiesQuery = FamilyQuery::create()->orderByName();
+
+    if ($familyActiveStatus === 'active') {
+        $familiesQuery->filterByDateDeactivated(null);
+        $sMode = 'Active';
+    } elseif ($familyActiveStatus === 'inactive') {
+        $familiesQuery->filterByDateDeactivated(null, Criteria::ISNOTNULL);
+        $sMode = 'Inactive';
+    } else {
+        $sMode = 'All';
+    }
+
+    if ($filterCity !== '') {
+        $familiesQuery->filterByCity('%' . $filterCity . '%', Criteria::LIKE);
+        $sMode = $sMode . ' - ' . $filterCity;
+    }
+
+    if ($filterState !== '') {
+        $familiesQuery->filterByState('%' . $filterState . '%', Criteria::LIKE);
+        $sMode = $sMode . ' - ' . $filterState;
+    }
+
+    if ($filterGeocoded === 'unverified') {
+        $familiesQuery->filterByAddress1('', Criteria::NOT_EQUAL);
+        $familiesQuery->where('(family_fam.fam_Latitude IS NULL OR family_fam.fam_Latitude = 0) OR (family_fam.fam_Longitude IS NULL OR family_fam.fam_Longitude = 0)');
+        $sMode = $sMode . ' - ' . gettext('Unverified Addresses');
+    }
+
+    $families = $familiesQuery->find();
+    $pageArgs = [
+        'sMode' => $sMode,
+        'sRootPath' => SystemURLs::getRootPath(),
+        'sPageTitle' => gettext('Families'),
+        'sPageSubtitle' => gettext('Browse and search all families in your congregation'),
+        'aBreadcrumbs' => PageHeader::breadcrumbs([
+            [gettext('People'), '/people/dashboard'],
+            [gettext('Families')],
+        ]),
+        'families' => $families,
+        'filterCity' => $filterCity,
+        'filterState' => $filterState,
+        'filterGeocoded' => $filterGeocoded,
+        'familyActiveStatus' => $familyActiveStatus,
+    ];
+
+    return $renderer->render($response, 'family-list.php', $pageArgs);
+}
+
+/**
+ * Display a "family not found" error page for an invalid family ID.
+ *
+ * @param Request $request HTTP request
+ * @param Response $response HTTP response
+ * @param array $args Route arguments
+ * @return Response Rendered error page
+ */
+function viewFamilyNotFound(Request $request, Response $response, array $args): Response
+{
+    $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+    $pageArgs = [
+        'sRootPath' => SystemURLs::getRootPath(),
+        'memberType' => 'Family',
+        'id' => SlimUtils::getURIParamInt($request, 'id'),
+    ];
+
+    return $renderer->render($response, 'not-found-view.php', $pageArgs);
+}
+
+/**
+ * Display the family profile page with custom fields, timeline, properties, and finance options.
+ *
+ * @param Request $request HTTP request
+ * @param Response $response HTTP response
+ * @param array $args Route arguments (id = family ID)
+ * @return Response Rendered family profile page or redirect if not found
+ */
+function viewFamily(Request $request, Response $response, array $args): Response
+{
+    $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+    $familyId = (int)$args['id'];
+    $family = FamilyQuery::create()->findPk($familyId);
+
+    if (empty($family)) {
+        return SlimUtils::renderRedirect($response, SystemURLs::getRootPath() . '/people/family/not-found?id=' . $familyId);
+    }
+
+    $timelineService = new TimelineService();
+
+    $allFamilyProperties = PropertyQuery::create()->findByProClass('f');
+
+    $allFamilyCustomFields = FamilyCustomMasterQuery::create()->find();
+
+    $rawQry = FamilyCustomQuery::create();
+    foreach ($allFamilyCustomFields as $customfield) {
+        $rawQry->addAsColumn(str_replace(['.', '(', ')'], '', $customfield->getField()), $customfield->getField());
+    }
+    $appFamilyCustomFields = $rawQry->findOneByFamId($familyId);
+
+    $familyCustom = [];
+    $customFieldService = new CustomFieldService();
+    if ($appFamilyCustomFields) {
+        foreach ($allFamilyCustomFields as $customfield) {
+            if ($customFieldService->canView($customfield->getFieldSecurity())) {
+                $value = $appFamilyCustomFields->getVirtualColumn($customfield->getField());
+                if (!empty($value)) {
+                    $item = new PeopleCustomField($customfield, $value);
+                    $familyCustom[] = $item;
+                }
+            }
+        }
+    }
+
+    $pageArgs = [
+        'sRootPath' => SystemURLs::getRootPath(),
+        'sPageTitle' => gettext('Family') . ': ' . InputUtils::escapeHTML($family->getName()),
+        'sPageSubtitle' => gettext('View family details, members, and timeline'),
+        'aBreadcrumbs' => PageHeader::breadcrumbs([
+            [gettext('People'), '/people/dashboard'],
+            [gettext('Families'), '/people/family'],
+            [InputUtils::escapeHTML($family->getName())],
+        ]),
+        'family' => $family,
+        'familyTimeline' => $timelineService->getForFamily($family->getId()),
+        'allFamilyProperties' => $allFamilyProperties,
+        'familyCustom' => $familyCustom,
+        'currentFY'           => FinancialService::formatFiscalYear(FiscalYearUtils::getCurrentFiscalYearId()),
+        'currentFYId'          => FiscalYearUtils::getCurrentFiscalYearId(),
+        'familyAvailableFyids' => (function () use ($familyId): array {
+            // Distinct FYID values for this family's pledge/payment history, newest first.
+            // Used to render server-side FY filter pills on the Pledges & Payments card,
+            // which is only ever shown to finance-enabled users — skip the query
+            // entirely for everyone else rather than running it on every family
+            // profile view (one of the most frequently loaded pages) for data
+            // that's never used.
+            if (!AuthenticationManager::getCurrentUser()->isFinanceEnabled()) {
+                return [];
+            }
+            $fyids = PledgeQuery::create()
+                ->filterByFamId($familyId)
+                ->addAsColumn('FyId', PledgeTableMap::COL_PLG_FYID)
+                ->select(['FyId'])
+                ->distinct()
+                ->find()
+                ->toArray();
+            $unique = array_unique(array_map('intval', array_filter($fyids, fn($v) => $v !== null && $v !== 0)));
+            rsort($unique);
+            return $unique;
+        })(),
+        'taxYears' => [],
+    ];
+
+    // Sign-in status under each member, for staff who edit records
+    if (AuthenticationManager::getCurrentUser()->isEditRecordsEnabled() && SystemConfig::getBooleanValue('bMemberSignIn')) {
+        $pageArgs['portalSignInStatuses'] = (new PersonSignInService())->statusesFor($family->getPeople());
+    }
+
+    if (AuthenticationManager::getCurrentUser()->isFinanceEnabled()) {
+        $finService = new FinancialService();
+        $maxTaxYears = SystemConfig::getIntValue('iMaxTaxYears');
+        $pageArgs['taxYears'] = $finService->getFamilyPaymentYears($familyId, $maxTaxYears > 0 ? $maxTaxYears : 0);
+    }
+
+    return $renderer->render($response, 'family-view.php', $pageArgs);
+}

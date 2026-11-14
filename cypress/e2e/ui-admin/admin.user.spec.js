@@ -1,0 +1,189 @@
+describe("Admin User Password", () => {
+    beforeEach(() => {
+        cy.setupAdminSession();
+    });
+
+    it("List System Users", () => {
+        cy.visit("admin/system/users");
+        cy.contains("Church Admin");
+    });
+
+    it("Shows Status column header in the users table", () => {
+        cy.visit("admin/system/users");
+        cy.get("#user-listing-table thead th").contains("Status").should("exist");
+    });
+
+    it("Shows em-dash in Status column for a normal active user", () => {
+        cy.visit("admin/system/users");
+        // Status is the 6th column (Name, Login Name, Access, Last Login, Failed Logins, Status).
+        // Target it by position to avoid matching the pre-existing em-dash in Failed Logins (col 5).
+        cy.contains("#user-listing-table tbody tr", "Church Admin")
+            .find("td:nth-child(6)")
+            .should("contain.text", "—");
+    });
+
+    describe("Change Password", () => {
+        // A throwaway account: a password change also rotates the account's API key.
+        const PERSON_ID = 28; // Rafael Dixon, no seeded account
+
+        before(() => {
+            cy.makePrivateAdminAPICall("DELETE", `/admin/api/user/${PERSON_ID}/`, null, [200, 404]);
+            cy.setupAdminSession({ forceLogin: true });
+            cy.visit(`admin/system/users/new?personId=${PERSON_ID}`);
+            cy.contains("User Editor");
+            cy.get("#SaveButton").click();
+            cy.location("pathname").should("match", /\/admin\/system\/users$/);
+        });
+
+        after(() => {
+            cy.makePrivateAdminAPICall("DELETE", `/admin/api/user/${PERSON_ID}/`, null, 200);
+        });
+
+        it("Admin Change password", () => {
+            cy.visit("admin/system/user/28/changePassword");
+            cy.contains("Change Password");
+            cy.contains("Rafael Dixon");
+            cy.get("#NewPassword1").type("new-user-password");
+            cy.get("#NewPassword2").type("new-user-password");
+            cy.get("#NewPassword1").closest("form").submit();
+            cy.url().should("contain", "admin/system/user/28/changePassword");
+            cy.contains("Password Change Successful");
+        });
+
+        it("Admin Change password stops a blank confirmation in the browser", () => {
+            cy.visit("/admin/system/user/28/changePassword");
+            cy.get("#NewPassword1").type("only-in-the-first-box");
+            cy.get("#NewPassword1").closest("form").submit();
+            cy.get("#NewPasswordError").should("have.text", "You must enter the same password in both boxes");
+            cy.get("#NewPassword1").should("have.value", "only-in-the-first-box");
+            cy.contains("Password Change Successful").should("not.exist");
+        });
+
+        it("Admin Change password refuses a confirmation that does not match", () => {
+            cy.visit("/admin/system/user/28/changePassword");
+            cy.get("input[name=csrf_token]")
+                .invoke("val")
+                .then((csrfToken) =>
+                    cy.request({
+                        method: "POST",
+                        url: "/admin/system/user/28/changePassword",
+                        form: true,
+                        body: { csrf_token: csrfToken, NewPassword1: "first-box", NewPassword2: "second-box" },
+                    }),
+                )
+                .its("body")
+                .should("contain", "You must enter the same password in both boxes")
+                .and("not.contain", "Password Change Successful");
+        });
+
+        it("Admin Change password refuses a blank password", () => {
+            cy.visit("/admin/system/user/28/changePassword");
+            cy.get("#NewPassword1").closest("form").submit();
+            cy.get("#NewPasswordError").should("have.text", "Enter a new password");
+            cy.contains("Password Change Successful").should("not.exist");
+        });
+    });
+
+    it("Create System Users", () => {
+        // Ensure clean start: if Peyton Ray already exists as a user, remove that user first.
+        // The route is declared as $group->delete('/') inside $app->group('/api/user/{userId}'),
+        // so the real path carries a trailing slash — without it Slim 4 returns 404 and the
+        // cleanup silently no-ops (issue #9782). 404 is allowed here only because the user
+        // genuinely may not exist yet.
+        cy.makePrivateAdminAPICall("DELETE", "/admin/api/user/25/", null, [200, 404]);
+        // Re-login after API call to restore session (necessary after makePrivateAdminAPICall)
+        cy.setupAdminSession({ forceLogin: true });
+        
+        // Go directly to user editor to create a user for PersonID=25
+        cy.visit('admin/system/users/new?personId=25');
+        cy.contains("User Editor");
+        
+        // Check that the form has pre-populated the UserName field with a value
+        cy.get('#UserName').invoke('val').should('not.be.empty');
+        
+        // Click Save button to submit the form
+        cy.get('#SaveButton').click();
+        
+        // Navigate to the system users page to verify the user was created
+        cy.visit('admin/system/users', { timeout: 10000 });
+        
+        // Verify the page loaded and has the user table
+        cy.get('#user-listing-table').should('exist');
+        
+        // DataTables v2 uses class .dt-search (not #table_id_filter) for the search wrapper.
+        // Search so Peyton Ray is visible regardless of pagination page.
+        cy.get('.dt-search input').type('Peyton Ray');
+        cy.get('#user-listing-table tbody').should('contain.text', 'Peyton Ray');
+
+        // Clean up: remove user status for PersonID=25 via API so test can be re-run.
+        // The user was just created, so this must return 200 — accepting 404 here would
+        // hide a cleanup that never ran and leak a user_usr row (issue #9782).
+        cy.makePrivateAdminAPICall("DELETE", "/admin/api/user/25/", null, 200);
+        // Re-login after API call to restore session
+        cy.setupAdminSession({ forceLogin: true });
+    });
+
+    // GHSA-4qpj-3hw2-52g8: Stored XSS via Person Name in Admin Users page.
+    // Verify that action menu items use safe data-* attributes instead of
+    // inline onclick handlers, eliminating the JS-string-in-HTML-attribute
+    // context that allowed arbitrary script injection.
+    it("GHSA-4qpj-3hw2-52g8: user action menu uses safe data-* attributes, not inline onclick", () => {
+        // The previous test (Create System Users) ends with forceLogin, which
+        // switches the browser to a new uniquely-named session. The shared
+        // beforeEach then restores the older 'admin-session' from Cypress cache,
+        // but that PHP session can be stale after 21+ minutes of CI run time.
+        // Force a fresh login here to guarantee a valid server-side session.
+        cy.setupAdminSession({ forceLogin: true });
+
+        cy.visit("admin/system/users");
+        cy.get("#user-listing-table").should("exist");
+
+        // The logged-in admin's own row has no delete button, but every other
+        // user row does. With the test DB having many users, page 1 always
+        // contains at least one non-self user — no DataTable search or
+        // pagination needed.
+        cy.get("#user-listing-table tbody .js-delete-user")
+            .should("have.length.at.least", 1)
+            .first()
+            .as("deleteLink");
+
+        // Must use safe data-* attributes, not inline onclick.
+        // This is the structural guard against regression to the XSS-vulnerable
+        // pattern of embedding JS strings directly in HTML attribute context.
+        cy.get("@deleteLink").should("have.attr", "data-user_id");
+        cy.get("@deleteLink").invoke("attr", "data-user_id").should("match", /^\d+$/);
+        cy.get("@deleteLink").should("have.attr", "data-user_name");
+        cy.get("@deleteLink").should("not.have.attr", "onclick");
+    });
+
+    describe("Reset Failed Logins (#10129)", () => {
+        const userName = "noperm.user";
+        const userId = 901;
+
+        before(() => {
+            cy.clearCookies();
+            cy.request({
+                method: "POST",
+                url: "/session/begin",
+                form: true,
+                body: { User: userName, Password: "not-the-password" },
+                failOnStatusCode: false,
+            });
+        });
+
+        after(() => {
+            cy.makePrivateAdminAPICall("POST", `/admin/api/user/${userId}/login/reset`, null, 200);
+        });
+
+        it("reloads the users list after the reset", () => {
+            cy.intercept("POST", `**/admin/api/user/${userId}/login/reset`).as("resetLogins");
+            cy.visit("admin/system/users");
+            cy.get(".dt-search input").type(userName);
+            cy.contains("#user-listing-table tbody tr", userName).find('[data-bs-toggle="dropdown"]').click();
+            cy.get(`.js-reset-login-count[data-user_id="${userId}"]`).click();
+            cy.get(".bootbox-accept").click();
+            cy.wait("@resetLogins").its("response.statusCode").should("eq", 200);
+            cy.get(`.js-reset-login-count[data-user_id="${userId}"]`).should("not.exist");
+        });
+    });
+});

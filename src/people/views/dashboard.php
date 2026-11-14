@@ -1,0 +1,323 @@
+<?php
+
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Utils\InputUtils;
+
+require SystemURLs::getDocumentRoot() . '/Include/Header.php';
+
+?>
+
+<div class="container-fluid">
+
+    <!-- Stat Cards Row -->
+    <div class="row mb-3">
+        <div class="col-6 col-lg-3">
+            <a href="<?= $sRootPath ?>/people/family" class="card card-sm text-decoration-none">
+                <div class="card-body">
+                    <div class="row align-items-center">
+                        <div class="col-auto">
+                            <span class="bg-secondary text-white avatar rounded-circle">
+                                <i class="fa-solid fa-people-roof icon"></i>
+                            </span>
+                        </div>
+                        <div class="col">
+                            <div class="fw-medium text-body"><?= $familyCount['familyCount'] ?></div>
+                            <div class="text-body-secondary"><?= gettext('Families') ?></div>
+                        </div>
+                    </div>
+                </div>
+            </a>
+        </div>
+        <div class="col-6 col-lg-3">
+            <a href="<?= $sRootPath ?>/people/list" class="card card-sm text-decoration-none">
+                <div class="card-body">
+                    <div class="row align-items-center">
+                        <div class="col-auto">
+                            <span class="bg-success text-white avatar rounded-circle">
+                                <i class="fa-solid fa-people-group icon"></i>
+                            </span>
+                        </div>
+                        <div class="col">
+                            <div class="fw-medium text-body"><?= $personCount ?></div>
+                            <div class="text-body-secondary"><?= gettext('People') ?></div>
+                        </div>
+                    </div>
+                </div>
+            </a>
+        </div>
+        <?php if (SystemConfig::getValue('bEnabledSundaySchool')) { ?>
+        <div class="col-6 col-lg-3">
+            <a href="<?= $sRootPath ?>/groups/sundayschool" class="card card-sm text-decoration-none">
+                <div class="card-body">
+                    <div class="row align-items-center">
+                        <div class="col-auto">
+                            <span class="bg-warning text-white avatar rounded-circle">
+                                <i class="fa-solid fa-children icon"></i>
+                            </span>
+                        </div>
+                        <div class="col">
+                            <div class="fw-medium text-body"><?= $groupStats['sundaySchoolkids'] ?></div>
+                            <div class="text-body-secondary"><?= gettext('Sunday School Kids') ?></div>
+                        </div>
+                    </div>
+                </div>
+            </a>
+        </div>
+        <?php } ?>
+        <div class="col-6 col-lg-3">
+            <a href="<?= $sRootPath ?>/groups/dashboard" class="card card-sm text-decoration-none">
+                <div class="card-body">
+                    <div class="row align-items-center">
+                        <div class="col-auto">
+                            <span class="bg-primary text-white avatar rounded-circle">
+                                <i class="fa-solid fa-users icon"></i>
+                            </span>
+                        </div>
+                        <div class="col">
+                            <div class="fw-medium text-body"><?= $groupStats['groups'] ?></div>
+                            <div class="text-body-secondary"><?= gettext('Groups') ?></div>
+                        </div>
+                    </div>
+                </div>
+            </a>
+        </div>
+    </div>
+
+    <!-- Quick Actions -->
+    <div class="card mb-3">
+        <div class="card-header">
+            <h3 class="card-title"><i class="fa-solid fa-bolt me-2"></i><?= gettext('Quick Actions') ?></h3>
+        </div>
+        <div class="card-body">
+            <div class="d-flex flex-wrap gap-2">
+                <?php if ($canEdit) : ?>
+                <a href="<?= $sRootPath ?>/people/verify" class="btn btn-outline-info">
+                    <i class="fa-solid fa-clipboard-check me-1"></i><?= gettext('Verify People') ?>
+                </a>
+                <?php endif; ?>
+                <?php if (!empty($canFixSignInEmail)) : ?>
+                    <a href="<?= $sRootPath ?>/people/sign-in-email" class="btn btn-outline-warning" id="signInEmailAttentionLink">
+                        <i class="fa-solid fa-envelope-circle-check me-1"></i><?= gettext('Email needs attention') ?>
+                    </a>
+                <?php endif; ?>
+                <?php if ($canEmail): ?>
+                    <button type="button" class="btn btn-outline-primary"
+                            data-email-composer
+                            data-email-endpoint="people/emails"
+                            data-email-title="<?= InputUtils::escapeAttribute(gettext('Email All Members')) ?>">
+                        <i class="fa-solid fa-envelope me-1"></i><?= gettext('Email All') ?>
+                    </button>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content Row -->
+    <div class="row">
+
+        <!-- Left column: Classification + Family Roles -->
+        <div class="col-lg-6">
+
+            <!-- People Classification -->
+            <div class="card mb-3">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-chart-bar me-2"></i><?= gettext('People by Classification') ?></h3>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-sm table-hover table-vcenter card-table">
+                        <thead>
+                            <tr>
+                                <th><?= gettext('Classification') ?></th>
+                                <th class="share-col"><?= gettext('Share') ?></th>
+                                <th class="text-end count-col"><?= gettext('Count') ?></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach (array_keys($classificationStats) as $key):
+                                $pct = $personCount > 0 ? round($classificationStats[$key]['count'] / $personCount * 100) : 0;
+                                ?>
+                                <tr>
+                                    <td class="text-nowrap">
+                                        <a href="<?= $sRootPath ?>/people/list?Classification=<?= $classificationStats[$key]['id'] ?>">
+                                            <?= gettext($key) ?>
+                                        </a>
+                                    </td>
+                                    <td>
+                                        <div class="d-flex align-items-center">
+                                            <div class="progress progress-thin flex-grow-1 me-2">
+                                                <div class="progress-bar bg-primary" style="width:<?= $pct ?>%"></div>
+                                            </div>
+                                            <span class="text-body-secondary small pct-label"><?= $pct ?>%</span>
+                                        </div>
+                                    </td>
+                                    <td class="text-end">
+                                        <span class="text-body fw-medium"><?= $classificationStats[$key]['count'] ?></span>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Family Roles -->
+            <div class="card mb-3">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-people-group me-2"></i><?= gettext('Family Roles') ?></h3>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-sm table-hover table-vcenter card-table">
+                        <thead>
+                            <tr>
+                                <th><?= gettext('Role / Gender') ?></th>
+                                <th class="share-col"><?= gettext('Share') ?></th>
+                                <th class="text-end count-col"><?= gettext('Count') ?></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach (array_keys($familyRoleStats) as $key):
+                                $genderId        = $familyRoleStats[$key]['genderId'];
+                                $roleId          = $familyRoleStats[$key]['roleId'];
+                                $roleGenderCount = $familyRoleStats[$key]['count'];
+                                if ($roleGenderCount === 0) { continue; }
+                                $pct = $personCount > 0 ? round(($roleGenderCount / $personCount) * 100) : 0;
+                                ?>
+                                <tr>
+                                    <td class="text-nowrap">
+                                        <a href="<?= $sRootPath ?>/people/list?Gender=<?= $genderId ?>&FamilyRole=<?= $roleId ?>">
+                                            <?= $key ?>
+                                        </a>
+                                    </td>
+                                    <td>
+                                        <div class="d-flex align-items-center">
+                                            <div class="progress progress-thin flex-grow-1 me-2">
+                                                <div class="progress-bar bg-success" style="width:<?= $pct ?>%"></div>
+                                            </div>
+                                            <span class="text-body-secondary small pct-label"><?= $pct ?>%</span>
+                                        </div>
+                                    </td>
+                                    <td class="text-end">
+                                        <span class="text-body fw-medium"><?= $roleGenderCount ?></span>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Right column: Reports + Gender Demographics + Age Histogram -->
+        <div class="col-lg-6">
+
+            <!-- Reports -->
+            <div class="card mb-3">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-file-lines me-2"></i><?= gettext('Reports') ?></h3>
+                </div>
+                <div class="list-group list-group-flush">
+                    <a href="<?= $sRootPath ?>/DirectoryReports.php" class="list-group-item list-group-item-action d-flex align-items-center">
+                        <i class="fa-solid fa-address-book fa-fw text-body-secondary me-3"></i>
+                        <div>
+                            <div class="fw-medium"><?= gettext('People Directory') ?></div>
+                            <div class="text-body-secondary small"><?= gettext('Printable directory of all people, grouped by family') ?></div>
+                        </div>
+                        <i class="fa-solid fa-chevron-right ms-auto text-body-secondary"></i>
+                    </a>
+                    <a href="<?= $sRootPath ?>/people/reports/letters-and-labels" class="list-group-item list-group-item-action d-flex align-items-center">
+                        <i class="fa-solid fa-envelope-open-text fa-fw text-body-secondary me-3"></i>
+                        <div>
+                            <div class="fw-medium"><?= gettext('Letters & Mailing Labels') ?></div>
+                            <div class="text-body-secondary small"><?= gettext('Generate letters and mailing labels') ?></div>
+                        </div>
+                        <i class="fa-solid fa-chevron-right ms-auto text-body-secondary"></i>
+                    </a>
+                </div>
+            </div>
+
+            <!-- Gender Demographics -->
+            <div class="card mb-3">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-id-card-clip me-2"></i><?= gettext('Gender Demographics') ?></h3>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-sm table-hover table-vcenter card-table">
+                        <thead>
+                            <tr>
+                                <th><?= gettext('Gender') ?></th>
+                                <th><?= gettext('Share') ?></th>
+                                <th class="text-end"><?= gettext('Count') ?></th>
+                                <th class="text-end"><?= gettext('Percentage') ?></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php
+                            $totalGender = array_sum($simpleGenderStats);
+                            foreach ($simpleGenderStats as $gender => $count):
+                                if ($count <= 0) { continue; }
+                                $pct = $totalGender > 0 ? round(($count / $totalGender) * 100, 1) : 0;
+                                ?>
+                                <tr>
+                                    <td><?= gettext($gender) ?></td>
+                                    <td>
+                                        <div class="progress progress-xs">
+                                            <div class="progress-bar bg-info" style="width:<?= $pct ?>%"></div>
+                                        </div>
+                                    </td>
+                                    <td class="text-end"><strong><?= $count ?></strong></td>
+                                    <td class="text-end text-body-secondary"><?= $pct ?>%</td>
+                                </tr>
+                            <?php endforeach; ?>
+                            <tr class="bg-surface-secondary">
+                                <td colspan="2"><strong><?= gettext('Total') ?></strong></td>
+                                <td class="text-end"><strong><?= $totalGender ?></strong></td>
+                                <td class="text-end"><strong>100%</strong></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Age Histogram -->
+            <div class="card mb-3">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-chart-column me-2"></i><?= gettext('Age Distribution') ?></h3>
+                </div>
+                <div class="card-body">
+                    <div id="age-stats-bar" class="age-stats-chart"></div>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+</div>
+
+<script nonce="<?= SystemURLs::getCSPNonce() ?>">
+    $(document).ready(function () {
+        var ageGroupLabels = <?= InputUtils::jsonEncodeForScript(array_keys($ageGroupStats)) ?>;
+        var ageGroupValues = <?= InputUtils::jsonEncodeForScript(array_values($ageGroupStats)) ?>;
+
+        var ageChartElement = document.getElementById('age-stats-bar');
+        if (ageChartElement && window.ApexCharts) {
+            new window.ApexCharts(ageChartElement, {
+                chart: { type: 'bar', height: 300, toolbar: { show: false } },
+                plotOptions: { bar: { borderRadius: 3, columnWidth: '60%' } },
+                series: [{ name: "<?= gettext('People') ?>", data: ageGroupValues }],
+                xaxis: { categories: ageGroupLabels, labels: { rotate: -45 } },
+                yaxis: { title: { text: "<?= gettext('Count') ?>" }, forceNiceScale: true },
+                dataLabels: { enabled: false },
+                grid: { borderColor: '#f0f0f0' }
+            }).render();
+        }
+    });
+</script>
+
+<?php if ($canEmail): ?>
+<script src="<?= SystemURLs::assetVersioned('/skin/v2/email-composer.min.js') ?>" defer nonce="<?= SystemURLs::getCSPNonce() ?>"></script>
+<?php endif; ?>
+
+<?php require SystemURLs::getDocumentRoot() . '/Include/Footer.php'; ?>

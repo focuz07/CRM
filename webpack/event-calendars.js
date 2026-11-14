@@ -1,0 +1,1169 @@
+// FullCalendar v7 — bundled via webpack (ESM imports).
+// temporal-polyfill must come first: it sets globalThis.Temporal, which FC reads at module load.
+import "temporal-polyfill/global";
+import { Calendar } from "fullcalendar/all";
+import formaTheme from "fullcalendar/themes/forma";
+import "fullcalendar/skeleton.css";
+import "fullcalendar/themes/forma/theme.css";
+import "fullcalendar/themes/forma/palettes/blue.css";
+import { alertAction, confirmAction } from "./common/confirm-action";
+import { applyFcLocale } from "./common/fc-locale";
+import { escapeHtml } from "./utils/escape-html";
+
+window.moveEventModal = {
+  getOptions: (confirmLabel) => ({
+    tone: "primary",
+    className: "modal-sm",
+    cancelLabel: `<i class="fa-solid fa-xmark me-1"></i>${i18next.t("Cancel")}`,
+    confirmLabel: `<i class="fa-solid fa-check me-1"></i>${i18next.t(confirmLabel || "Confirm")}`,
+    onCancel: () => window.moveEventModal.revertFunc(),
+  }),
+  buildMessage: (_eventTitle, fromLabel, fromDate, toLabel, toDate) =>
+    '<p class="text-muted mb-3">' +
+    i18next.t("Are you sure you want to continue?") +
+    "</p>" +
+    '<div class="d-flex align-items-stretch gap-2">' +
+    '<div class="card flex-fill border-danger-subtle mb-0">' +
+    '<div class="card-body py-2 px-3">' +
+    '<div class="text-danger small fw-medium mb-1"><i class="fa-solid fa-calendar-xmark me-1"></i>' +
+    i18next.t(fromLabel) +
+    "</div>" +
+    '<div class="fw-semibold">' +
+    fromDate +
+    "</div>" +
+    "</div></div>" +
+    '<div class="d-flex align-items-center text-muted px-1"><i class="fa-solid fa-arrow-right"></i></div>' +
+    '<div class="card flex-fill border-success-subtle mb-0">' +
+    '<div class="card-body py-2 px-3">' +
+    '<div class="text-success small fw-medium mb-1"><i class="fa-solid fa-calendar-check me-1"></i>' +
+    i18next.t(toLabel) +
+    "</div>" +
+    '<div class="fw-semibold">' +
+    toDate +
+    "</div>" +
+    "</div></div>" +
+    "</div>",
+  applyMove: () => {
+    const evt = window.moveEventModal.event;
+    // Storage convention: wall-clock-in-sTimeZone (matches all existing
+    // events). FullCalendar's `startStr`/`endStr` already carry the time
+    // in the calendar's configured tz (sTimeZone). Strip any trailing Z
+    // or +HH:MM offset so PHP/Propel stores the wall-clock numbers as-is
+    // and hydrates them back in sTimeZone for display. Using `toISOString()`
+    // here would send UTC and double-shift the time on read.
+    const stripTz = (s) => (typeof s === "string" ? s.replace(/(?:Z|[+-]\d{2}:\d{2})$/, "") : s);
+    window.CRM.APIRequest({
+      method: "POST",
+      path: `events/${evt.id}/time`,
+      data: JSON.stringify({
+        startTime: evt.allDay ? evt.startStr : stripTz(evt.startStr),
+        endTime: evt.end ? stripTz(evt.endStr) : null,
+      }),
+    });
+  },
+  // Format a FullCalendar event Date for display in the church's wall-clock.
+  // FullCalendar uses "marker" Dates: a JS Date whose UTC components encode
+  // the wall-clock time in the calendar's configured timezone (so a 10 PM
+  // Detroit event has start.getUTCHours() === 22, regardless of browser tz).
+  // Read those UTC components verbatim with `timeZone: "UTC"` so the modal
+  // mirrors the time the calendar grid displays. Using `timeZone: sTimeZone`
+  // would re-apply the offset and shift the display by the church's UTC
+  // offset (e.g. 10 PM → 6 PM on EDT calendars).
+  formatChurchDate: (date) => {
+    if (!(date instanceof Date)) return "";
+    return new Intl.DateTimeFormat(undefined, {
+      timeZone: "UTC",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    }).format(date);
+  },
+  handleEventDrop: (info) => {
+    const event = info.event;
+    const revertFunc = info.revert;
+    // Fixed-date events (birthdays, anniversaries, holidays) have startEditable=false
+    // via per-event `editable: false`. Guard against any path that still fires the
+    // drop handler on them so the move-confirmation modal never appears. See #4835.
+    if (!event.startEditable) {
+      revertFunc();
+      return;
+    }
+    const fmt = window.moveEventModal.formatChurchDate;
+    const originalStart = info.oldEvent.start ? fmt(info.oldEvent.start) : info.oldEvent.startStr;
+    const newStart = event.start ? fmt(event.start) : event.startStr;
+    window.moveEventModal.revertFunc = revertFunc;
+    window.moveEventModal.event = event;
+    confirmAction(
+      `<i class="fa-solid fa-calendar-days me-2 text-primary"></i>${escapeHtml(event.title)}`,
+      window.moveEventModal.buildMessage(event.title, "From", originalStart, "To", newStart),
+      window.moveEventModal.applyMove,
+      window.moveEventModal.getOptions("Move"),
+    );
+  },
+  handleEventResize: (info) => {
+    const event = info.event;
+    const revertFunc = info.revert;
+    if (!event.durationEditable) {
+      revertFunc();
+      return;
+    }
+    const fmt = window.moveEventModal.formatChurchDate;
+    const originalEnd = info.oldEvent.end ? fmt(info.oldEvent.end) : info.oldEvent.endStr || info.oldEvent.startStr;
+    const newEnd = event.end ? fmt(event.end) : event.endStr || event.startStr;
+    window.moveEventModal.revertFunc = revertFunc;
+    window.moveEventModal.event = event;
+    confirmAction(
+      `<i class="fa-solid fa-clock me-2 text-primary"></i>${escapeHtml(event.title)}`,
+      window.moveEventModal.buildMessage(event.title, "Old End", originalEnd, "New End", newEnd),
+      window.moveEventModal.applyMove,
+      window.moveEventModal.getOptions("Resize"),
+    );
+  },
+};
+
+window.CRM.refreshAllFullCalendarSources = () => {
+  window.CRM.fullcalendar.refetchEvents();
+};
+
+function deleteCalendar() {
+  window.CRM.APIRequest({
+    method: "DELETE",
+    path: `calendars/${window.calendarPropertiesModal.calendar.Id}`,
+  }).done(() => {
+    const eventSource = window.CRM.fullcalendar.getEventSourceById(
+      `user-${window.calendarPropertiesModal.calendar.Id}`,
+    );
+    if (eventSource) {
+      eventSource.remove();
+    }
+    initializeFilterSettings();
+    setTimeout(() => {
+      window.location.reload();
+    }, 1000);
+  });
+}
+
+/**
+ * Volunteer v2 D25: the church calendar's "Ministries that may add events". The server sends
+ * the ministries only when the rollout is on and this user may change the grants, so an empty
+ * list means the field is not shown at all.
+ */
+function grantMinistries() {
+  return window.CRM.calendarJSArgs.grantMinistries || [];
+}
+
+function ministryGrantsFieldHtml() {
+  return (
+    '<select id="calendarMinistryGrants" class="form-select" multiple></select>' +
+    '<div class="form-text">' +
+    i18next.t("Their coordinators may pin their ministry's events to this calendar without Add Events permission.") +
+    "</div>"
+  );
+}
+
+/**
+ * Fill the field once it is in the DOM: active ministries, plus any inactive one the calendar
+ * is already opened to, so a save never drops a grant the administrator could not see.
+ */
+function initMinistryGrantsField(grantedMinistries) {
+  const select = document.getElementById("calendarMinistryGrants");
+  if (!select) return;
+
+  const grantedIds = grantedMinistries.map((m) => Number(m.id));
+  for (const ministry of grantMinistries()) {
+    const granted = grantedIds.includes(Number(ministry.id));
+    if (!ministry.active && !granted) continue;
+    const option = document.createElement("option");
+    option.value = String(ministry.id);
+    option.textContent = ministry.active ? ministry.name : `${ministry.name} (${i18next.t("Inactive")})`;
+    option.selected = granted;
+    select.appendChild(option);
+  }
+
+  if (window.TomSelect) {
+    new window.TomSelect(select, {
+      plugins: ["remove_button"],
+      placeholder: i18next.t("Select ministries..."),
+    });
+  }
+}
+
+function selectedMinistryGrants() {
+  const select = document.getElementById("calendarMinistryGrants");
+  return select ? Array.from(select.selectedOptions).map((option) => Number(option.value)) : [];
+}
+
+function saveMinistryGrants(calendarId, ministryIds) {
+  return window.CRM.APIRequest({
+    method: "PUT",
+    path: `calendars/${calendarId}/ministries`,
+    data: JSON.stringify({ ministryIds }),
+  });
+}
+
+function calendarTakesMinistryGrants(calendar) {
+  return (calendar.MinistryId === null || calendar.MinistryId === undefined) && grantMinistries().length > 0;
+}
+
+window.calendarPropertiesModal = {
+  _copyToClipboard: (text) => {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard
+        .writeText(text)
+        .then(() => {
+          // brief visual feedback handled by btn animation
+        })
+        .catch(() => {
+          // Fallback to old method if clipboard API fails
+          const fallbackTextarea = document.createElement("textarea");
+          fallbackTextarea.value = text;
+          fallbackTextarea.setAttribute("readonly", "");
+          fallbackTextarea.style.position = "absolute";
+          fallbackTextarea.style.left = "-9999px";
+          document.body.appendChild(fallbackTextarea);
+          try {
+            fallbackTextarea.select();
+            document.execCommand("copy");
+            document.body.removeChild(fallbackTextarea);
+          } catch (_e) {
+            document.body.removeChild(fallbackTextarea);
+            window.CRM.notify(i18next.t("Unable to copy to clipboard. Please copy the URL manually."), {
+              type: "danger",
+              delay: 6000,
+            });
+          }
+        });
+    } else {
+      // Fallback for non-secure contexts
+      window.CRM.notify(i18next.t("Clipboard API not available. Please copy the URL manually."), {
+        type: "warning",
+        delay: 6000,
+      });
+    }
+  },
+  getBootboxContent: (calendar) => {
+    let HTMLURL = "";
+    let icsURL = "";
+    let jsonURL = "";
+    if (calendar.AccessToken) {
+      HTMLURL = `${window.CRM.fullURL}/external/calendars/${calendar.AccessToken}`;
+      icsURL = `${window.CRM.fullURL}/api/public/calendar/${calendar.AccessToken}/ics`;
+      jsonURL = `${window.CRM.fullURL}/api/public/calendar/${calendar.AccessToken}/events`;
+    }
+
+    const copyBtn = (url) =>
+      '<button type="button" class="btn btn-icon btn-ghost-secondary copy-url-btn" data-url="' +
+      url +
+      '" title="' +
+      i18next.t("Copy to clipboard") +
+      '">' +
+      '<i class="fa-regular fa-copy"></i>' +
+      "</button>";
+
+    const urlRow = (label, url) => {
+      if (!url) return "";
+      return (
+        '<div class="mb-3">' +
+        '<label class="form-label text-muted small mb-1">' +
+        label +
+        "</label>" +
+        '<div class="input-group">' +
+        '<input type="text" class="form-control form-control-sm font-monospace" readonly value="' +
+        url +
+        '">' +
+        '<a href="' +
+        url +
+        '" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-ghost-secondary" title="' +
+        i18next.t("Open") +
+        '">' +
+        '<i class="fa-solid fa-arrow-up-right-from-square"></i>' +
+        "</a>" +
+        copyBtn(url) +
+        "</div>" +
+        "</div>"
+      );
+    };
+
+    const colorSwatch = (hex) =>
+      '<span class="d-inline-flex align-items-center gap-2">' +
+      '<span class="calendar-color-swatch" style="background:#' +
+      hex +
+      '"></span>' +
+      "<code>#" +
+      hex +
+      "</code>" +
+      "</span>";
+
+    // Access token section
+    let tokenSection =
+      '<div class="mb-3">' +
+      '<label class="form-label text-muted small mb-1">' +
+      i18next.t("Access Token") +
+      "</label>" +
+      '<div class="input-group">' +
+      '<input id="AccessToken" class="form-control form-control-sm font-monospace" type="text" readonly value="' +
+      (calendar.AccessToken || "") +
+      '">' +
+      copyBtn(calendar.AccessToken || "") +
+      "</div>";
+
+    if (window.CRM.calendarJSArgs.isModifiable) {
+      tokenSection +=
+        '<div class="d-flex gap-2 mt-2">' +
+        '<a id="NewAccessToken" class="btn btn-sm btn-outline-warning flex-fill">' +
+        '<i class="fa-solid fa-repeat me-1"></i>' +
+        i18next.t("New Access Token") +
+        "</a>";
+      if (calendar.AccessToken != null) {
+        tokenSection +=
+          '<a id="DeleteAccessToken" class="btn btn-sm btn-outline-danger">' +
+          '<i class="fa-solid fa-trash-can me-1"></i>' +
+          i18next.t("Delete") +
+          "</a>";
+      }
+      tokenSection += "</div>";
+    }
+    tokenSection += "</div>";
+
+    const frm_str =
+      '<form id="some-form" class="px-1">' +
+      tokenSection +
+      urlRow(i18next.t("HTML URL"), HTMLURL) +
+      urlRow(i18next.t("ICS URL"), icsURL) +
+      urlRow("JSON URL", jsonURL) +
+      '<div class="row g-3">' +
+      '<div class="col-6">' +
+      '<label class="form-label text-muted small mb-1">' +
+      i18next.t("Foreground Color") +
+      "</label>" +
+      "<div>" +
+      colorSwatch(calendar.ForegroundColor) +
+      "</div>" +
+      "</div>" +
+      '<div class="col-6">' +
+      '<label class="form-label text-muted small mb-1">' +
+      i18next.t("Background Color") +
+      "</label>" +
+      "<div>" +
+      colorSwatch(calendar.BackgroundColor) +
+      "</div>" +
+      "</div>" +
+      "</div>" +
+      (calendarTakesMinistryGrants(calendar)
+        ? '<div class="mt-3 d-none" id="calendarMinistryGrantsField">' +
+          '<label class="form-label text-muted small mb-1" for="calendarMinistryGrants">' +
+          i18next.t("Ministries that may add events") +
+          "</label>" +
+          ministryGrantsFieldHtml() +
+          "</div>"
+        : "") +
+      "</form>";
+
+    const $object = $("<div/>").html(frm_str).contents();
+
+    // Wire up copy buttons after DOM insertion (bootbox calls this after render)
+    // Use .off() first to prevent handler accumulation across modal re-opens
+    setTimeout(() => {
+      $(".copy-url-btn")
+        .off("click")
+        .on("click", function () {
+          const url = $(this).data("url");
+          window.calendarPropertiesModal._copyToClipboard(url);
+          const $icon = $(this).find("i");
+          $icon.removeClass("fa-regular fa-copy").addClass("fa-solid fa-check text-success");
+          setTimeout(() => {
+            $(this).find("i").removeClass("fa-solid fa-check text-success").addClass("fa-regular fa-copy");
+          }, 1500);
+        });
+    }, 50);
+
+    return $object;
+  },
+  getButtons: (calendar) => {
+    const buttons = [];
+    buttons.push({
+      label: i18next.t("Cancel"),
+      className: "btn btn-secondary float-end",
+    });
+    if (calendarTakesMinistryGrants(calendar)) {
+      buttons.push({
+        label: i18next.t("Save"),
+        className: "btn btn-primary float-end",
+        callback: window.calendarPropertiesModal.saveMinistryGrants,
+      });
+    }
+    if (window.CRM.calendarJSArgs.isModifiable) {
+      buttons.push({
+        label: i18next.t("Delete Calendar"),
+        className: "btn btn-danger float-start",
+        callback: deleteCalendar,
+      });
+    }
+    return buttons;
+  },
+  loadMinistryGrants: (calendar) => {
+    if (!calendarTakesMinistryGrants(calendar)) return;
+    window.CRM.APIRequest({
+      method: "GET",
+      path: `calendars/${calendar.Id}/ministries`,
+    }).done((data) => {
+      initMinistryGrantsField(data.ministries || []);
+      $("#calendarMinistryGrantsField").removeClass("d-none");
+    });
+  },
+  saveMinistryGrants: () => {
+    saveMinistryGrants(window.calendarPropertiesModal.calendar.Id, selectedMinistryGrants()).done(() => {
+      window.CRM.notify(i18next.t("Calendar saved"), { type: "success" });
+      window.calendarPropertiesModal.modal.modal("hide");
+    });
+    return false;
+  },
+  show: (calendar) => {
+    window.calendarPropertiesModal.calendar = calendar;
+    const bootboxmessage = window.calendarPropertiesModal.getBootboxContent(calendar);
+    window.calendarPropertiesModal.modal = bootbox.dialog({
+      title: escapeHtml(getLocalizedCalendarName(calendar.Name)),
+      message: bootboxmessage,
+      show: true,
+      buttons: window.calendarPropertiesModal.getButtons(calendar),
+      onEscape: () => {
+        window.calendarPropertiesModal.modal.modal("hide");
+      },
+    });
+    $("#NewAccessToken").click(window.calendarPropertiesModal.newAccessToken);
+    $("#DeleteAccessToken").click(window.calendarPropertiesModal.deleteAccessToken);
+    window.calendarPropertiesModal.loadMinistryGrants(calendar);
+  },
+  newAccessToken: () => {
+    window.CRM.APIRequest({
+      method: "POST",
+      path: `calendars/${window.calendarPropertiesModal.calendar.Id}/NewAccessToken`,
+    }).done((newcalendar) => {
+      const closeBtn = $(`<button class="btn btn-primary float-end mt-3">${i18next.t("Close")}</button>`);
+      const $body = $(window.calendarPropertiesModal.modal).find(".bootbox-body");
+      $body.html(window.calendarPropertiesModal.getBootboxContent(newcalendar));
+      $body.append(closeBtn);
+      $("#NewAccessToken").click(window.calendarPropertiesModal.newAccessToken);
+      $("#DeleteAccessToken").click(window.calendarPropertiesModal.deleteAccessToken);
+      window.calendarPropertiesModal.loadMinistryGrants(newcalendar);
+      closeBtn.on("click", () => {
+        window.calendarPropertiesModal.modal.modal("hide");
+      });
+
+      const calendarRow = $(`[data-calendarid="${newcalendar.Id}"]`).closest("tr");
+      if (calendarRow.length > 0) {
+        const accessTokenCell = calendarRow.find(".calendar-access-token-cell");
+        if (accessTokenCell.length > 0) {
+          accessTokenCell.text(newcalendar.AccessToken);
+        }
+      }
+
+      const createdMessage = i18next.t("A Calendar access token has been generated and saved.");
+      if (!window.CRM.calendarJSArgs.bEnableExternalCalendarAPI) {
+        // The page normally shows this warning only on initial load. A newly
+        // generated token should show it immediately, without a page refresh.
+        const $warning = $("#calendarApiWarning").removeClass("d-none");
+        const warningMessage = $warning.find("p").text().trim();
+        if (warningMessage) {
+          alertAction(
+            "",
+            `${escapeHtml(createdMessage)}<p class="mt-2 text-warning">${escapeHtml(warningMessage)}</p>`,
+          );
+        } else {
+          window.CRM.notify(createdMessage, { type: "success", delay: 6000 });
+        }
+      } else {
+        window.CRM.notify(createdMessage, { type: "success", delay: 6000 });
+      }
+      window.calendarPropertiesModal.calendar = newcalendar;
+    });
+  },
+  deleteAccessToken: () => {
+    window.CRM.APIRequest({
+      method: "DELETE",
+      path: `calendars/${window.calendarPropertiesModal.calendar.Id}/AccessToken`,
+    }).done((newcalendar) => {
+      const calendarRow = $(`[data-calendarid="${newcalendar.Id}"]`).closest("tr");
+      if (calendarRow.length > 0) {
+        const accessTokenCell = calendarRow.find(".calendar-access-token-cell");
+        if (accessTokenCell.length > 0) {
+          accessTokenCell.text("");
+        } else {
+          if (!window.CRM.calendarJSArgs.isModifiable || !newcalendar.AccessToken) {
+            calendarRow.remove();
+          }
+        }
+      }
+
+      if (window.calendarPropertiesModal.modal) {
+        window.calendarPropertiesModal.modal.modal("hide");
+      }
+
+      setTimeout(() => {
+        document.body.focus();
+      }, 300);
+    });
+  },
+};
+
+function fieldError(inputField) {
+  let p = $(inputField).parent().find("p .form-field-error");
+  if (p.length === 0) {
+    p = $("<p class='text-danger form-field-error'>");
+    $(inputField).parent().append(p);
+  }
+  $(p).text(i18next.t("Invalid Entry"));
+}
+
+window.newCalendarModal = {
+  getBootboxContent: () => {
+    const frm_str =
+      '<form id="some-form"><table class="table modal-table">' +
+      "<tr>" +
+      "<td>" +
+      i18next.t("Calendar Name") +
+      ":</td>" +
+      '<td colspan="3">' +
+      '<input id="calendarName" class="form-control" type="text"  />' +
+      "</td>" +
+      "</tr>" +
+      "<tr>" +
+      "<td>" +
+      i18next.t("Foreground Color") +
+      ":</td>" +
+      '<td colspan="3">' +
+      '<input id="ForegroundColor" class="form-control form-control-color w-100" type="color" value="#ffffff" title="' +
+      i18next.t("Foreground Color") +
+      '" />' +
+      "</td>" +
+      "</tr>" +
+      "<tr>" +
+      "<td>" +
+      i18next.t("Background Color") +
+      ":</td>" +
+      '<td colspan="3">' +
+      '<input id="BackgroundColor" class="form-control form-control-color w-100" type="color" value="#000000" title="' +
+      i18next.t("Background Color") +
+      '" />' +
+      "</td>" +
+      "</tr>" +
+      (grantMinistries().some((ministry) => ministry.active)
+        ? '<tr id="calendarMinistryGrantsField">' +
+          "<td>" +
+          i18next.t("Ministries that may add events") +
+          ":</td>" +
+          '<td colspan="3">' +
+          ministryGrantsFieldHtml() +
+          "</td>" +
+          "</tr>"
+        : "") +
+      "</table>" +
+      "</form>";
+    const object = $("<div/>").html(frm_str).contents();
+
+    return object;
+  },
+  getButtons: () => {
+    const buttons = [];
+    buttons.push({
+      label: i18next.t("Save"),
+      className: "btn btn-primary float-end",
+      callback: window.newCalendarModal.saveButtonCallback,
+    });
+    buttons.push({
+      label: i18next.t("Cancel"),
+      className: "btn btn-secondary float-start",
+    });
+
+    return buttons;
+  },
+  validateNewCalendar: () => {
+    let status = true;
+    if (!$("#calendarName").val()) {
+      fieldError($("#calendarName"));
+      status = false;
+    }
+    return status;
+  },
+  saveButtonCallback: () => {
+    $(".form-field-error").remove();
+    if (!window.newCalendarModal.validateNewCalendar()) {
+      return false;
+    }
+    const newCalendar = {
+      Name: $("#calendarName").val(),
+      ForegroundColor: $("#ForegroundColor").val(),
+      BackgroundColor: $("#BackgroundColor").val(),
+    };
+    const ministryIds = selectedMinistryGrants();
+    window.CRM.APIRequest({
+      method: "POST",
+      path: "calendars",
+      data: JSON.stringify(newCalendar),
+    }).done((calendar) => {
+      if (ministryIds.length === 0) {
+        initializeFilterSettings();
+        return;
+      }
+      saveMinistryGrants(calendar.Id, ministryIds).always(() => {
+        initializeFilterSettings();
+      });
+    });
+  },
+  show: () => {
+    const bootboxmessage = window.newCalendarModal.getBootboxContent();
+    window.calendarPropertiesModal.modal = bootbox.dialog({
+      title: i18next.t("New Calendar"),
+      message: bootboxmessage,
+      show: true,
+      buttons: window.newCalendarModal.getButtons(),
+      onEscape: () => {
+        window.calendarPropertiesModal.modal.modal("hide");
+      },
+    });
+    initMinistryGrantsField([]);
+  },
+};
+
+function initializeCalendar() {
+  window.CRM.isCalendarLoading = false;
+
+  if (window.CRM.fullcalendar) {
+    window.CRM.fullcalendar.destroy();
+  }
+
+  const mobileHeaderToolbar = {
+    start: "prev,next",
+    center: "title",
+    end: "today",
+  };
+  const desktopHeaderToolbar = {
+    start: "prev,next today",
+    center: "title",
+    end: "dayGridMonth,timeGridWeek,timeGridDay,listMonth",
+  };
+  const mobileFooterToolbar = { end: "dayGridMonth,timeGridWeek,timeGridDay,listMonth" };
+
+  // FullCalendar's "today" highlight is computed from `now`. Default `now` is
+  // the actual current moment, but FC reads its date components in a way that
+  // can fall back to browser-local — so a PST admin sees April 24 highlighted
+  // even when it's already April 25 in the church's tz. Build a Date whose
+  // local components match the church's wall-clock right now: pulled from
+  // Intl with timeZone so getDate()/getHours() reflect the church's "today".
+  const churchNow = (() => {
+    const tz = window.CRM.calendarJSArgs.sTimeZone;
+    if (!tz) return new Date();
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date());
+    const get = (type) => parts.find((p) => p.type === type)?.value || "00";
+    const hh = get("hour") === "24" ? "00" : get("hour");
+    return new Date(`${get("year")}-${get("month")}-${get("day")}T${hh}:${get("minute")}:${get("second")}`);
+  })();
+
+  window.CRM.fullcalendar = new Calendar(document.getElementById("calendar"), {
+    plugins: [formaTheme],
+    locale: window.CRM.lang || "en",
+    timeZone: window.CRM.calendarJSArgs.sTimeZone || "local",
+    now: churchNow,
+    initialView: window.innerWidth < 768 ? "listMonth" : "dayGridMonth",
+    buttonClass: (button) => {
+      if (button.isIconOnly) return "btn btn-sm btn-icon btn-ghost-secondary";
+      if (button.buttonGroup) return `btn btn-sm ${button.isSelected ? "btn-primary" : "btn-ghost-secondary"}`;
+      return "btn btn-sm btn-outline-secondary";
+    },
+    headerToolbar: window.innerWidth < 768 ? mobileHeaderToolbar : desktopHeaderToolbar,
+    footerToolbar: window.innerWidth < 768 ? mobileFooterToolbar : false,
+    contentHeight: "auto",
+    footerToolbarClass: "crm-fc-footer-toolbar",
+    headerToolbarClass: "crm-fc-header-toolbar",
+    selectable: true,
+    editable: window.CRM.calendarJSArgs.isModifiable,
+    eventDrop: window.moveEventModal.handleEventDrop,
+    eventResize: window.moveEventModal.handleEventResize,
+    selectMirror: true,
+    select: window.showNewEventForm,
+    eventClick: (info) => {
+      const eventData = info.event;
+      const jsEvent = info.jsEvent;
+      jsEvent.preventDefault();
+
+      if (eventData.url !== "null") {
+        if (/^https?:$/.test(new URL(eventData.url, window.location.href).protocol)) {
+          window.open(eventData.url, "_blank", "noopener,noreferrer");
+        }
+      } else if (eventData.editable || eventData.startEditable || eventData.durationEditable) {
+        window.showEventForm(eventData);
+      } else {
+        const props = eventData.extendedProps || {};
+        const country = props.country || "";
+        const type = props.type ? props.type.charAt(0).toUpperCase() + props.type.slice(1) : "";
+        const parts = [eventData.title];
+        if (country) parts.push(country);
+        if (type) parts.push(type);
+        window.CRM.notify(parts.join(" · "), { type: "info", delay: 10000, close: true });
+      }
+    },
+    eventContent: (info) => pinnedEventContent(info),
+    eventDidMount: (info) => {
+      const pins = info.event.extendedProps.pinnedCalendars;
+      const names = Array.isArray(pins) ? pins.map((pin) => pin.name).filter(Boolean) : [];
+      if (info.event.title && names.length > 1) {
+        info.el.setAttribute("title", `${info.event.title} (${names.join(", ")})`);
+      } else if (info.event.title) {
+        info.el.setAttribute("title", info.event.title);
+      }
+    },
+    eventsSet: () => {
+      // After this render, so setProp/setExtendedProp are not called mid-render.
+      schedulePinCollapse();
+    },
+    loading: (isLoading) => {
+      window.CRM.isCalendarLoading = isLoading;
+    },
+  });
+
+  // FullCalendar v7 removed the windowResize option. Replicate the debounced
+  // resize behavior with a native event listener. Clean up the old handler
+  // when initializeCalendar() is called again (e.g. after locale reload).
+  if (window.CRM._calendarResizeHandler) {
+    window.removeEventListener("resize", window.CRM._calendarResizeHandler);
+  }
+  let resizeTimer;
+  let lastMobile = window.innerWidth < 768;
+  window.CRM._calendarResizeHandler = () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      const nowMobile = window.innerWidth < 768;
+      // setOption forces a FullCalendar relayout. Calling it when the
+      // breakpoint did not change is what leaves ResizeObserver notifications
+      // undelivered in the same frame.
+      if (nowMobile === lastMobile) {
+        return;
+      }
+      lastMobile = nowMobile;
+      window.CRM.fullcalendar.setOption("headerToolbar", nowMobile ? mobileHeaderToolbar : desktopHeaderToolbar);
+      window.CRM.fullcalendar.setOption("footerToolbar", nowMobile ? mobileFooterToolbar : false);
+    }, 200);
+  };
+  window.addEventListener("resize", window.CRM._calendarResizeHandler);
+}
+
+/**
+ * Build a stable event source URL using a deterministic source ID.
+ * No cache-busting parameter — FullCalendar refetches via refetchEvents().
+ */
+function GetCalendarURL(calendarType, calendarID) {
+  let endpoint;
+  if (calendarType === "user") {
+    endpoint = "/api/calendars/";
+  } else if (calendarType === "system") {
+    endpoint = "/api/systemcalendars/";
+  }
+  return `${window.CRM.root + endpoint + calendarID}/fullcalendar`;
+}
+
+/**
+ * Get the deterministic event source ID for a calendar.
+ */
+function GetCalendarSourceId(calendarType, calendarID) {
+  return `${calendarType}-${calendarID}`;
+}
+
+/**
+ * Translate a calendar name when it matches one of the two DB-seeded default
+ * calendar names ("Public Calendar", "Private Calendar"). Custom user-defined
+ * names are returned unchanged (i18next.t passthrough returns the key as-is
+ * for unknown strings). The explicit literal calls register these two msgids
+ * for the i18next-cli extractor so they reach the translation pipeline.
+ */
+function getLocalizedCalendarName(name) {
+  switch (name) {
+    case "Public Calendar":
+      return i18next.t("Public Calendar");
+    case "Private Calendar":
+      return i18next.t("Private Calendar");
+    default:
+      return name;
+  }
+}
+
+/**
+ * Build a sidebar list-group item for a calendar with a BS5 form-switch toggle.
+ */
+function getCalendarFilterElement(calendar, type) {
+  const sourceId = GetCalendarSourceId(type, calendar.Id);
+  const switchId = `display-${sourceId}`;
+
+  const publicBadge = calendar.AccessToken
+    ? '<span class="badge bg-azure-lt ms-1" title="' +
+      i18next.t("Public calendar") +
+      '"><i class="fa-solid fa-globe fa-xs"></i></span>'
+    : "";
+
+  const html =
+    '<div class="list-group-item px-2 py-2" data-source-id="' +
+    sourceId +
+    '">' +
+    '<div class="d-flex align-items-center">' +
+    '<span class="d-inline-block rounded-circle flex-shrink-0 me-2 calendar-dot" style="background-color:#' +
+    calendar.BackgroundColor +
+    '"></span>' +
+    '<div class="flex-fill">' +
+    '<div class="fw-medium small d-flex align-items-center">' +
+    escapeHtml(getLocalizedCalendarName(calendar.Name)) +
+    publicBadge +
+    "</div>" +
+    "</div>" +
+    '<div class="form-check form-switch ms-2 mb-0">' +
+    '<input type="checkbox" class="form-check-input calendarSelectionBox" id="' +
+    switchId +
+    '" checked data-calendartype="' +
+    type +
+    '" data-calendarid="' +
+    calendar.Id +
+    '" aria-label="Toggle ' +
+    escapeHtml(getLocalizedCalendarName(calendar.Name)) +
+    ' calendar visibility"/>' +
+    "</div>" +
+    "</div>" +
+    (type === "user"
+      ? '<div class="mt-1 d-flex gap-1">' +
+        '<button class="btn btn-sm btn-ghost-primary calendarfocus flex-fill" data-calendartype="' +
+        type +
+        '" data-calendarid="' +
+        calendar.Id +
+        '"><i class="fa-solid fa-crosshairs me-1"></i>' +
+        i18next.t("Focus") +
+        "</button>" +
+        '<button class="btn btn-sm btn-ghost-secondary calendarproperties" data-calendarid="' +
+        calendar.Id +
+        '"><i class="fa-solid fa-gear"></i></button>' +
+        "</div>"
+      : "") +
+    "</div>";
+
+  return html;
+}
+
+/**
+ * One chip per event on the staff calendar.
+ *
+ * Each visible user calendar is its own event source, and an event pinned to
+ * two of them is the same row twice. System calendars (birthdays, unpinned
+ * events) reuse numeric ids from other tables, so they stay in their own
+ * groups and are never folded into a church event.
+ */
+function pinnedEventGroupKey(event) {
+  const sourceId = event.source && event.source.id ? String(event.source.id) : "";
+  if (sourceId.startsWith("user-")) {
+    return `user-event-${event.id}`;
+  }
+  return `${sourceId}-${event.id}`;
+}
+
+function calendarPinFromEvent(event) {
+  const props = event.extendedProps || {};
+  return {
+    id: props.calendarId,
+    name: getLocalizedCalendarName(props.calendarName || ""),
+    color: props.calendarColor || event.backgroundColor || "#206bc4",
+  };
+}
+
+// One follow-up scan covers every setProp eventsSet fires during a collapse.
+let pinCollapseScheduled = false;
+let pinCollapseAgain = false;
+
+function schedulePinCollapse() {
+  if (pinCollapseScheduled) {
+    pinCollapseAgain = true;
+    return;
+  }
+  pinCollapseScheduled = true;
+  queueMicrotask(() => {
+    pinCollapseAgain = false;
+    collapsePinnedCalendarEvents();
+    pinCollapseScheduled = false;
+    if (pinCollapseAgain) {
+      schedulePinCollapse();
+    }
+  });
+}
+
+function collapsePinnedCalendarEvents() {
+  const calendar = window.CRM.fullcalendar;
+  if (!calendar) {
+    return;
+  }
+
+  const groups = new Map();
+  for (const event of calendar.getEvents()) {
+    const key = pinnedEventGroupKey(event);
+    const group = groups.get(key);
+    if (group) {
+      group.push(event);
+    } else {
+      groups.set(key, [event]);
+    }
+  }
+
+  for (const group of groups.values()) {
+    const pins = [];
+    const seen = new Set();
+    for (const event of group) {
+      const pin = calendarPinFromEvent(event);
+      const pinKey = String(pin.id ?? "");
+      if (pinKey === "" || seen.has(pinKey)) {
+        continue;
+      }
+      seen.add(pinKey);
+      pins.push(pin);
+    }
+
+    const keep = group[0];
+    const current = JSON.stringify(keep.extendedProps.pinnedCalendars || []);
+    if (current !== JSON.stringify(pins)) {
+      keep.setExtendedProp("pinnedCalendars", pins);
+    }
+    if (keep.display === "none") {
+      keep.setProp("display", "auto");
+    }
+    for (let i = 1; i < group.length; i++) {
+      if (group[i].display !== "none") {
+        group[i].setProp("display", "none");
+      }
+    }
+  }
+}
+
+function pinnedEventContent(info) {
+  const pins = info.event.extendedProps.pinnedCalendars;
+  const named = Array.isArray(pins) ? pins.filter((pin) => pin.name) : [];
+  if (named.length < 2) {
+    return true;
+  }
+
+  const nodes = [];
+  if (info.timeText) {
+    const time = document.createElement("span");
+    time.className = "fc-event-time";
+    time.textContent = info.timeText;
+    nodes.push(time);
+  }
+  const title = document.createElement("span");
+  title.className = "fc-event-title";
+  title.textContent = info.event.title;
+  nodes.push(title);
+
+  const marks = document.createElement("span");
+  marks.className = "crm-cal-pin-marks";
+  for (const pin of named) {
+    const dot = document.createElement("span");
+    dot.className = "crm-cal-pin-mark";
+    dot.style.backgroundColor = pin.color;
+    dot.title = pin.name;
+    marks.appendChild(dot);
+  }
+  nodes.push(marks);
+  return { domNodes: nodes };
+}
+
+/**
+ * Remove all existing FullCalendar event sources to prevent duplicates.
+ */
+function clearAllEventSources() {
+  const sources = window.CRM.fullcalendar.getEventSources();
+  for (let i = sources.length - 1; i >= 0; i--) {
+    sources[i].remove();
+  }
+}
+
+/**
+ * Add an event source with a deterministic ID (prevents duplicates).
+ */
+function addCalendarEventSource(calendarType, calendarID) {
+  const sourceId = GetCalendarSourceId(calendarType, calendarID);
+  const existing = window.CRM.fullcalendar.getEventSourceById(sourceId);
+  if (!existing) {
+    window.CRM.fullcalendar.addEventSource({
+      id: sourceId,
+      url: GetCalendarURL(calendarType, calendarID),
+    });
+  }
+}
+
+/**
+ * Remove an event source by its deterministic ID.
+ */
+function removeCalendarEventSource(calendarType, calendarID) {
+  const sourceId = GetCalendarSourceId(calendarType, calendarID);
+  const existing = window.CRM.fullcalendar.getEventSourceById(sourceId);
+  if (existing) {
+    existing.remove();
+  }
+}
+
+function registerCalendarSelectionEvents() {
+  $(document).on("change", ".calendarSelectionBox", function () {
+    const calendarType = $(this).data("calendartype");
+    const calendarId = $(this).data("calendarid");
+
+    if ($(this).is(":checked")) {
+      addCalendarEventSource(calendarType, calendarId);
+    } else {
+      removeCalendarEventSource(calendarType, calendarId);
+    }
+  });
+
+  $(document).on("click", ".calendarproperties", function () {
+    window.CRM.APIRequest({
+      method: "GET",
+      path: `calendars/${$(this).data("calendarid")}`,
+    }).done((data) => {
+      const calendar = data.Calendars?.[0] ? data.Calendars[0] : null;
+      if (calendar && typeof calendar.AccessToken !== "undefined") {
+        window.calendarPropertiesModal.show(calendar);
+      } else {
+        alertAction(
+          "",
+          i18next.t(
+            "Calendar properties could not be loaded. This calendar may be missing an access token or is not configured correctly.",
+          ),
+        );
+      }
+    });
+  });
+
+  $(document).on("click", ".calendarfocus", function () {
+    const calendarTypeToKeep = $(this).data("calendartype");
+    const calendarIDToKeep = $(this).data("calendarid");
+    $(".calendarSelectionBox").each(function () {
+      if ($(this).data("calendartype") === calendarTypeToKeep && $(this).data("calendarid") === calendarIDToKeep) {
+        if (!$(this).is(":checked")) {
+          $(this).prop("checked", true).trigger("change");
+        }
+      } else {
+        if ($(this).is(":checked")) {
+          $(this).prop("checked", false).trigger("change");
+        }
+      }
+    });
+    $(this).removeClass("calendarfocus").addClass("calendarunfocus");
+    $(this).html(`<i class="fa-solid fa-expand me-1"></i>${i18next.t("Unfocus")}`);
+  });
+
+  $(document).on("click", ".calendarunfocus", function () {
+    $(".calendarSelectionBox").each(function () {
+      if (!$(this).is(":checked")) {
+        $(this).prop("checked", true).trigger("change");
+      }
+    });
+    $(this).removeClass("calendarunfocus").addClass("calendarfocus");
+    $(this).html(`<i class="fa-solid fa-crosshairs me-1"></i>${i18next.t("Focus")}`);
+  });
+}
+
+/**
+ * Draw the two lists of `calendars` rows: church calendars, and the ministry
+ * calendars that name an owning ministry (`MinistryId`, #9866). A ministry
+ * calendar behaves exactly like a church one — same source, same switch, same
+ * Focus and properties actions — it is only listed under its own heading, and
+ * the heading stays hidden when no calendar has a ministry.
+ */
+function showAllUserCalendars() {
+  window.CRM.APIRequest({
+    method: "GET",
+    path: "calendars",
+    suppressErrorDialog: true,
+  }).done((calendars) => {
+    $("#calendarUserList").empty();
+    $("#calendarMinistryList").empty();
+    let ministryCount = 0;
+
+    $.each(calendars.Calendars, (_idx, calendar) => {
+      const isMinistryCalendar = calendar.MinistryId !== null && calendar.MinistryId !== undefined;
+      const list = isMinistryCalendar ? "#calendarMinistryList" : "#calendarUserList";
+      if (isMinistryCalendar) {
+        ministryCount += 1;
+      }
+      $(list).append(getCalendarFilterElement(calendar, "user"));
+      addCalendarEventSource("user", calendar.Id);
+    });
+
+    $("#calendarMinistrySection").toggleClass("d-none", ministryCount === 0);
+  });
+}
+
+function showAllSystemCalendars() {
+  window.CRM.APIRequest({
+    method: "GET",
+    path: "systemcalendars",
+    suppressErrorDialog: true,
+  }).done((calendars) => {
+    $("#calendarSystemList").empty();
+    $.each(calendars.Calendars, (_idx, calendar) => {
+      $("#calendarSystemList").append(getCalendarFilterElement(calendar, "system"));
+      addCalendarEventSource("system", calendar.Id);
+    });
+  });
+}
+
+function initializeFilterSettings() {
+  clearAllEventSources();
+  showAllUserCalendars();
+  showAllSystemCalendars();
+}
+
+function initializeNewCalendarButton() {
+  if (window.CRM.calendarJSArgs.isModifiable) {
+    $("#addCalendarBtn")
+      .removeClass("d-none")
+      .on("click", () => {
+        window.newCalendarModal.show();
+      });
+  }
+}
+
+function displayAccessTokenAPITest() {
+  if (
+    window.CRM.calendarJSArgs.countCalendarAccessTokens > 0 &&
+    !window.CRM.calendarJSArgs.bEnableExternalCalendarAPI
+  ) {
+    $("#calendarApiWarning").removeClass("d-none");
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  window.CRM.onLocalesReady(async () => {
+    initializeCalendar();
+    initializeFilterSettings();
+    initializeNewCalendarButton();
+    registerCalendarSelectionEvents();
+    displayAccessTokenAPITest();
+
+    await applyFcLocale(window.CRM.fullcalendar);
+    window.CRM.fullcalendar.render();
+  });
+
+  // Initialize the system settings panel for admins (config provided inline by view)
+  if (window.CRM.calendarSettingsPanel && window.CRM.settingsPanel) {
+    const cfg = window.CRM.calendarSettingsPanel;
+    window.CRM.settingsPanel.init({
+      ...cfg,
+      onSave: () => {
+        setTimeout(() => window.location.reload(), 1500);
+      },
+    });
+  }
+});

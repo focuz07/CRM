@@ -1,0 +1,146 @@
+/// <reference types="cypress" />
+
+
+describe("Finance Deposits", () => {
+    beforeEach(() => {
+        cy.setupAdminSession();
+    });
+
+    it("Create Deposit on the Finance Dashboard opens the new-deposit form and lands on the editor", () => {
+        const comment = "From dashboard " + Date.now();
+        cy.visit("/finance/");
+        cy.contains("Finance Dashboard");
+
+        cy.contains("a", "Create Deposit").click();
+        cy.url().should("contain", "/finance/deposit/search").and("not.contain", "new=1");
+        cy.get("#newDepositModal").should("be.visible");
+        // Typing races the modal's fade-in and drops characters; the handler reads .val().
+        cy.get("#depositComment").invoke("val", comment);
+        cy.get("#addNewDeposit").click();
+
+        cy.location("pathname").should("match", /\/finance\/deposit\/\d+$/);
+        cy.get("#Comment").should("have.value", comment);
+    });
+
+    it("Create a new Deposit without comment", () => {
+        cy.visit("/finance/deposit/search");
+        cy.get("[data-bs-target='#newDepositModal']").click();
+        cy.get("#depositComment").clear();
+        cy.get("#addNewDeposit").click();
+        cy.contains("You are about to add a new deposit without a comment");
+    });
+
+    it("Create a new Deposit", () => {
+        const uniqueSeed = Date.now().toString();
+        const name = "New Test Deposit " + uniqueSeed;
+
+        cy.visit("/finance/deposit/search");
+        cy.contains("Deposits");
+        cy.get("[data-bs-target='#newDepositModal']").click();
+        cy.get("#depositComment").type(name);
+        cy.get("#addNewDeposit").click();
+
+        cy.location("pathname").should("match", /\/finance\/deposit\/\d+$/);
+
+        cy.get(".btn-success").click();
+        cy.url().should("contain", "/finance/pledge/new");
+
+        cy.get(".fund-select").first().select(1);
+        cy.get(".fund-amount").first().type("1000");
+        cy.get("#CheckNo").type(uniqueSeed);
+        cy.get("#FamilyID").invoke("val", "1");
+
+        cy.get("#savePledgeBtn").click();
+        cy.location("pathname").should("match", /\/finance\/deposit\/\d+$/);
+    });
+
+    it("Open the Deposits page & Add Payment", () => {
+        cy.visit("/finance/deposit/5");
+        cy.contains("Deposit Slip Number: 5");
+        cy.contains("Payments");
+
+        cy.get(".btn-success").click();
+        cy.url().should("contain", "/finance/pledge/new");
+
+        cy.get(".fund-select").first().select(1);
+        cy.get(".fund-amount").first().type("1000");
+        cy.get("#CheckNo").type("111");
+        cy.get("#FamilyID").invoke("val", "1");
+
+        cy.get("#savePledgeBtn").click();
+        cy.location("pathname").should("match", /\/finance\/deposit\/\d+$/);
+    });
+
+    it("Unknown deposit id redirects to the search page", () => {
+        cy.visit("/finance/deposit/9999");
+        cy.url().should("contain", "/finance/deposit/search");
+        cy.contains("Deposits");
+    });
+
+    it("Deposit id 0 redirects to the search page", () => {
+        cy.visit("/finance/deposit/0");
+        cy.url().should("contain", "/finance/deposit/search");
+        cy.contains("Deposits");
+    });
+
+    it("Create a Deposit with XSS attempt - should be sanitized", () => {
+        const uniqueSeed = Date.now().toString();
+        const xssPayload = "<script>alert('XSS')</script>Test" + uniqueSeed;
+        const sanitizedComment = "alert(&#039;XSS&#039;)Test" + uniqueSeed; // The script tags should be stripped, quotes escaped
+
+        // Create the deposit directly via the API to test server-side sanitization.
+        // Using cy.request() here is intentional: the test targets the POST /api/deposits
+        // endpoint's sanitization behavior, not the modal UI itself.  Typing the raw
+        // XSS payload (<script>…</script>) through a Bootstrap modal input is fragile
+        // because Bootstrap's transition management can interrupt Cypress keystroke
+        // delivery, causing only part of the value to be committed.
+        cy.request({
+            method: "POST",
+            url: "/api/deposits",
+            body: {
+                depositType:    "Bank",
+                depositComment: xssPayload,
+                depositDate:    new Date().toISOString().split("T")[0],
+            },
+            headers: { "Content-Type": "application/json" },
+        }).then((response) => {
+            expect(response.status).to.eq(200);
+            const depositId = response.body.Id;
+
+            cy.visit(`/finance/deposit/${depositId}`);
+
+            // Verify the comment field contains sanitized text (script tags stripped, quotes escaped)
+            cy.get("#Comment").should("have.value", sanitizedComment);
+        });
+
+    });
+
+    it("Payments table has row actions and bulk select enables Delete Selected", () => {
+        cy.visit("/finance/deposit/5");
+        cy.get("#paymentsTable tbody tr").should("have.length.greaterThan", 0);
+        cy.get("#paymentsTable tbody tr").first().find(".dropdown-menu").should("exist");
+
+        cy.get("#deleteSelectedRows").should("be.disabled");
+        cy.get("#paymentsTable tbody .row-select").first().check();
+        cy.get("#deleteSelectedRows").should("not.be.disabled");
+        cy.get("#paymentsTable tbody .row-select").first().uncheck();
+        cy.get("#deleteSelectedRows").should("be.disabled");
+
+        // Indeterminate select-all is not checked, so uncheck() would not clear rows.
+        cy.get("#selectAllPayments").check();
+        cy.get("#paymentsTable tbody .row-select:not(:checked)").should("have.length", 0);
+        cy.get("#deleteSelectedRows").should("not.be.disabled");
+        cy.get("#selectAllPayments").uncheck();
+        cy.get("#paymentsTable tbody .row-select:checked").should("have.length", 0);
+        cy.get("#deleteSelectedRows").should("be.disabled");
+    });
+
+    it("Previous and Next navigate between deposits", () => {
+        cy.visit("/finance/deposit/5");
+        cy.contains("a.btn", "Next").click();
+        cy.location("pathname").should("match", /\/finance\/deposit\/\d+$/).and("not.match", /\/finance\/deposit\/5$/);
+        cy.contains("a.btn", "Previous").click();
+        cy.location("pathname").should("match", /\/finance\/deposit\/5$/);
+    });
+
+});

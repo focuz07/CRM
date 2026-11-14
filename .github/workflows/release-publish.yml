@@ -1,0 +1,383 @@
+name: Release & Start Next
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a release half-way: a cancelled run can leave a deleted tag
+  # or a draft without its next-version PR. A second dispatch waits instead.
+  cancel-in-progress: false
+
+
+# End-of-cycle one-click flow. Run it on the branch being released; the only
+# input is the version to start after it.
+#
+#   1. publish    — makes sure Build/Test/Package and the Nightly are green on
+#                   the tip of the selected branch (a green run is reused, a
+#                   pending run is waited for, a missing run is started, a
+#                   failed run stops the release), then downloads that
+#                   build's ChurchCRM-<version>.zip and creates a draft GitHub
+#                   Release. The tag is read from package.json on that commit.
+#
+#   2. notes      — writes release-notes-context-<tag>.md (every PR in the
+#                   release with its full description, bucketed by the files
+#                   it touched) as a run artifact. The release-notes skill
+#                   reads it instead of opening each PR by hand.
+#
+#   3. start_next — chains into release-prepare.yml (reusable) to bump master
+#                   to the version you typed in `next_version` and open the
+#                   "Start <next> release" PR.
+#
+#   4. marketing_capture — starts marketing-capture-assets.yml on master.
+#                   It never gates the release: a failed dispatch leaves the
+#                   draft, the notes context and the next-version PR as they
+#                   are. The capture workflow publishes the visuals when that
+#                   run is on master.
+#
+# Review the draft release. If happy, click "Publish release" on GitHub. The
+# marketing capture and the bump PR never block it: merge the PR once the
+# capture has finished. Bookkeeping reads the next version from the PR's
+# build/<next> branch until then, so it needs no re-run.
+#
+# For mid-cycle re-bumps (e.g. patch → minor because a feature landed) run
+# "Release: start next version" (release-prepare.yml) directly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      next_version:
+        description: 'Next version to start AFTER this release (e.g. 7.2.4 patch, 7.3.0 minor, 8.0.0 major). The version being released is read from package.json on the selected branch.'
+        required: true
+        type: string
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────
+  # Publish the CURRENT version as a draft GitHub Release.
+  # ───────────────────────────────────────────────────────────────────
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    env:
+      # gh CLI needs to know the repo to query since we don't check out the
+      # working tree — without this, commands like `gh run download` fail with
+      # "fatal: not a git repository".
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    outputs:
+      release_tag: ${{ steps.tag.outputs.tag }}
+      release_url: ${{ steps.release.outputs.release_url }}
+      previous_tag: ${{ steps.previous.outputs.tag }}
+      target_commit: ${{ steps.run.outputs.commit }}
+    steps:
+      - name: Require green build and nightly on the branch tip
+        id: run
+        env:
+          COMMIT: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Green run on the tip: reuse it. Pending run: wait for it. No run:
+          # start one. Only failed runs: stop.
+          find_run() {
+            gh run list --workflow="$1" --commit "$COMMIT" --limit 20 --json databaseId,status,conclusion --jq "$2"
+          }
+          resolve() {
+            local wf="$1" id
+            id=$(find_run "$wf" '[.[]|select(.conclusion=="success")][0].databaseId // empty')
+            if [ -z "$id" ]; then
+              id=$(find_run "$wf" '[.[]|select(.status!="completed")][0].databaseId // empty')
+            fi
+            if [ -z "$id" ]; then
+              if [ -n "$(find_run "$wf" '.[0].databaseId // empty')" ]; then
+                echo "::error::Every $wf run on ${COMMIT:0:12} failed or was cancelled. Fix it and re-run, then dispatch again."
+                return 1
+              fi
+              gh workflow run "$wf" --ref "$BRANCH" >&2
+              for _ in $(seq 1 12); do
+                sleep 5
+                id=$(find_run "$wf" '[.[]|select(.status!="completed")][0].databaseId // empty')
+                [ -n "$id" ] && break
+              done
+              if [ -z "$id" ]; then
+                echo "::error::Started $wf on $BRANCH but no run appeared for ${COMMIT:0:12}. The branch tip may have moved."
+                return 1
+              fi
+            fi
+            echo "$id"
+          }
+
+          run_id=$(resolve build-test-package.yml)
+          nightly=$(resolve build-test-nightly.yml)
+
+          for id in "$run_id" "$nightly"; do
+            gh run watch "$id" --interval 60 >/dev/null || true
+            conclusion=$(gh run view "$id" --json conclusion --jq .conclusion)
+            if [ "$conclusion" != "success" ]; then
+              echo "::error::Run #$id on ${COMMIT:0:12} finished '$conclusion'. Stopping: $(gh run view "$id" --json url --jq .url)"
+              exit 1
+            fi
+          done
+
+          echo "Build run #$run_id and nightly run #$nightly are green on ${COMMIT:0:12}."
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "run_url=$(gh run view "$run_id" --json url --jq .url)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          NEXT_VERSION: ${{ inputs.next_version }}
+          COMMIT: ${{ steps.run.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          # Read package.json at the tip. Avoids checking out the whole tree
+          # just to inspect one file.
+          pkg_b64=$(gh api "repos/$GH_REPO/contents/package.json?ref=$COMMIT" --jq '.content')
+          tag=$(echo "$pkg_b64" | base64 -d | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).version))")
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::package.json at $COMMIT has version '$tag', not X.Y.Z."
+            exit 1
+          fi
+          echo "Releasing tag=$tag from package.json at $COMMIT."
+
+          # Sanity: next_version must differ from the tag we're about to release.
+          if [ "$tag" = "$NEXT_VERSION" ]; then
+            echo "::error::next_version ($NEXT_VERSION) matches the version being released ($tag). Pick a higher version for next_version."
+            exit 1
+          fi
+
+          # Suggestion table (visibility for patch/minor/major decision).
+          BASE="${tag%%-*}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+          NEXT_PATCH="$MAJOR.$MINOR.$((PATCH+1))"
+          NEXT_MINOR="$MAJOR.$((MINOR+1)).0"
+          NEXT_MAJOR="$((MAJOR+1)).0.0"
+
+          {
+            echo "## Version check"
+            echo ""
+            echo "| Role | Version |"
+            echo "|---|---|"
+            echo "| Releasing now           | \`$tag\` |"
+            echo "| Next version (typed)    | \`$NEXT_VERSION\` |"
+            echo "| Suggested next patch    | \`$NEXT_PATCH\` |"
+            echo "| Suggested next minor    | \`$NEXT_MINOR\` |"
+            echo "| Suggested next major    | \`$NEXT_MAJOR\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve previous release
+        id: previous
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Latest published, non-prerelease release that is not the one being
+          # created. Passed to --notes-start-tag so the generated draft always
+          # compares against the last public release, not the nearest tag.
+          prev=$(gh release list --exclude-drafts --exclude-pre-releases --limit 20 --json tagName --jq '.[].tagName' \
+            | grep -vFx -- "$TAG" | head -n 1 || true)
+          if [ -z "$prev" ]; then
+            echo "::error::Could not find a previous published release to compare against."
+            exit 1
+          fi
+          echo "Previous release: $prev"
+          echo "tag=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Download release artifact
+        id: artifact
+        env:
+          RUN_ID: ${{ steps.run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-download
+          # gh run download unwraps the upload-artifact outer zip, so we end up
+          # with the real ChurchCRM-<version>.zip on disk (no double-unzip).
+          gh run download "$RUN_ID" \
+            --pattern 'ChurchCRM-*' \
+            --dir release-download
+
+          zip_path=$(find release-download -type f -name 'ChurchCRM-*.zip' | head -n 1)
+          if [ -z "$zip_path" ]; then
+            echo "::error::No ChurchCRM-*.zip found in artifacts for run $RUN_ID"
+            find release-download -maxdepth 3 -print
+            exit 1
+          fi
+
+          mv "$zip_path" ./
+          zip_name=$(basename "$zip_path")
+          echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
+          echo "Found release asset: $zip_name"
+
+      - name: Create GitHub Release
+        id: release
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+          TARGET_COMMIT: ${{ steps.run.outputs.commit }}
+          ZIP_NAME: ${{ steps.artifact.outputs.zip_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1 \
+            || gh api "repos/$GH_REPO/git/refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Release or tag $TAG already exists. Edit it on GitHub; deleting it would discard its notes."
+            exit 1
+          fi
+
+          echo "Creating draft release $TAG targeting $TARGET_COMMIT."
+          gh release create "$TAG" "$ZIP_NAME" \
+            --title "$TAG" \
+            --target "$TARGET_COMMIT" \
+            --generate-notes \
+            --notes-start-tag "$PREVIOUS_TAG" \
+            --draft || {
+            echo "::error::Failed to create release. Check token permissions."
+            exit 1
+          }
+
+          release_url=$(gh release view "$TAG" --json url --jq .url)
+          echo "release_url=$release_url" >> "$GITHUB_OUTPUT"
+
+      - name: Publish summary
+        if: always()
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          RUN_ID: ${{ steps.run.outputs.run_id }}
+          RUN_URL: ${{ steps.run.outputs.run_url }}
+          COMMIT: ${{ steps.run.outputs.commit }}
+          ZIP_NAME: ${{ steps.artifact.outputs.zip_name }}
+          RELEASE_URL: ${{ steps.release.outputs.release_url }}
+        run: |
+          {
+            echo "## Release Summary"
+            echo ""
+            echo "- **Tag:** \`$TAG\`"
+            echo "- **Draft:** true"
+            echo "- **Source build:** [run #$RUN_ID]($RUN_URL)"
+            echo "- **Commit:** \`$COMMIT\`"
+            if [ -n "${ZIP_NAME:-}" ]; then
+              echo "- **Asset:** \`$ZIP_NAME\`"
+            fi
+            if [ -n "${RELEASE_URL:-}" ]; then
+              echo ""
+              echo "### [Open release page]($RELEASE_URL)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────
+  # Gather every PR in the release for the release-notes skill.
+  # Deterministic — no model call. A failure here never blocks the release.
+  # ───────────────────────────────────────────────────────────────────
+  notes_context:
+    needs: publish
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.publish.outputs.release_tag }}
+      PREVIOUS_TAG: ${{ needs.publish.outputs.previous_tag }}
+      TARGET_COMMIT: ${{ needs.publish.outputs.target_commit }}
+    steps:
+      # Pinned to commit SHAs (v7); the other workflows move with #10006.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            scripts
+            .github/actions
+
+      - uses: ./.github/actions/setup-node
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Build release-notes context
+        run: node scripts/release/release-notes-context.js "$PREVIOUS_TAG" "$TARGET_COMMIT" > "release-notes-context-$TAG.md"
+
+      - name: Upload context
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: release-notes-context-${{ needs.publish.outputs.release_tag }}
+          path: release-notes-context-${{ needs.publish.outputs.release_tag }}.md
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          {
+            echo "## Release notes context"
+            echo ""
+            echo "Artifact \`release-notes-context-$TAG\` covers $PREVIOUS_TAG → ${TARGET_COMMIT:0:12}."
+            echo "Next: ask an agent to \"write the $TAG release notes\" (\`.agents/skills/churchcrm/release-notes.md\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────
+  # Bump master to the next version + open "Start <next> release" PR.
+  # Reuses release-prepare.yml so the bump logic lives in one place.
+  # ───────────────────────────────────────────────────────────────────
+  notify_docs:
+    needs: publish
+    if: success()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stage or publish the docs for this release
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_RELEASE_TOKEN }}
+          VERSION: ${{ needs.publish.outputs.release_tag }}
+          NEXT_VERSION: ${{ inputs.next_version }}
+          MERGE: 'false'
+        run: node scripts/release/notify-docs-release.js
+
+  start_next:
+    needs: publish
+    if: success()
+    uses: ./.github/workflows/release-prepare.yml
+    with:
+      version: ${{ inputs.next_version }}
+    permissions:
+      contents: write
+      pull-requests: write
+
+  # ───────────────────────────────────────────────────────────────────
+  # Start the marketing capture for the release commit. It runs on its own
+  # and never blocks the draft, the notes context or the next-version PR.
+  # ───────────────────────────────────────────────────────────────────
+  marketing_capture:
+    needs: publish
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Start the capture on master
+        env:
+          TARGET_COMMIT: ${{ needs.publish.outputs.target_commit }}
+        run: |
+          if gh workflow run marketing-capture-assets.yml --ref master; then
+            echo "Started marketing-capture-assets.yml on master (release commit $TARGET_COMMIT)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not start marketing-capture-assets.yml on master for release commit $TARGET_COMMIT. Run it from the Actions tab on master."
+            exit 1
+          fi

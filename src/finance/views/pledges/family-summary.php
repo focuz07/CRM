@@ -1,0 +1,106 @@
+<?php
+
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\Utils\CurrencyFormatter;
+use ChurchCRM\Utils\InputUtils;
+
+require SystemURLs::getDocumentRoot() . '/Include/Header.php';
+
+?>
+
+<div class="container-fluid">
+    <!-- Page Title -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <h2><?= gettext('Pledge Dashboard') ?></h2>
+            <p class="text-body-secondary small">
+                <?= gettext('Track and manage pledge commitments by family and fund') ?>
+            </p>
+        </div>
+    </div>
+
+    <!-- Fiscal Year Selector -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-body">
+                    <form method="GET" class="form-inline">
+                        <label for="fyid" class="me-2"><?= gettext('Select Fiscal Year') ?>:</label>
+                        <select name="fyid" id="fyid" class="form-select me-3" onchange="this.form.submit();">
+                            <option value="">-- <?= gettext('select an option') ?> --</option>
+                            <?php foreach ($availableYears as $year): ?>
+                                <option value="<?= $year['id'] ?>" <?= $year['id'] == $selectedFyid ? 'selected' : '' ?>>
+                                    <?= InputUtils::escapeHTML($year['label']) ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Results Table -->
+    <div class="row">
+        <div class="col-12">
+            <?php if (empty($familyPledges)): ?>
+                <div class="alert alert-info">
+                    <i class="fa-solid fa-circle-info"></i>
+                    <?= gettext('No pledges found for the selected fiscal year') ?>
+                </div>
+            <?php else: ?>
+                <div class="card">
+                    <div class="card-header bg-surface-secondary">
+                        <h5 class="mb-0">
+                            <?= gettext('Family Pledges') ?> 
+                            <span class="badge bg-primary ms-2"><?= count($familyPledges) ?> <?= gettext('Families') ?></span>
+                        </h5>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="table-responsive">
+                            <table class="table table-hover mb-0">
+                                <thead class="bg-surface-secondary">
+                                    <tr>
+                                        <th><?= gettext('Family Name') ?></th>
+                                        <?php if (SystemConfig::getBooleanValue('bUseDonationEnvelopes')): ?>
+                                        <th><?= gettext('Envelope') ?></th>
+                                        <?php endif; ?>
+                                        <th><?= gettext('Fund Name') ?></th>
+                                        <th class="text-end"><?= gettext('Pledge Amount') ?></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($familyPledges as $family): ?>
+                                        <?php $isFirstRow = true; ?>
+                                        <?php foreach ($family['pledges'] as $pledge): ?>
+                                            <tr>
+                                                <?php if ($isFirstRow): ?>
+                                                    <td rowspan="<?= count($family['pledges']) ?>" class="align-middle fw-bold">
+                                                        <?= InputUtils::escapeHTML($family['family_name']) ?>
+                                                    </td>
+                                                    <?php if (SystemConfig::getBooleanValue('bUseDonationEnvelopes')): ?>
+                                                    <td rowspan="<?= count($family['pledges']) ?>" class="align-middle">
+                                                        <?= InputUtils::escapeHTML($family['envelope'] ?? '') ?>
+                                                    </td>
+                                                    <?php endif; ?>
+                                                    <?php $isFirstRow = false; ?>
+                                                <?php endif; ?>
+                                                <td><?= InputUtils::escapeHTML($pledge['fund_name']) ?></td>
+                                                <td class="text-end">
+                                                    <?= CurrencyFormatter::formatHtml($pledge['pledge_amount']) ?>
+                                                </td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+</div>
+
+<?php require SystemURLs::getDocumentRoot() . '/Include/Footer.php'; ?>

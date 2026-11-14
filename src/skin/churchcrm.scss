@@ -1,0 +1,58 @@
+@use "sass:meta";
+/*! DO NOT MANUALLY EDIT skin/churchcrm.min.css
+
+    Please make changes to skin/scss/*.scss and recompile with SASS. http://sass-lang.com/
+
+    sass --watch src/skin/churchcrm.scss:src/skin/churchcrm.min.css --style compressed
+
+*/
+
+// Vendor CSS is imported via webpack/skin-main.js.
+
+// Font Awesome 7: keep the v6 default icon width unless explicitly fixed.
+.fa,
+.fa-solid,
+.fas,
+.fa-regular,
+.far,
+.fa-brands,
+.fab {
+    --fa-width: auto;
+}
+
+.fa-fw {
+    --fa-width: 1.25em;
+    width: var(--fa-width);
+    text-align: center;
+}
+
+@include meta.load-css("scss/utility-classes");
+
+@include meta.load-css("scss/ui-components");
+
+@include meta.load-css("scss/financial-reports");
+@include meta.load-css("scss/images");
+@include meta.load-css("scss/_brand-logo");
+@include meta.load-css("scss/avatars");
+@include meta.load-css("scss/cart");
+@include meta.load-css("scss/calendars");
+@include meta.load-css("scss/_authentication-pages");
+@include meta.load-css("scss/kiosk");
+@include meta.load-css("scss/groups");
+@include meta.load-css("scss/finance");
+@include meta.load-css("scss/quill");
+
+@include meta.load-css("scss/volunteer");
+
+@include meta.load-css("scss/fab");
+
+@include meta.load-css("scss/_tomselect");
+
+// Page-level styles, one partial per area
+@include meta.load-css("scss/page-shared");
+@include meta.load-css("scss/page-people");
+@include meta.load-css("scss/page-admin");
+@include meta.load-css("scss/page-events-finance");
+@include meta.load-css("scss/page-platform");
+
+@include meta.load-css("scss/_tabler-bridge");

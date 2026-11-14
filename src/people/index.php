@@ -1,0 +1,27 @@
+<?php
+
+require_once __DIR__ . '/../Include/LoadConfigs.php';
+
+use ChurchCRM\Slim\MvcAppFactory;
+
+$app = MvcAppFactory::create('/people', [
+    'dashboardUrl' => '/people/dashboard',
+    'dashboardText' => gettext('Back to People Dashboard'),
+]);
+
+// Register routes
+require __DIR__ . '/routes/dashboard.php';
+require __DIR__ . '/routes/people.php';
+require __DIR__ . '/routes/family.php';
+require __DIR__ . '/routes/person.php';
+require __DIR__ . '/routes/view.php';
+require __DIR__ . '/routes/cart.php';
+require __DIR__ . '/routes/email.php';
+require __DIR__ . '/routes/text.php';
+require __DIR__ . '/routes/self-register.php';
+require __DIR__ . '/routes/map.php';
+require __DIR__ . '/routes/reports.php';
+require __DIR__ . '/routes/labels.php';
+require __DIR__ . '/routes/sign-in-email.php';
+
+$app->run();

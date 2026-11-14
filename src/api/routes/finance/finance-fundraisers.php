@@ -1,0 +1,300 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\model\ChurchCRM\DonatedItemQuery;
+use ChurchCRM\model\ChurchCRM\FundRaiser;
+use ChurchCRM\model\ChurchCRM\FundRaiserQuery;
+use ChurchCRM\Service\FundRaiserService;
+use ChurchCRM\Utils\CurrencyFormatter;
+use ChurchCRM\Utils\LoggerUtils;
+use ChurchCRM\Slim\Middleware\InputSanitizationMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Auth\ManageFundraisersRoleAuthMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Setting\FundraiserEnabledMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\DateTimeUtils;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+
+/**
+ * REST API for Fundraiser CRUD — replaces legacy FundRaiserEditor.php /
+ * FundRaiserDelete.php / FindFundRaiser.php form-post workflow.
+ *
+ * Provides the canonical read/write path for fundraiser records so clients
+ * (mobile, MVC migration, integrations) don't depend on legacy form posts.
+ */
+
+/**
+ * Convert a FundRaiser model to a plain array safe for JSON output.
+ */
+function fundraiserToArray(FundRaiser $fr): array
+{
+    $goalAmount = $fr->getGoalAmount() !== null ? (float) $fr->getGoalAmount() : null;
+
+    return [
+        'id'                    => (int) $fr->getId(),
+        'title'                 => $fr->getTitle(),
+        'description'           => $fr->getDescription(),
+        'date'                  => $fr->getDate() !== null ? $fr->getDate()->format('Y-m-d') : null,
+        'endDate'               => $fr->getEndDate() !== null ? $fr->getEndDate()->format('Y-m-d') : null,
+        'status'                => $fr->getStatus(),
+        'goalAmount'            => $goalAmount,
+        'goalAmount_formatted'  => $goalAmount !== null ? CurrencyFormatter::format($goalAmount) : null,
+        'type'                  => $fr->getType(),
+        'fundId'                => $fr->getFundId() !== null ? (int) $fr->getFundId() : null,
+        'enteredBy'             => (int) $fr->getEnteredBy(),
+        'enteredDate'           => $fr->getEnteredDate() !== null ? $fr->getEnteredDate()->format('Y-m-d') : null,
+    ];
+}
+
+$app->group('/fundraisers', function (RouteCollectorProxy $group): void {
+    /**
+     * @OA\Get(
+     *     path="/fundraisers",
+     *     summary="List all fundraisers (Manage Fundraisers role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="Array of fundraiser objects"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Manage Fundraisers role required")
+     * )
+     */
+    $group->get('', function (Request $request, Response $response, array $args): Response {
+        $list = FundRaiserQuery::create()
+            ->orderByDate('desc')
+            ->find();
+
+        $out = [];
+        foreach ($list as $fr) {
+            $out[] = fundraiserToArray($fr);
+        }
+
+        return SlimUtils::renderJSON($response, ['fundraisers' => $out]);
+    });
+
+    /**
+     * @OA\Post(
+     *     path="/fundraisers",
+     *     summary="Create a new fundraiser (Manage Fundraisers role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\RequestBody(required=true,
+     *         @OA\JsonContent(
+     *             required={"title"},
+     *             @OA\Property(property="title", type="string", maxLength=128),
+     *             @OA\Property(property="description", type="string"),
+     *             @OA\Property(property="date", type="string", format="date")
+     *         )
+     *     ),
+     *     @OA\Response(response=201, description="Newly created fundraiser object"),
+     *     @OA\Response(response=400, description="Validation error"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Manage Fundraisers role required")
+     * )
+     */
+    $group->post('', function (Request $request, Response $response, array $args): Response {
+        try {
+            $input = (array) $request->getParsedBody();
+            $title = (string) ($input['title'] ?? '');
+            $description = (string) ($input['description'] ?? '');
+            $date = trim((string) ($input['date'] ?? ''));
+
+            if ($title === '') {
+                return SlimUtils::renderErrorJSON($response, gettext('Title is required'), [], 400);
+            }
+
+            if ($date !== '') {
+                $date = DateTimeUtils::parseIsoDate($date);
+                if (!$date) {
+                    return SlimUtils::renderErrorJSON($response, gettext('Not a valid date'), [], 400);
+                }
+            } else {
+                $date = DateTimeUtils::getToday()->format('Y-m-d');
+            }
+
+            $fr = new FundRaiser();
+            $fr->setTitle($title);
+            $fr->setDescription($description);
+            $fr->setDate($date);
+            $fieldErr = (new FundRaiserService())->applyFields($fr, $input);
+            if ($fieldErr !== null) {
+                return SlimUtils::renderErrorJSON($response, $fieldErr, [], 400);
+            }
+            $fr->setEnteredBy((int) AuthenticationManager::getCurrentUser()->getId());
+            $fr->setEnteredDate(DateTimeUtils::getToday()->format('Y-m-d'));
+            $fr->save();
+
+            return SlimUtils::renderJSON($response, ['fundraiser' => fundraiserToArray($fr)], 201);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON($response, gettext('Failed to create fundraiser'), [], 500, $e, $request);
+        }
+    })->add(new InputSanitizationMiddleware(['title' => 'text', 'description' => 'text']));
+
+    /**
+     * @OA\Get(
+     *     path="/fundraisers/{id}",
+     *     summary="Get a single fundraiser (Manage Fundraisers role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="Fundraiser object"),
+     *     @OA\Response(response=404, description="Fundraiser not found"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Manage Fundraisers role required")
+     * )
+     */
+    $group->get('/{id:[0-9]+}', function (Request $request, Response $response, array $args): Response {
+        $fr = FundRaiserQuery::create()->findPk((int) $args['id']);
+        if ($fr === null) {
+            return SlimUtils::renderErrorJSON($response, gettext('Fundraiser not found'), [], 404);
+        }
+
+        return SlimUtils::renderJSON($response, ['fundraiser' => fundraiserToArray($fr)]);
+    });
+
+    /**
+     * @OA\Put(
+     *     path="/fundraisers/{id}",
+     *     summary="Update a fundraiser (Manage Fundraisers role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\RequestBody(required=true,
+     *         @OA\JsonContent(
+     *             @OA\Property(property="title", type="string", maxLength=128),
+     *             @OA\Property(property="description", type="string"),
+     *             @OA\Property(property="date", type="string", format="date")
+     *         )
+     *     ),
+     *     @OA\Response(response=200, description="Updated fundraiser object"),
+     *     @OA\Response(response=400, description="Validation error"),
+     *     @OA\Response(response=404, description="Fundraiser not found"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Manage Fundraisers role required")
+     * )
+     */
+    $group->put('/{id:[0-9]+}', function (Request $request, Response $response, array $args): Response {
+        try {
+            $fr = FundRaiserQuery::create()->findPk((int) $args['id']);
+            if ($fr === null) {
+                return SlimUtils::renderErrorJSON($response, gettext('Fundraiser not found'), [], 404);
+            }
+
+            $input = (array) $request->getParsedBody();
+
+            if (array_key_exists('title', $input)) {
+                $title = (string) $input['title'];
+                if ($title === '') {
+                    return SlimUtils::renderErrorJSON($response, gettext('Title is required'), [], 400);
+                }
+                $fr->setTitle($title);
+            }
+
+            if (array_key_exists('description', $input)) {
+                $fr->setDescription((string) $input['description']);
+            }
+
+            if (array_key_exists('date', $input)) {
+                $date = trim((string) $input['date']);
+                if ($date !== '') {
+                    $iso = DateTimeUtils::parseIsoDate($date);
+                    if (!$iso) {
+                        return SlimUtils::renderErrorJSON($response, gettext('Not a valid date'), [], 400);
+                    }
+                    $fr->setDate($iso);
+                }
+            }
+            $fieldErr = (new FundRaiserService())->applyFields($fr, $input);
+            if ($fieldErr !== null) {
+                return SlimUtils::renderErrorJSON($response, $fieldErr, [], 400);
+            }
+
+            $fr->save();
+
+            return SlimUtils::renderJSON($response, ['fundraiser' => fundraiserToArray($fr)]);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON($response, gettext('Failed to update fundraiser'), [], 500, $e, $request);
+        }
+    })->add(new InputSanitizationMiddleware(['title' => 'text', 'description' => 'text']));
+
+    /**
+     * @OA\Delete(
+     *     path="/fundraisers/{id}",
+     *     summary="Delete a fundraiser (Manage Fundraisers role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="Fundraiser deleted"),
+     *     @OA\Response(response=404, description="Fundraiser not found"),
+     *     @OA\Response(response=409, description="Fundraiser still has associated donated items"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Manage Fundraisers role required")
+     * )
+     */
+    $group->delete('/{id:[0-9]+}', function (Request $request, Response $response, array $args): Response {
+        try {
+            $id = (int) $args['id'];
+            $fr = FundRaiserQuery::create()->findPk($id);
+            if ($fr === null) {
+                return SlimUtils::renderErrorJSON($response, gettext('Fundraiser not found'), [], 404);
+            }
+
+            // Block deletion when donated items still reference this fundraiser.
+            // Callers must remove the items first rather than silently orphan
+            // them or cascade-delete auction/raffle history.
+            $itemCount = DonatedItemQuery::create()->filterByFrId($id)->count();
+            if ($itemCount > 0) {
+                return SlimUtils::renderErrorJSON(
+                    $response,
+                    sprintf(
+                        gettext('Cannot delete fundraiser: %d donated items are still associated. Remove the items first.'),
+                        $itemCount
+                    ),
+                    [],
+                    409
+                );
+            }
+
+            $fr->delete();
+
+            return SlimUtils::renderSuccessJSON($response);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON($response, gettext('Failed to delete fundraiser'), [], 500, $e, $request);
+        }
+    });
+
+})->add(new FundraiserEnabledMiddleware())->add(ManageFundraisersRoleAuthMiddleware::class);
+
+// GET /api/fundraisers/active-count — active fundraiser count for menu badge
+// Visible to all authenticated users (moved outside role-restricted group).
+// Used by JavaScript to dynamically load the badge on page load (matches Calendar pattern).
+$app->get('/fundraisers/active-count', function (Request $request, Response $response): Response {
+    $logger = LoggerUtils::getAppLogger();
+    $logger->debug('[fundraisers/active-count] Endpoint called', ['user' => $GLOBALS['iUserID'] ?? null]);
+
+    try {
+        $logger->debug('[fundraisers/active-count] Creating FundRaiserService');
+        $service = new FundRaiserService();
+
+        $logger->debug('[fundraisers/active-count] Calling getActiveFundraiserCount()');
+        $activeCount = $service->getActiveFundraiserCount();
+        $logger->debug('[fundraisers/active-count] Got count', ['count' => $activeCount]);
+
+        $json = json_encode(['count' => $activeCount]);
+        $logger->debug('[fundraisers/active-count] Encoded JSON', ['json' => $json]);
+
+        $response->getBody()->write($json);
+        return $response
+            ->withHeader('Content-Type', 'application/json')
+            ->withStatus(200);
+    } catch (\Throwable $e) {
+        $logger->error('[fundraisers/active-count] Exception caught', [
+            'exception' => get_class($e),
+            'message' => $e->getMessage(),
+            'code' => $e->getCode(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine(),
+        ]);
+        return SlimUtils::renderErrorJSON($response, gettext('Failed to get fundraiser count'), [], 500, $e, $request);
+    }
+})->add(new FundraiserEnabledMiddleware());

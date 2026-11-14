@@ -1,0 +1,302 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\model\ChurchCRM\PropertyQuery;
+use ChurchCRM\model\ChurchCRM\RecordProperty;
+use ChurchCRM\model\ChurchCRM\RecordPropertyQuery;
+use ChurchCRM\Slim\Middleware\Request\Auth\EditRecordsRoleAuthMiddleware;
+use ChurchCRM\Slim\Middleware\Api\FamilyMiddleware;
+use ChurchCRM\Slim\Middleware\Api\PersonMiddleware;
+use ChurchCRM\Slim\Middleware\Api\PropertyMiddleware;
+use ChurchCRM\Slim\Middleware\InputSanitizationMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\LoggerUtils;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Exception\HttpNotFoundException;
+use Slim\Routing\RouteCollectorProxy;
+
+$app->group('/people/properties', function (RouteCollectorProxy $group): void {
+    $personPropertyAPIMiddleware = new PropertyMiddleware('p');
+    $personAPIMiddleware = new PersonMiddleware();
+    $familyPropertyAPIMiddleware = new PropertyMiddleware('f');
+    $familyAPIMiddleware = new FamilyMiddleware();
+    $group->get('/person', 'getAllPersonProperties')->add(EditRecordsRoleAuthMiddleware::class);
+    $group->get('/person/{personId}', 'getPersonProperties')->add($personAPIMiddleware)->add(EditRecordsRoleAuthMiddleware::class);
+    $group->post('/person/{personId}/{propertyId}', 'addPropertyToPerson')
+        ->add(new InputSanitizationMiddleware(['value' => 'text']))
+        ->add($personAPIMiddleware)
+        ->add($personPropertyAPIMiddleware)
+        ->add(EditRecordsRoleAuthMiddleware::class);
+    $group->delete('/person/{personId}/{propertyId}', 'removePropertyFromPerson')->add($personAPIMiddleware)->add($personPropertyAPIMiddleware)->add(EditRecordsRoleAuthMiddleware::class);
+    $group->get('/family', 'getAllFamilyProperties')->add(EditRecordsRoleAuthMiddleware::class);
+    $group->get('/family/{familyId}', 'getFamilyProperties')->add($familyAPIMiddleware)->add(EditRecordsRoleAuthMiddleware::class);
+    $group->post('/family/{familyId}/{propertyId}', 'addPropertyToFamily')
+        ->add(new InputSanitizationMiddleware(['value' => 'text']))
+        ->add($familyAPIMiddleware)
+        ->add($familyPropertyAPIMiddleware)
+        ->add(EditRecordsRoleAuthMiddleware::class);
+    $group->delete('/family/{familyId}/{propertyId}', 'removePropertyFromFamily')->add($familyAPIMiddleware)->add($familyPropertyAPIMiddleware)->add(EditRecordsRoleAuthMiddleware::class);
+
+});
+
+/**
+ * @OA\Get(
+ *     path="/people/properties/person",
+ *     summary="Get all available person property definitions",
+ *     tags={"Properties"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Array of person property definitions"),
+ *     @OA\Response(response=403, description="EditRecords role required")
+ * )
+ */
+function getAllPersonProperties(Request $request, Response $response, array $args): Response
+{
+    $properties = PropertyQuery::create()
+        ->filterByProClass('p')
+        ->find();
+
+    return SlimUtils::renderJSON($response, $properties->toArray());
+}
+
+/**
+ * @OA\Post(
+ *     path="/people/properties/person/{personId}/{propertyId}",
+ *     summary="Add or update a property on a person (EditRecords role required)",
+ *     tags={"Properties"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="propertyId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\RequestBody(
+ *         @OA\JsonContent(@OA\Property(property="value", type="string", description="Property value (required only when property has a prompt)"))
+ *     ),
+ *     @OA\Response(response=200, description="Property assigned successfully"),
+ *     @OA\Response(response=403, description="EditRecords role required")
+ * )
+ */
+function addPropertyToPerson(Request $request, Response $response, array $args): Response
+{
+    $person = $request->getAttribute('person');
+
+    return addProperty($request, $response, $person->getId(), $request->getAttribute('property'));
+}
+
+/**
+ * @OA\Delete(
+ *     path="/people/properties/person/{personId}/{propertyId}",
+ *     summary="Remove a property from a person (EditRecords role required)",
+ *     tags={"Properties"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="propertyId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Property removed successfully"),
+ *     @OA\Response(response=404, description="Record not found"),
+ *     @OA\Response(response=403, description="EditRecords role required")
+ * )
+ */
+function removePropertyFromPerson(Request $request, Response $response, array $args): Response
+{
+    $person = $request->getAttribute('person');
+
+    return removeProperty($request, $response, $person->getId(), $request->getAttribute('property'));
+}
+
+/**
+ * @OA\Get(
+ *     path="/people/properties/family",
+ *     summary="Get all available family property definitions",
+ *     tags={"Properties"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Array of family property definitions"),
+ *     @OA\Response(response=403, description="EditRecords role required")
+ * )
+ */
+function getAllFamilyProperties(Request $request, Response $response, array $args): Response
+{
+    $properties = PropertyQuery::create()
+        ->filterByProClass('f')
+        ->find();
+
+    return SlimUtils::renderJSON($response, $properties->toArray());
+}
+
+/**
+ * @OA\Get(
+ *     path="/people/properties/person/{personId}",
+ *     summary="Get properties assigned to a specific person",
+ *     tags={"Properties"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Array of assigned property records with edit/delete permissions",
+ *         @OA\JsonContent(type="array", @OA\Items(
+ *             @OA\Property(property="id", type="integer"),
+ *             @OA\Property(property="name", type="string"),
+ *             @OA\Property(property="value", type="string"),
+ *             @OA\Property(property="allowEdit", type="boolean"),
+ *             @OA\Property(property="allowDelete", type="boolean")
+ *         ))
+ *     ),
+ *     @OA\Response(response=403, description="EditRecords role required")
+ * )
+ */
+function getPersonProperties(Request $request, Response $response, array $args): Response
+{
+    $person = $request->getAttribute('person');
+
+    return getProperties($response, 'p', $person->getId());
+}
+
+/**
+ * @OA\Get(
+ *     path="/people/properties/family/{familyId}",
+ *     summary="Get properties assigned to a specific family",
+ *     tags={"Properties"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="familyId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Array of assigned property records with edit/delete permissions",
+ *         @OA\JsonContent(type="array", @OA\Items(
+ *             @OA\Property(property="id", type="integer"),
+ *             @OA\Property(property="name", type="string"),
+ *             @OA\Property(property="value", type="string"),
+ *             @OA\Property(property="allowEdit", type="boolean"),
+ *             @OA\Property(property="allowDelete", type="boolean")
+ *         ))
+ *     ),
+ *     @OA\Response(response=403, description="EditRecords role required")
+ * )
+ */
+function getFamilyProperties(Request $request, Response $response, array $args): Response
+{
+    $family = $request->getAttribute('family');
+
+    return getProperties($response, 'f', $family->getId());
+}
+
+function getProperties(Response $response, string $type, int $id): Response
+{
+    $properties = RecordPropertyQuery::create()
+        ->filterByRecordId($id)
+        ->find();
+
+    $finalProperties = [];
+
+    foreach ($properties as $property) {
+        $rawProp = $property->getProperty();
+        if ($rawProp->getProClass() === $type) {
+            $tempProp = [];
+            $tempProp['id'] = $property->getPropertyId();
+            $tempProp['name'] = $rawProp->getProName();
+            $tempProp['value'] = $property->getPropertyValue();
+            if (AuthenticationManager::getCurrentUser()->isEditRecordsEnabled()) {
+                $tempProp['allowEdit'] = !empty(trim($rawProp->getProPrompt()));
+                $tempProp['allowDelete'] = true;
+            } else {
+                $tempProp['allowEdit'] = false;
+                $tempProp['allowDelete'] = false;
+            }
+            $finalProperties[] = $tempProp;
+        }
+    }
+
+    return SlimUtils::renderJSON($response, $finalProperties);
+}
+
+/**
+ * @OA\Post(
+ *     path="/people/properties/family/{familyId}/{propertyId}",
+ *     summary="Add or update a property on a family (EditRecords role required)",
+ *     tags={"Properties"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="familyId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="propertyId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\RequestBody(
+ *         @OA\JsonContent(@OA\Property(property="value", type="string", description="Property value (required only when property has a prompt)"))
+ *     ),
+ *     @OA\Response(response=200, description="Property assigned successfully"),
+ *     @OA\Response(response=403, description="EditRecords role required")
+ * )
+ */
+function addPropertyToFamily(Request $request, Response $response, array $args): Response
+{
+    $family = $request->getAttribute('family');
+
+    return addProperty($request, $response, $family->getId(), $request->getAttribute('property'));
+}
+
+/**
+ * @OA\Delete(
+ *     path="/people/properties/family/{familyId}/{propertyId}",
+ *     summary="Remove a property from a family (EditRecords role required)",
+ *     tags={"Properties"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="familyId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="propertyId", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Property removed successfully"),
+ *     @OA\Response(response=404, description="Record not found"),
+ *     @OA\Response(response=403, description="EditRecords role required")
+ * )
+ */
+function removePropertyFromFamily(Request $request, Response $response, array $args): Response
+{
+    $family = $request->getAttribute('family');
+
+    return removeProperty($request, $response, $family->getId(), $request->getAttribute('property'));
+}
+
+function addProperty(Request $request, Response $response, $id, $property): Response
+{
+    $personProperty = RecordPropertyQuery::create()
+        ->filterByRecordId($id)
+        ->filterByPropertyId($property->getProId())
+        ->findOne();
+
+    $propertyValue = '';
+    if (!empty($property->getProPrompt())) {
+        $data = $request->getParsedBody();
+        // GHSA-8r36-fvxj-26qv: property value is sanitized upstream by
+        // InputSanitizationMiddleware(['value' => 'text']) on the route.
+        $propertyValue = empty($data['value']) ? 'N/A' : (string) $data['value'];
+        LoggerUtils::getAppLogger()->debug('final value is: ' . $propertyValue);
+    }
+
+    if ($personProperty) {
+        if (empty($property->getProPrompt()) || $personProperty->getPropertyValue() == $propertyValue) {
+            return SlimUtils::renderJSON($response, ['success' => true, 'msg' => gettext('The property is already assigned.')]);
+        }
+
+        $personProperty->setPropertyValue($propertyValue);
+        if (!$personProperty->save()) {
+            throw new \Exception(gettext('The property could not be assigned.'));
+        }
+
+        return SlimUtils::renderJSON($response, ['success' => true, 'msg' => gettext('The property is successfully assigned.')]);
+    } else {
+        $personProperty = new RecordProperty();
+        $personProperty->setPropertyId($property->getProId());
+        $personProperty->setRecordId($id);
+        $personProperty->setPropertyValue($propertyValue);
+        $personProperty->save();
+
+        return SlimUtils::renderJSON($response, ['success' => true, 'msg' => gettext('The property is successfully assigned.')]);
+    }
+}
+
+function removeProperty($request, $response, $id, $property): Response
+{
+    $personProperty = RecordPropertyQuery::create()
+        ->filterByRecordId($id)
+        ->filterByPropertyId($property->getProId())
+        ->findOne();
+
+    if ($personProperty === null) {
+        throw new HttpNotFoundException($request, gettext('The record could not be found.'));
+    }
+
+    $personProperty->delete();
+    if (!$personProperty->isDeleted()) {
+        throw new \Exception(gettext('The property could not be unassigned.'));
+    }
+
+    return SlimUtils::renderJSON($response, ['success' => true, 'msg' => gettext('The property is successfully unassigned.')]);
+}
+

@@ -1,0 +1,157 @@
+name: "Locale: extract terms"
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && 'Locale terms: extract now (manual, no wait)' || 'Locale terms: wait for more merges, then extract' }}
+
+# Stage 1 of the terms flow, in plain words:
+#   1. A code PR merges to master (anything under src/ except the translation files).
+#   2. Wait (default 15 minutes, repo variable LOCALE_TERMS_WAIT_MINUTES). Every newer merge restarts the
+#      wait, so a burst of code merges becomes ONE terms PR. A manual run skips the wait and cancels a
+#      wait that is already running ("run now", e.g. before a release).
+#   3. Extract the strings (npm run locale:build) into locale/messages.po. The same command then
+#      brings every locale in line with it (locale:apply --prune: translations of removed strings are
+#      dropped, each locale .po/.mo is rebuilt from its JSON) and rewrites locale/terms/missing/<code>/*.json,
+#      the checked-in queue of terms still to translate. The tree is ready to commit.
+#   4. Open or update ONE terms PR, "locale: new terms from code (+N / -M) - <date>", on the rolling
+#      branch locale/terms/<version>. Its body lists every new and removed string, where it is in the
+#      code, and a "Needs a look" list of strings that look like bugs or would lose translations.
+#   5. A person reviews and merges it. New strings are then translated in the repo (/locale-translate,
+#      npm run locale:missing + locale:apply) and land as a normal PR. There is no outside sync.
+#
+# Translation PRs and the terms PR only touch src/locale/i18n and src/locale/textdomain, so those paths
+# are excluded: merging them never starts another extraction. The terms PR also carries locale/terms/missing.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'src/**'
+      - '!src/locale/i18n/**'
+      - '!src/locale/textdomain/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Concurrency is per job: `wait` cancels and restarts on every new run, `extract` queues so two
+# extractions never write the terms branch at once.
+
+jobs:
+  wait:
+    concurrency:
+      group: locale-terms-wait
+      cancel-in-progress: true
+    timeout-minutes: 125
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Wait for more code merges (skipped on a manual run)
+        if: github.event_name == 'push'
+        env:
+          MINUTES: ${{ vars.LOCALE_TERMS_WAIT_MINUTES || '15' }}
+        run: |
+          [[ "$MINUTES" =~ ^[0-9]+$ ]] && [ "$MINUTES" -le 120 ] || { echo "::error::LOCALE_TERMS_WAIT_MINUTES must be 0-120"; exit 1; }
+          echo "Waiting $MINUTES minutes; a newer merge to master restarts this wait. Run this workflow by hand to skip it."
+          sleep $((MINUTES * 60))
+
+  extract:
+    needs: wait
+    if: ${{ !cancelled() && needs.wait.result == 'success' }}
+    concurrency:
+      group: locale-terms-extract
+      cancel-in-progress: false
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # the newest master after the wait, not the commit that started the run
+          ref: master
+          # full history: the report greps the source and lists the code merges since the last terms merge
+          fetch-depth: 0
+
+      - name: Setup Node.js (from .nvmrc)
+        uses: ./.github/actions/setup-node
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install gettext tools
+        run: sudo apt-get update && sudo apt-get install -y gettext
+
+      - name: Empty the test data (blank DB from Install.sql)
+        run: truncate -s 0 cypress/data/seed.sql
+
+      - name: Start CI Docker containers
+        run: npm run docker:ci:root:start
+
+      - name: Wait for Docker to be ready
+        run: sleep 10
+
+      - name: Extract terms, prune the locales, queue the missing terms (npm run locale:build)
+        run: npm run locale:build
+
+      - name: Stop CI Docker containers
+        if: always()
+        run: npm run docker:ci:root:down
+
+      - name: Check plugin help extraction
+        run: |
+          if grep -q "plugin:holidays" locale/messages.po; then
+            echo "Plugin help terms: $(grep -c '^#\. plugin:' locale/messages.po)"
+          else
+            echo "::warning::No plugin help terms found in locale/messages.po; plugin extraction may have failed"
+          fi
+
+      - name: Check for meaningful changes
+        id: check_changes
+        run: node locale/scripts/lib/locale-po-changes.js
+
+      - name: List new and removed terms
+        id: report
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          mkdir -p locale-terms-report
+          git diff -- locale/messages.po > locale-terms-report/messages.po.diff || true
+          node locale/scripts/lib/locale-terms-diff.js --base HEAD \
+            --body locale-terms-report/pr-body.md --full locale-terms-report/terms.md \
+            --date "$(date -u +%Y-%m-%d)"
+          cat locale-terms-report/terms.md >> "$GITHUB_STEP_SUMMARY"
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the terms report
+        if: steps.check_changes.outputs.has_changes == 'true'
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: locale-terms-report
+          path: |
+            locale-terms-report/
+            locale/messages.po
+          retention-days: 15
+
+      # Rolling branch: while the terms PR is open, each later burst updates the same PR, so it always
+      # shows everything master has not merged yet. GITHUB_TOKEN: the PR still needs a person's merge.
+      - name: Open or update the terms PR
+        if: steps.check_changes.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ github.token }}
+          base: master
+          branch: 'locale/terms/${{ steps.report.outputs.version }}'
+          delete-branch: true
+          add-paths: |
+            locale/messages.po
+            locale/terms/missing
+            src/locale/i18n
+            src/locale/textdomain
+          labels: |
+            Localization
+          title: ${{ steps.report.outputs.title }}
+          commit-message: ${{ steps.report.outputs.title }}
+          body-path: locale-terms-report/pr-body.md

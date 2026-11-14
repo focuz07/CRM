@@ -1,0 +1,75 @@
+name: "Issues: hygiene"
+
+concurrency:
+  group: ${{ github.event_name == 'issues' && format('issue-{0}', github.event.issue.number) || github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'issues' }}
+
+# ==============================================================================
+# PURPOSE: Security guard on newly opened issues, firing deterministically even
+# when the community agent is down, rate-limited, or out of budget.
+#
+# Stale-issue marking/closing and closed-stale review moved to the Hazel community
+# agent's weekly reasoned review, approved by a maintainer in batch.
+# ==============================================================================
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  security-guard:
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    name: Security guard on new issues
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Redirect vulnerability reports to private disclosure
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const issue = context.payload.issue || {};
+            const login = (issue.user && issue.user.login) || '';
+            if ((issue.user && issue.user.type) === 'Bot' || /\[bot\]$/.test(login)) {
+              console.log(`Author ${login} is a bot — skipping.`);
+              return;
+            }
+            if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(issue.author_association)) {
+              console.log(`Author ${login} is ${issue.author_association} — maintainers handle their own security issues.`);
+              return;
+            }
+
+            const text = `${issue.title || ''}\n${issue.body || ''}`;
+            const hasCVE = /cve-\d{4}-\d+/i.test(text) || /ghsa-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}/i.test(text);
+            const looksSecurity = /\b(vulnerabilit(y|ies)|exploit|xss|cross-site scripting|sql injection|sqli|csrf|remote code execution|rce|privilege escalation|authentication bypass|path traversal)\b/i.test(text);
+            const ref = { owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number };
+
+            if (hasCVE) {
+              const body = fs.readFileSync(path.join(process.env.GITHUB_WORKSPACE, '.github/issue-comments/security.md'), 'utf8');
+              await github.rest.issues.createComment({ ...ref, body });
+              await github.rest.issues.addLabels({ ...ref, labels: ['Security', 'security-delete-required'] });
+              await github.rest.issues.update({ ...ref, state: 'closed', state_reason: 'not_planned' });
+              console.log('CVE/GHSA reference: template posted, labelled, closed.');
+              return;
+            }
+            if (looksSecurity) {
+              await github.rest.issues.addLabels({ ...ref, labels: ['Security'] });
+              console.log('Vulnerability-shaped wording: labelled security.');
+              return;
+            }
+            console.log('Nothing security-shaped.');

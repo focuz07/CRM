@@ -1,0 +1,106 @@
+<?php
+
+namespace ChurchCRM\dto;
+
+use ChurchCRM\model\ChurchCRM\Calendar;
+use ChurchCRM\model\ChurchCRM\User;
+use ChurchCRM\Plugin\Hook\HookManager;
+use ChurchCRM\Plugin\Hooks;
+use ChurchCRM\Plugin\PluginManager;
+use ChurchCRM\SystemCalendars\AnniversariesCalendar;
+use ChurchCRM\SystemCalendars\BirthdaysCalendar;
+use ChurchCRM\SystemCalendars\FundraisersCalendar;
+use ChurchCRM\SystemCalendars\SystemCalendar;
+use ChurchCRM\SystemCalendars\UnpinnedEvents;
+use Propel\Runtime\Collection\ObjectCollection;
+
+class SystemCalendars
+{
+    /**
+     * Every system calendar this installation has, core and plugin-registered.
+     *
+     * Public since #9866: the Member Portal chooses which calendars members
+     * see, and it needs the calendar objects themselves — a name, its colours
+     * and its `getEvents()` — not the Propel stand-ins `getCalendarList()`
+     * returns for the JSON API.
+     *
+     * @return SystemCalendar[]
+     */
+    public static function getCalendars(): array
+    {
+        $systemCalendarNames = [
+            BirthdaysCalendar::class,
+            AnniversariesCalendar::class,
+            FundraisersCalendar::class,
+            UnpinnedEvents::class,
+        ];
+
+        $calendars = [];
+        foreach ($systemCalendarNames as $systemCalendarName) {
+            if ($systemCalendarName::isAvailable()) {
+                $calendars[] = new $systemCalendarName();
+            }
+        }
+
+        // Allow plugins to contribute additional system calendars.
+        // Lazy-init PluginManager because the API entry point does not
+        // initialize it the way Header.php does.
+        try {
+            PluginManager::init(SystemURLs::getDocumentRoot() . '/plugins');
+            $calendars = HookManager::applyFilters(Hooks::SYSTEM_CALENDARS_REGISTER, $calendars);
+        } catch (\Throwable $e) {
+            // Plugin discovery failure must not break core calendars
+        }
+
+        return $calendars;
+    }
+
+    /**
+     * The system calendars this staff user may read. Fundraiser dates follow the fundraiser pages.
+     *
+     * @return SystemCalendar[]
+     */
+    public static function getCalendarsFor(User $user): array
+    {
+        return array_values(array_filter(
+            self::getCalendars(),
+            static fn (SystemCalendar $calendar): bool => !$calendar instanceof FundraisersCalendar || $user->isManageFundraisersEnabled()
+        ));
+    }
+
+    public static function getCalendarList(User $user): ObjectCollection
+    {
+        $calendars = new ObjectCollection();
+        $calendars->setModel(Calendar::class);
+        foreach (self::getCalendarsFor($user) as $calendar) {
+            $calendars->push(self::toPropelCalendar($calendar));
+        }
+
+        return $calendars;
+    }
+
+    public static function getCalendarById($id, User $user): ?SystemCalendar
+    {
+        $requestedCalendar = null;
+        foreach (self::getCalendarsFor($user) as $calendar) {
+            if ($calendar->getId() == $id) {
+                $requestedCalendar = $calendar;
+                break;
+            }
+        }
+
+        return $requestedCalendar;
+    }
+
+    public static function toPropelCalendar(SystemCalendar $calendar): Calendar
+    {
+        $procalendar = new Calendar();
+        $procalendar->setId($calendar->getId());
+        $procalendar->setName($calendar->getName());
+        $procalendar->setAccessToken($calendar->getAccessToken());
+        $procalendar->setBackgroundColor($calendar->getBackgroundColor());
+        $procalendar->setForegroundColor($calendar->getForegroundColor());
+
+        return $procalendar;
+    }
+}

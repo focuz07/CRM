@@ -1,0 +1,509 @@
+<?php
+
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Service\ChurchLogoService;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\view\ChurchLogo;
+
+require SystemURLs::getDocumentRoot() . '/Include/Header.php';
+
+// Ensure variables have defaults (sGlobalMessage and sGlobalMessageClass are
+// consumed by Footer.php via showGlobalMessage() → window.CRM.notify())
+$sGlobalMessage      = $sGlobalMessage ?? '';
+$sGlobalMessageClass = $sGlobalMessageClass ?? 'success';
+$validationError     = $validationError ?? '';
+$socialNetworks      = $socialNetworks ?? [];
+
+// Only the networks the admin has actually filled in are previewed.
+$setSocialNetworks = array_values(array_filter(
+    $socialNetworks,
+    static fn (array $network): bool => $network['url'] !== ''
+));
+
+// Per-network placeholder, so each field shows the shape of its own URL.
+$socialPlaceholders = [
+    'x'         => 'https://x.com/yourchurch',
+    'youtube'   => 'https://youtube.com/@yourchurch',
+    'facebook'  => 'https://facebook.com/yourchurch',
+    'instagram' => 'https://instagram.com/yourchurch',
+];
+?>
+
+<form method="POST"
+      action="<?= $sRootPath ?>/admin/system/church-info"
+      id="church-info-form"
+      novalidate>
+
+    <!-- Church Identity -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-church me-2"></i><?= gettext('Church Identity') ?></h3>
+                </div>
+                <div class="card-body">
+                    <div class="mb-3">
+                        <label for="sChurchName">
+                            <?= gettext('Church Name') ?>
+                            <span class="text-danger">*</span>
+                        </label>
+                        <input type="text"
+                               class="form-control<?= (!empty($validationError)) ? ' is-invalid' : '' ?>"
+                               id="sChurchName"
+                               name="sChurchName"
+                               value="<?= InputUtils::escapeHTML($churchInfo['sChurchName']) ?>"
+                               required
+                               maxlength="200"
+                               aria-describedby="churchNameHelp">
+                        <small id="churchNameHelp" class="form-text text-body-secondary">
+                            <?= gettext('Required. Used on all reports and communications.') ?>
+                        </small>
+                        <?php if (!empty($validationError)): ?>
+                        <div class="invalid-feedback"><?= InputUtils::escapeHTML($validationError) ?></div>
+                        <?php endif; ?>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="sChurchWebSite"><?= gettext('Website') ?></label>
+                        <input type="url"
+                               class="form-control"
+                               id="sChurchWebSite"
+                               name="sChurchWebSite"
+                               value="<?= InputUtils::escapeHTML($churchInfo['sChurchWebSite']) ?>"
+                               maxlength="200"
+                               placeholder="https://">
+                        <small class="form-text text-body-secondary">
+                            <?= gettext('Optional. URL for your church website.') ?>
+                        </small>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="sChurchTaxId"><?= gettext('Tax ID (EIN)') ?></label>
+                        <input type="text"
+                               class="form-control"
+                               id="sChurchTaxId"
+                               name="sChurchTaxId"
+                               value="<?= InputUtils::escapeHTML($churchInfo['sChurchTaxId']) ?>"
+                               maxlength="50">
+                        <small class="form-text text-body-secondary">
+                            <?= gettext('Optional. Printed on contribution statements.') ?>
+                        </small>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Church Logo: saved by its own API; the buttons are type="button" so they never submit this form -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card" id="church-logo-card">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-image me-2"></i><?= gettext('Church Logo') ?></h3>
+                </div>
+                <div class="card-body">
+                    <p class="text-body-secondary">
+                        <?= gettext('Shown in the sidebar, on the login page and in emails. Uploading a logo replaces the ChurchCRM branding everywhere it appears.') ?>
+                    </p>
+
+                    <div class="mb-2">
+                        <?= ChurchLogo::img([
+                            'id'    => 'church-logo-preview',
+                            'class' => 'border rounded bg-light p-2',
+                            'style' => 'max-height: 120px; max-width: 100%; height: auto;',
+                        ]) ?>
+                    </div>
+
+                    <button type="button" class="btn btn-outline-primary" id="church-logo-upload-btn">
+                        <i class="fa-solid fa-upload me-1"></i><?= gettext('Upload') ?>
+                    </button>
+                    <?php if (ChurchLogoService::hasCustomLogo()): ?>
+                    <button type="button" class="btn btn-outline-danger ms-2" id="church-logo-remove-btn">
+                        <i class="fa-solid fa-trash me-1"></i><?= gettext('Remove') ?>
+                    </button>
+                    <?php else: ?>
+                    <span class="text-body-secondary small ms-2" id="church-logo-default-note">
+                        <i class="fa-solid fa-circle-info me-1"></i><?= gettext('Using default ChurchCRM logo') ?>
+                    </span>
+                    <?php endif; ?>
+
+                    <small class="form-text text-body-secondary d-block mt-2">
+                        <?= gettext('PNG, JPG, GIF or WebP. A wide banner of roughly 3.5:1 (for example 700x200) works best; transparent PNG preferred.') ?>
+                    </small>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Contact Information -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-address-book me-2"></i><?= gettext('Contact Information') ?></h3>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="mb-3 col-md-6">
+                            <label for="sChurchPhone">
+                                <?= gettext('Phone Number') ?>
+                                <span class="text-danger">*</span>
+                            </label>
+                            <input type="tel"
+                                   class="form-control"
+                                   id="sChurchPhone"
+                                   name="sChurchPhone"
+                                   value="<?= InputUtils::escapeHTML($churchInfo['sChurchPhone']) ?>"
+                                   maxlength="30"
+                                   placeholder="(555) 555-5555"
+                                   required>
+                        </div>
+
+                        <div class="mb-3 col-md-6">
+                            <label for="sChurchEmail">
+                                <?= gettext('Email Address') ?>
+                                <span class="text-danger">*</span>
+                            </label>
+                            <input type="email"
+                                   class="form-control"
+                                   id="sChurchEmail"
+                                   name="sChurchEmail"
+                                   value="<?= InputUtils::escapeHTML($churchInfo['sChurchEmail']) ?>"
+                                   maxlength="200"
+                                   placeholder="info@yourchurch.org"
+                                   required>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Location -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-map me-2"></i><?= gettext('Location') ?></h3>
+                </div>
+                <div class="card-body">
+                    <div class="mb-3">
+                        <label for="sChurchAddress">
+                            <?= gettext('Street Address') ?>
+                            <span class="text-danger">*</span>
+                        </label>
+                        <input type="text"
+                               class="form-control"
+                               id="sChurchAddress"
+                               name="sChurchAddress"
+                               value="<?= InputUtils::escapeHTML($churchInfo['sChurchAddress']) ?>"
+                               maxlength="200"
+                               required>
+                    </div>
+
+                    <div class="row">
+                        <div class="mb-3 col-md-4">
+                            <label for="sChurchCity"><?= gettext('City') ?> <span class="text-danger">*</span></label>
+                            <input type="text"
+                                   class="form-control"
+                                   id="sChurchCity"
+                                   name="sChurchCity"
+                                   value="<?= InputUtils::escapeHTML($churchInfo['sChurchCity']) ?>"
+                                   maxlength="100"
+                                   required>
+                        </div>
+                        <div class="mb-3 col-md-3">
+                            <label for="sChurchState"><?= gettext('State') ?> <span class="text-danger">*</span></label>
+                            <div id="sChurchStateContainer" class="w-100"
+                                 data-user-selected-state="<?= InputUtils::escapeHTML($churchInfo['sChurchState']) ?>">
+                            </div>
+                        </div>
+                        <div class="mb-3 col-md-2">
+                            <label for="sChurchZip"><?= gettext('Zip Code') ?> <span class="text-danger">*</span></label>
+                            <input type="text"
+                                   class="form-control"
+                                   id="sChurchZip"
+                                   name="sChurchZip"
+                                   value="<?= InputUtils::escapeHTML($churchInfo['sChurchZip']) ?>"
+                                   maxlength="20"
+                                   required>
+                        </div>
+                        <div class="mb-3 col-md-3">
+                            <label for="sChurchCountry"><?= gettext('Country') ?> <span class="text-danger">*</span></label>
+                            <select class="form-select w-100" id="sChurchCountry" name="sChurchCountry"
+                                    data-user-selected="<?= InputUtils::escapeHTML($churchInfo['sChurchCountry']) ?>">
+                            </select>
+                        </div>
+                    </div>
+
+                    <hr class="my-3">
+                    <h5 class="mb-3"><?= gettext('Map Coordinates') ?></h5>
+                    <p class="text-body-secondary small mb-2">
+                        <i class="fa-solid fa-circle-info me-1"></i>
+                        <?= gettext('Click "Generate Coordinates" to look up the map location for the address above, or enter latitude/longitude manually. If left blank, coordinates are also auto-detected when you save the form.') ?>
+                    </p>
+                    <button type="button" class="btn btn-outline-primary btn-sm mb-3" id="generate-coordinates-btn">
+                        <i class="fa-solid fa-location-crosshairs me-1"></i>
+                        <?= gettext('Generate Coordinates') ?>
+                    </button>
+                    <small class="form-text text-body-secondary d-block mb-3" id="generate-coordinates-help">
+                        <?= gettext('Uses your street address above to look up coordinates via OpenStreetMap.') ?>
+                    </small>
+                    <div class="row">
+                        <div class="mb-3 col-md-4">
+                            <label for="iChurchLatitude"><?= gettext('Latitude') ?></label>
+                            <input type="number"
+                                   step="any"
+                                   min="-90"
+                                   max="90"
+                                   class="form-control"
+                                   id="iChurchLatitude"
+                                   name="iChurchLatitude"
+                                   value="<?= InputUtils::escapeHTML((string) $churchInfo['iChurchLatitude']) ?>"
+                                   placeholder="<?= gettext('e.g., 40.7128') ?>">
+                            <small class="form-text text-body-secondary"><?= gettext('Range: -90 to 90.') ?></small>
+                        </div>
+                        <div class="mb-3 col-md-4">
+                            <label for="iChurchLongitude"><?= gettext('Longitude') ?></label>
+                            <input type="number"
+                                   step="any"
+                                   min="-180"
+                                   max="180"
+                                   class="form-control"
+                                   id="iChurchLongitude"
+                                   name="iChurchLongitude"
+                                   value="<?= InputUtils::escapeHTML((string) $churchInfo['iChurchLongitude']) ?>"
+                                   placeholder="<?= gettext('e.g., -74.0060') ?>">
+                            <small class="form-text text-body-secondary"><?= gettext('Range: -180 to 180.') ?></small>
+                        </div>
+                    </div>
+
+                    <?php
+                    $latFloat  = (float) $churchInfo['iChurchLatitude'];
+                    $lngFloat  = (float) $churchInfo['iChurchLongitude'];
+                    $hasCoords = ($latFloat !== 0.0 || $lngFloat !== 0.0)
+                        && $latFloat >= -90.0 && $latFloat <= 90.0
+                        && $lngFloat >= -180.0 && $lngFloat <= 180.0;
+                    ?>
+
+
+                    <div id="church-location-map" class="mb-2 rounded border admin-map-canvas<?= $hasCoords ? '' : ' d-none' ?>"></div>
+                    <div class="alert alert-info mt-3 mb-0<?= $hasCoords ? ' d-none' : '' ?>" id="no-coords-alert">
+                        <i class="fa-solid fa-location-dot me-2"></i>
+                        <?= gettext('A map will appear here once coordinates are saved — either auto-detected from your address or entered manually above.') ?>
+                    </div>
+                    <script nonce="<?= SystemURLs::getCSPNonce() ?>">
+                        window.CRM = window.CRM || {};
+                        window.CRM.churchMapConfig = <?= InputUtils::jsonEncodeForScript([
+                            'lat'       => $latFloat,
+                            'lng'       => $lngFloat,
+                            'name'      => $churchInfo['sChurchName'],
+                            'hasCoords' => $hasCoords,
+                        ]) ?>;
+                    </script>
+
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Social Media -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-share-nodes me-2"></i><?= gettext('Social Media') ?></h3>
+                </div>
+                <div class="card-body">
+                    <p class="text-body-secondary mb-3">
+                        <?= gettext('Optional. Links to the church\'s own accounts, shown to members on pages such as the portal footer. Leave a field blank to hide that network.') ?>
+                    </p>
+                    <div class="row">
+                        <?php foreach ($socialNetworks as $network): ?>
+                        <div class="mb-3 col-md-6">
+                            <label for="<?= InputUtils::escapeAttribute($network['config']) ?>"><?= InputUtils::escapeHTML($network['label']) ?></label>
+                            <div class="input-group">
+                                <span class="input-group-text">
+                                    <i class="<?= InputUtils::escapeAttribute($network['icon']) ?>"
+                                       id="social-icon-<?= InputUtils::escapeAttribute($network['id']) ?>"
+                                       aria-hidden="true"></i>
+                                </span>
+                                <input type="url"
+                                       class="form-control"
+                                       id="<?= InputUtils::escapeAttribute($network['config']) ?>"
+                                       name="<?= InputUtils::escapeAttribute($network['config']) ?>"
+                                       value="<?= InputUtils::escapeHTML($network['url']) ?>"
+                                       maxlength="200"
+                                       placeholder="<?= InputUtils::escapeAttribute($socialPlaceholders[$network['id']] ?? 'https://') ?>">
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+                    <small class="form-text text-body-secondary">
+                        <?= gettext('Each address must start with https://') ?>
+                    </small>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Display Preview -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="card-title"><i class="fa-solid fa-eye me-2"></i><?= gettext('Display Preview') ?></h3>
+                </div>
+                <div class="card-body">
+                    <p class="text-body-secondary">
+                        <?= gettext('This is how your church information will appear on reports and directories.') ?>
+                    </p>
+
+                    <h5 class="mb-2"><i class="fa-solid fa-eye me-2"></i><?= gettext('Preview') ?></h5>
+                    <div class="card-body bg-surface-secondary rounded">
+                        <address class="mb-0">
+                            <div id="preview-name-line" class="<?= empty($churchInfo['sChurchName']) ? 'd-none' : '' ?>">
+                            <strong id="preview-name"><?= InputUtils::escapeHTML($churchInfo['sChurchName']) ?></strong><br>
+                            </div>
+                            <div id="preview-address-line" class="<?= empty($churchInfo['sChurchAddress']) ? 'd-none' : '' ?>">
+                            <span id="preview-address"><?= InputUtils::escapeHTML($churchInfo['sChurchAddress']) ?></span><br>
+                            </div>
+                            <?php
+                            $cityStateParts = array_filter([$churchInfo['sChurchCity'], $churchInfo['sChurchState']]);
+                            $cityStateStr = implode(', ', $cityStateParts);
+                            $zip = $churchInfo['sChurchZip'];
+                            $cityLine = trim($cityStateStr . ($zip !== '' ? ' ' . $zip : ''));
+                            ?>
+                            <div id="preview-citystate-line" class="<?= $cityLine === '' ? 'd-none' : '' ?>">
+                            <span id="preview-citystate"><?= InputUtils::escapeHTML($cityLine) ?></span><br>
+                            </div>
+                            <div id="preview-country-line" class="<?= empty($churchInfo['sChurchCountry']) ? 'd-none' : '' ?>">
+                            <span id="preview-country"><?= InputUtils::escapeHTML($countries[$churchInfo['sChurchCountry']] ?? $churchInfo['sChurchCountry']) ?></span><br>
+                            </div>
+                            <div id="preview-phone-line" class="<?= empty($churchInfo['sChurchPhone']) ? 'd-none' : '' ?>">
+                            <i class="fa-solid fa-phone me-1"></i><span id="preview-phone"><?= InputUtils::escapeHTML($churchInfo['sChurchPhone']) ?></span><br>
+                            </div>
+                            <div id="preview-email-line" class="<?= empty($churchInfo['sChurchEmail']) ? 'd-none' : '' ?>">
+                            <i class="fa-solid fa-envelope me-1"></i><a id="preview-email" href="mailto:<?= InputUtils::escapeAttribute($churchInfo['sChurchEmail']) ?>" target="_blank" rel="noopener noreferrer"><?= InputUtils::escapeHTML($churchInfo['sChurchEmail']) ?></a><br>
+                            </div>
+                            <div id="preview-website-line" class="<?= empty($churchInfo['sChurchWebSite']) ? 'd-none' : '' ?>">
+                            <i class="fa-solid fa-globe me-1"></i><a id="preview-website" href="<?= InputUtils::escapeAttribute($churchInfo['sChurchWebSite']) ?>" target="_blank" rel="noopener noreferrer"><?= InputUtils::escapeHTML($churchInfo['sChurchWebSite']) ?></a>
+                            </div>
+                            <div id="preview-social-line" class="mt-2<?= $setSocialNetworks === [] ? ' d-none' : '' ?>">
+                                <?php foreach ($setSocialNetworks as $network): ?>
+                                <a id="preview-social-<?= InputUtils::escapeAttribute($network['id']) ?>"
+                                   class="me-2 fs-4"
+                                   href="<?= InputUtils::escapeAttribute($network['url']) ?>"
+                                   target="_blank"
+                                   rel="noopener noreferrer"
+                                   aria-label="<?= InputUtils::escapeAttribute($network['label']) ?>"
+                                   title="<?= InputUtils::escapeAttribute($network['label']) ?>"><i class="<?= InputUtils::escapeAttribute($network['icon']) ?>" aria-hidden="true"></i></a>
+                                <?php endforeach; ?>
+                            </div>
+                        </address>
+                    </div>
+                    <div class="alert alert-warning mt-3<?= empty($churchInfo['sChurchName']) ? '' : ' d-none' ?>" id="preview-name-required-alert">
+                        <i class="fa-solid fa-triangle-exclamation me-2"></i>
+                        <?= gettext('Church name is required. Please fill in the Church Identity section above.') ?>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Form Actions -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-body d-flex justify-content-between align-items-center">
+                    <div>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fa-solid fa-floppy-disk me-1"></i>
+                            <?= gettext('Save Church Information') ?>
+                        </button>
+                        <a href="<?= $sRootPath ?>/admin/" class="btn btn-secondary ms-2">
+                            <?= gettext('Cancel') ?>
+                        </a>
+                    </div>
+                    <small class="text-body-secondary">
+                        <span class="text-danger">*</span> <?= gettext('Required') ?>
+                    </small>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</form>
+
+<script nonce="<?= SystemURLs::getCSPNonce() ?>">
+(function () {
+    var requiredFields = ['sChurchName', 'sChurchPhone', 'sChurchEmail', 'sChurchAddress', 'sChurchCity', 'sChurchState', 'sChurchZip', 'sChurchCountry'];
+
+    document.getElementById('church-info-form').addEventListener('submit', function (e) {
+        e.preventDefault();
+
+        var firstInvalidField = null;
+        var hasErrors = false;
+
+        for (var i = 0; i < requiredFields.length; i++) {
+            var el = document.getElementById(requiredFields[i]);
+            if (!el) { continue; }
+
+            if (!el.value.trim()) {
+                el.classList.add('is-invalid');
+                // For TomSelect-enhanced selects, also mark the wrapper
+                if (el.tomselect) {
+                    var tsWrapper = el.parentNode.querySelector('.ts-wrapper');
+                    if (tsWrapper) { tsWrapper.classList.add('is-invalid'); }
+                }
+                hasErrors = true;
+                if (!firstInvalidField) {
+                    firstInvalidField = el;
+                }
+            } else {
+                el.classList.remove('is-invalid');
+                if (el.tomselect) {
+                    var tsWrapper = el.parentNode.querySelector('.ts-wrapper');
+                    if (tsWrapper) { tsWrapper.classList.remove('is-invalid'); }
+                }
+            }
+        }
+
+        if (hasErrors) {
+            firstInvalidField.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            // Focus via TomSelect API when available, otherwise native focus
+            if (firstInvalidField.tomselect) {
+                firstInvalidField.tomselect.focus();
+            } else {
+                firstInvalidField.focus();
+            }
+            return;
+        }
+
+        this.submit();
+    });
+
+    // Clear is-invalid on input/change
+    document.querySelectorAll('#church-info-form input, #church-info-form select').forEach(function (el) {
+        ['input', 'change'].forEach(function (evtName) {
+            el.addEventListener(evtName, function () {
+                if (this.value && this.value.trim()) {
+                    this.classList.remove('is-invalid');
+                    const wrapper = this.nextElementSibling;
+                    if (wrapper && wrapper.classList.contains('ts-wrapper')) {
+                        wrapper.classList.remove('is-invalid');
+                    }
+                }
+            });
+        });
+    });
+})();
+</script>
+
+<link rel="stylesheet" href="<?= SystemURLs::assetVersioned('/skin/v2/photo-uploader.min.css') ?>">
+<script src="<?= SystemURLs::assetVersioned('/skin/v2/photo-uploader.min.js') ?>"></script>
+
+<!-- Church Info page JavaScript -->
+<script src="<?= SystemURLs::assetVersioned('/skin/v2/church-info.min.js') ?>"></script>
+
+<?php require SystemURLs::getDocumentRoot() . '/Include/Footer.php'; ?>

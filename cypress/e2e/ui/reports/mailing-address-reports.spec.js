@@ -1,0 +1,331 @@
+/// <reference types="cypress" />
+
+import { pdfText } from "../../../support/pdf-text";
+
+// Mail goes to the family's mailing address: the flagged second address when there is one.
+describe("Mailing address on mailed reports", () => {
+    const createdFamilyIds = [];
+
+    const labelQuery =
+        "labeltype=Tractor&labelfont=Helvetica&labelfontsize=default&recipientnamingmethod=familyname";
+
+    /**
+     * Creates a family whose flagged second address is in a different ZIP.
+     * Pass `secondCity: ""` for a PO Box that has only a state and ZIP on record,
+     * and `members` (first names) when the family has to appear in the directory,
+     * which lists people, not families.
+     */
+    const createFamilyWithMailingAddress = (familyName, { secondCity = "Othertown", members = [], birthMonth = null } = {}) => {
+        cy.visit("/FamilyEditor.php");
+        cy.contains("Family Info");
+        cy.get("#FamilyName").type(familyName);
+        members.forEach((firstName, index) => {
+            // Last name left blank: the editor fills in the family name. The
+            // directory form pre-selects the member classifications, so each
+            // member is a Member (1) rather than Unassigned (0).
+            cy.get(`input[name="FirstName${index + 1}"]`).type(firstName);
+            cy.get(`select[name="Classification${index + 1}"]`).select("1", { force: true });
+            if (birthMonth !== null) {
+                cy.get(`select[name="BirthMonth${index + 1}"]`).select(birthMonth, { force: true });
+                cy.get(`select[name="BirthDay${index + 1}"]`).select("15", { force: true });
+            }
+        });
+        cy.get('input[name="Address1"]').type("742 Evergreen Terrace");
+        cy.get('input[name="City"]').clear().type("Springfield");
+        cy.get('select[name="State"]').select("IL", { force: true });
+        cy.get('input[name="Zip"]').clear().type("62704");
+
+        cy.get("#secondAddressToggle").click();
+        cy.get("#SecondAddress1").type("PO Box 1204");
+        if (secondCity !== "") {
+            cy.get("#SecondCity").type(secondCity);
+        }
+        cy.get("#SecondState").select("IL", { force: true });
+        cy.get("#SecondZip").type("62998");
+        cy.get("#SecondIsMailing").should("not.be.disabled").check();
+
+        cy.get('button[name="FamilySubmit"]').click();
+        cy.location("pathname").should("include", "/people/family/");
+
+        return cy.location("pathname").then((pathname) => {
+            const id = Number(pathname.split("/").pop());
+            createdFamilyIds.push(id);
+            return id;
+        });
+    };
+
+    /** Fetches a PDF report over the browser's session and returns its text lines. */
+    const fetchPdfLines = (path) =>
+        cy
+            .request({ url: path, encoding: "binary", failOnStatusCode: false })
+            .then((response) => {
+                expect(response.status, "no server error").to.equal(200);
+                expect(response.headers["content-type"] || "").to.include("application/pdf");
+                return pdfText(response.body);
+            });
+
+    /** The three lines a label prints for a family that mails to its PO Box. */
+    const expectLabelLines = (lines, familyName) => {
+        const at = lines.indexOf(familyName);
+        expect(at, `a label for ${familyName}`).to.be.greaterThan(-1);
+        expect(lines.slice(at, at + 3)).to.deep.equal([familyName, "PO Box 1204", "Othertown, IL  62998"]);
+        expect(lines).to.not.include("742 Evergreen Terrace");
+    };
+
+    /** The rows of the /people/labels CSV output, header dropped. */
+    const fetchLabelRows = (query) =>
+        cy
+            .request(
+                `/people/labels?${query}&labeltype=5160&labelfont=Helvetica&labelfontsize=10&startrow=1&startcol=1&filetype=CSV`,
+            )
+            .then((response) => {
+                expect(response.status, "no server error").to.equal(200);
+                return String(response.body).trim().split(/\r?\n/).slice(1);
+            });
+
+    const expectMailingAddressRow = (rows, familyName) => {
+        const row = rows.find((line) => line.includes(familyName));
+        expect(row, `a label for ${familyName}`).to.not.equal(undefined);
+        expect(row).to.include("PO Box 1204").and.include("Othertown").and.include("62998");
+        expect(row).to.not.include("742 Evergreen Terrace");
+    };
+
+    const cartRequest = (method, body) =>
+        cy.request({
+            method,
+            url: "/api/cart/",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+
+    beforeEach(() => {
+        cy.freshAdminFormLogin();
+    });
+
+    after(() => {
+        // deleteMembers: without it the family delete only unlinks the members,
+        // which would leave the directory suite's people behind as orphans.
+        createdFamilyIds.forEach((id) => {
+            cy.makePrivateAdminAPICall("DELETE", `/api/family/${id}?deleteMembers=true`, null, 200);
+        });
+    });
+
+    it("prints the second address on newsletter labels when it is the mailing address", () => {
+        const familyName = "MailLabels" + Cypress._.random(0, 1e6);
+        createFamilyWithMailingAddress(familyName);
+        // New families receive the newsletter by default, so this one gets a label.
+        fetchPdfLines(`/people/labels/newsletter?${labelQuery}`).then((lines) => {
+            expectLabelLines(lines, familyName);
+        });
+    });
+
+    it("prints the second address on confirm data labels when it is the mailing address", () => {
+        const familyName = "MailConfirm" + Cypress._.random(0, 1e6);
+        createFamilyWithMailingAddress(familyName);
+        // Confirm labels cover every family.
+        fetchPdfLines(`/people/labels/confirm?${labelQuery}`).then((lines) => {
+            expectLabelLines(lines, familyName);
+        });
+    });
+
+    it("prints the second address on labels generated from the cart", () => {
+        const familyName = "MailCart" + Cypress._.random(0, 1e6);
+        createFamilyWithMailingAddress(familyName, { members: ["Carta"] }).then((familyId) => {
+            cartRequest("DELETE", {});
+            cartRequest("POST", { Family: familyId });
+            fetchLabelRows("groupbymode=indiv").then((rows) => expectMailingAddressRow(rows, familyName));
+            fetchLabelRows("groupbymode=fam").then((rows) => expectMailingAddressRow(rows, familyName));
+            cartRequest("DELETE", {});
+        });
+    });
+
+    it("prints the second address on People Report labels", () => {
+        const familyName = "MailReport" + Cypress._.random(0, 1e6);
+        createFamilyWithMailingAddress(familyName, { members: ["Bday"], birthMonth: "11" });
+        fetchLabelRows("report=birthdays&month=11&groupbymode=indiv").then((rows) =>
+            expectMailingAddressRow(rows, familyName),
+        );
+    });
+
+    it("addresses the confirmation letter to the second address and lists it on the data sheet", () => {
+        const familyName = "MailLetter" + Cypress._.random(0, 1e6);
+        createFamilyWithMailingAddress(familyName).then((familyId) => {
+            fetchPdfLines(`/people/report/verify?familyId=${familyId}`).then((rawLines) => {
+                // HTML collapses the label layout's double space before the ZIP.
+                const lines = rawLines.map((line) => line.replace(/\s+/g, " ").trim());
+                // The address block under the letterhead — salutation, then the
+                // mailing address — is what shows through the envelope window.
+                const block = lines.indexOf("PO Box 1204");
+                expect(block, "the mailing address in the letter's address block").to.be.greaterThan(-1);
+                expect(lines[block - 1]).to.include(familyName);
+                expect(lines[block + 1]).to.equal("Othertown, IL 62998");
+                // The data sheet lists what is on record: the primary address and,
+                // because it differs, the mailing address too.
+                const address = lines.indexOf("Address:");
+                expect(address, "the data sheet's Address line").to.be.greaterThan(-1);
+                expect(lines[address + 1]).to.equal("742 Evergreen Terrace, Springfield, IL 62704");
+                const mailing = lines.indexOf("Mailing Address:");
+                expect(mailing, "the data sheet's Mailing Address line").to.be.greaterThan(-1);
+                expect(lines[mailing + 1]).to.equal("PO Box 1204, Othertown, IL 62998");
+            });
+        });
+    });
+
+    it("addresses each giving statement's remittance slip to that statement's family", () => {
+        // Seed families 1 and 6 both gave on 2018-03-04; statements run in family order.
+        cy.visit("/finance/reports/giving-statements");
+        cy.get("#DateStart").clear().type("2018-01-01");
+        cy.get("#DateEnd").clear().type("2018-12-31");
+        cy.get("#remittanceYes").check();
+        cy.get("#givingReportForm").then(($form) => {
+                const body = new URLSearchParams(new FormData($form[0]));
+                body.append("family[]", "1");
+                body.append("family[]", "6");
+                return cy
+                    .request({
+                        method: "POST",
+                        // Root-relative path. Cypress resolves it against baseUrl.
+                        // The form action already includes SystemURLs::getRootPath();
+                        // appending /download and handing that to cy.request doubles
+                        // the install path on a subdirectory install.
+                        url: "/finance/reports/giving-statements/download",
+                        headers: { "content-type": "application/x-www-form-urlencoded" },
+                        body: body.toString(),
+                        encoding: "binary",
+                    })
+                    .then((response) => pdfText(response.body));
+            })
+            .then((lines) => {
+                const slip = lines.indexOf("Please detach this slip and mail with your next gift.");
+                expect(slip, "the first statement's remittance slip").to.be.greaterThan(-1);
+                const slipAddress = lines
+                    .slice(slip)
+                    .find((line) => line === "3259 Daisy Dr" || line === "6730 Mockingbird Hill");
+                expect(slipAddress).to.equal("3259 Daisy Dr");
+                // Same salutation on the slip as at the head of the statement it closes.
+                const header = lines.indexOf("3259 Daisy Dr");
+                expect(lines[lines.indexOf(slipAddress, slip) - 1]).to.equal(lines[header - 1]);
+            });
+    });
+
+    // Keep these last: the API-key call replaces the browser's CRM session server-side.
+    it("resolves the printed address to the flagged second address", () => {
+        createFamilyWithMailingAddress("MailLabelData" + Cypress._.random(0, 1e6)).then((familyId) => {
+            cy.makePrivateAdminAPICall("GET", `/api/family/${familyId}`, null, 200).then((response) => {
+                // What a label prints, line for line.
+                expect(response.body.MailingAddressLines).to.equal("PO Box 1204, Othertown, IL  62998");
+                // The ZIP the label run is sorted on.
+                expect(response.body.MailingAddress.Zip).to.equal("62998");
+                expect(response.body.Zip).to.equal("62704");
+            });
+        });
+    });
+
+    it("prints a city-less mailing address without a dangling comma", () => {
+        createFamilyWithMailingAddress("MailNoCity" + Cypress._.random(0, 1e6), { secondCity: "" }).then(
+            (familyId) => {
+                cy.makePrivateAdminAPICall("GET", `/api/family/${familyId}`, null, 200).then((response) => {
+                    expect(response.body.MailingAddressLines).to.equal("PO Box 1204, IL 62998");
+                });
+            }
+        );
+    });
+
+    /**
+     * The church directory report (#9743): "Address" is relabelled "Primary
+     * Address" and a new "Mailing Address if Different" sub-option, off by
+     * default, prints the flagged second address under a "Mailing Address:" label.
+     *
+     * Mocha runs a nested suite after its parent's own tests, so these start from
+     * the parent's cy.freshAdminFormLogin() and are unaffected by the API-key calls above.
+     * Families created here land in the same createdFamilyIds list, so the shared
+     * `after` hook still returns family_fam to the row count it started with.
+     */
+    describe("Church directory report", () => {
+        /**
+         * Posts the directory form exactly as the browser serialises it, so the
+         * option keys under test are the real ones and the defaults are honest.
+         * The form target is a PDF, which cy.visit() cannot follow, so the POST is
+         * replayed with cy.request() over the session the visit established and
+         * the PDF's text lines are handed back.
+         */
+        const submitDirectoryForm = () =>
+            cy.get('form[action$="/people/reports/directory"]').then(($form) =>
+                cy
+                    .request({
+                        method: "POST",
+                        url: "people/reports/directory",
+                        headers: { "content-type": "application/x-www-form-urlencoded" },
+                        body: new URLSearchParams(new FormData($form[0])).toString(),
+                        encoding: "binary",
+                        failOnStatusCode: false,
+                    })
+                    .then((response) => {
+                        expect(response.status, "no server error").to.equal(200);
+                        expect(response.headers["content-type"] || "").to.include("application/pdf");
+                        return pdfText(response.body);
+                    })
+            );
+
+        beforeEach(() => {
+            cy.visit("/DirectoryReports.php");
+        });
+
+        it("relabels the address option and offers an indented mailing-address sub-option", () => {
+            cy.get('label[for="bDirAddress"]').should("have.text", "Primary Address");
+            // Same POST key, same default — only the wording changed.
+            cy.get("#bDirAddress").should("be.checked");
+
+            cy.get('label[for="bDirMailingAddress"]').should(
+                "have.text",
+                "Mailing Address if Different"
+            );
+            // Off by default, so existing directories render exactly as before.
+            cy.get("#bDirMailingAddress").should("not.be.checked").and("be.enabled");
+            // Indented so it reads as a sub-option of "Primary Address" in the grid.
+            cy.get("#bDirMailingAddress").parent().should("have.class", "ms-4");
+        });
+
+        it("disables and clears the sub-option while the primary address is off", () => {
+            // The mailing address prints beneath the primary one, so the report
+            // ignores the sub-option when the primary address is off; the form
+            // says so instead of letting the choice vanish silently.
+            cy.get("#bDirMailingAddress").check();
+            cy.get("#bDirAddress").uncheck();
+            cy.get("#bDirMailingAddress").should("be.disabled").and("not.be.checked");
+            cy.get("#bDirAddress").check();
+            cy.get("#bDirMailingAddress").should("be.enabled").and("not.be.checked");
+        });
+
+        it("generates a directory with the mailing address option off", () => {
+            const familyName = "MailDirOff" + Cypress._.random(0, 1e6);
+            createFamilyWithMailingAddress(familyName, { members: ["Ann", "Ben"] }).then(() => {
+                cy.visit("/DirectoryReports.php");
+                submitDirectoryForm().then((lines) => {
+                    const at = lines.findIndex((line) => line.includes(familyName));
+                    expect(at, `the ${familyName} entry`).to.be.greaterThan(-1);
+                    expect(lines).to.include("742 Evergreen Terrace");
+                    // The default output is the directory exactly as it printed before.
+                    expect(lines.some((line) => line.includes("Mailing Address"))).to.equal(false);
+                    expect(lines).to.not.include("PO Box 1204");
+                });
+            });
+        });
+
+        it("prints the mailing address under the primary one when the option is on", () => {
+            const familyName = "MailDirOn" + Cypress._.random(0, 1e6);
+            createFamilyWithMailingAddress(familyName, { members: ["Ann", "Ben"] }).then(() => {
+                cy.visit("/DirectoryReports.php");
+                cy.get("#bDirMailingAddress").check();
+                submitDirectoryForm().then((lines) => {
+                    const at = lines.findIndex((line) => /Mailing Address: PO Box 1204$/.test(line));
+                    expect(at, "the family's Mailing Address line").to.be.greaterThan(-1);
+                    expect(lines[at + 1]).to.match(/Othertown, IL +62998$/);
+                    // Beneath the primary address, which still prints.
+                    const primary = lines.findIndex((line) => line.includes("742 Evergreen Terrace"));
+                    expect(primary).to.be.greaterThan(-1).and.to.be.lessThan(at);
+                });
+            });
+        });
+    });
+});

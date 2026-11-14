@@ -1,0 +1,75 @@
+/**
+ * Leaflet map initialisation for the person detail view (/people/view/{id}).
+ *
+ * PHP injects window.CRM.personMapConfig with one of two shapes:
+ *   { lat, lng }   — family has stored geocoded coordinates (used directly)
+ *   { address }    — unaffiliated person with own address (Nominatim geocodes client-side)
+ *
+ * Also handles the "Refresh Coordinates" button shown when the person's family
+ * has no stored coordinates (calls POST /family/{id}/geocode).
+ *
+ * Leaflet comes from webpack/leaflet-global.js.
+ */
+import L from "../leaflet-global";
+import { formatTimeElements } from "../ministries/components/ui";
+import { initAttendanceHistory } from "./attendance-history";
+import { initRefreshCoordinatesBtn } from "./geo-refresh";
+import { initGroupManager } from "./person-group-manager";
+import { initLoginAsPerson } from "./person-login-as-person";
+import { initPortalAccess } from "./person-portal-access";
+import { initPortalSignInCard } from "./person-signin-card";
+import { initTimelineFilter } from "./timeline-filter";
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll(".timeline-container").forEach(initTimelineFilter);
+  initPortalSignInCard();
+  initPortalAccess();
+  initLoginAsPerson();
+  // The Volunteer v2 pane's dates (#9711), in ChurchCRM's locale.
+  formatTimeElements();
+  // Map initialisation
+  const config = window.CRM?.personMapConfig;
+  if (config) {
+    function initMap(lat, lng) {
+      const map = L.map("person-map", {
+        scrollWheelZoom: false,
+        dragging: false,
+        zoomControl: false,
+      }).setView([lat, lng], 14);
+
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution:
+          '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors',
+      }).addTo(map);
+
+      L.marker([lat, lng]).addTo(map);
+    }
+
+    if (config.lat !== undefined && config.lng !== undefined) {
+      // Stored coordinates from family — render immediately, no API call needed
+      initMap(config.lat, config.lng);
+    } else if (config.address) {
+      // Unaffiliated person with own address — geocode client-side via Nominatim (free, no key)
+      fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(config.address)}&format=json&limit=1`, {
+        headers: { "Accept-Language": "en", Accept: "application/json" },
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          if (!data.length) {
+            return;
+          }
+          initMap(parseFloat(data[0].lat), parseFloat(data[0].lon));
+        });
+    }
+  }
+
+  // Initialize refresh coordinates button (shown when family has no stored coordinates)
+  initRefreshCoordinatesBtn();
+
+  // Initialize group interaction handlers (add, change role, remove)
+  initGroupManager();
+
+  // Initialize attendance history tab (lazy loads on first tab activation)
+  initAttendanceHistory();
+});

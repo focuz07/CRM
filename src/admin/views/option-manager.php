@@ -1,0 +1,279 @@
+<?php
+
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Utils\CSRFUtils;
+use ChurchCRM\Utils\InputUtils;
+
+require SystemURLs::getDocumentRoot() . '/Include/Header.php';
+?>
+
+<?php if ($mode === 'grades'): ?>
+<div class="card mb-4" id="gradeNamesCard">
+    <div class="card-header">
+        <h5 class="mb-0">
+            <i class="fa-solid fa-earth-americas me-2"></i>
+            <?= gettext('Grade Names') ?>
+        </h5>
+    </div>
+    <div class="card-body">
+        <div class="row g-2 align-items-end">
+            <div class="col-md-6">
+                <label for="gradePreset" class="form-label"><?= gettext('Country') ?></label>
+                <select id="gradePreset" class="form-select">
+                    <?php foreach ($gradePresets as $presetKey => $presetName): ?>
+                    <option value="<?= InputUtils::escapeAttribute($presetKey) ?>"<?= $presetKey === $currentGradePreset ? ' selected' : '' ?>><?= InputUtils::escapeHTML($presetName) ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="col-auto">
+                <button type="button" class="btn btn-primary" id="applyGradePreset" data-csrf-token="<?= InputUtils::escapeAttribute(CSRFUtils::generateToken()) ?>">
+                    <i class="fa-solid fa-check me-1"></i><?= gettext('Apply') ?>
+                </button>
+            </div>
+        </div>
+        <div class="form-text mt-2"><?= gettext('Renames the grades to the names used in that country. People keep their grade, and grades you added yourself stay.') ?></div>
+    </div>
+</div>
+<script src="<?= SystemURLs::assetVersioned('/skin/v2/admin-grade-names.min.js') ?>" nonce="<?= SystemURLs::getCSPNonce() ?>"></script>
+<?php endif; ?>
+
+<!-- Add New Option -->
+<div class="card mb-4">
+    <div class="card-status-top bg-success"></div>
+    <div class="card-header">
+        <h5 class="mb-0">
+            <i class="fa-solid fa-plus"></i>
+            <?= InputUtils::escapeHTML($addLabel) ?>
+        </h5>
+    </div>
+    <div class="card-body">
+        <div class="row">
+            <div class="col-md-6">
+                <label for="newOptionName" class="form-label"><?= gettext('Name') ?>:</label>
+                <input class="form-control" type="text" id="newOptionName" maxlength="40">
+                <div id="newOptionError" class="text-danger small mt-1 d-none"></div>
+            </div>
+        </div>
+        <div class="text-center mt-3">
+            <button type="button" class="btn btn-success" id="addOptionBtn">
+                <i class="fa-solid fa-plus"></i>
+                <?= InputUtils::escapeHTML($addLabel) ?>
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Existing Options -->
+<div class="card">
+    <div class="card-header d-flex align-items-center">
+        <h5 class="mb-0">
+            <i class="fa-solid fa-list me-2"></i>
+            <?= gettext('Existing Options') ?>
+        </h5>
+        <span class="badge bg-primary text-white ms-auto" id="optionCount"><?= $optionRows->count() ?></span>
+    </div>
+    <div class="card-body overflow-visible">
+        <table class="table table-hover table-sm mb-0" id="optionsTable">
+            <thead>
+                <tr>
+                    <th class="admin-col-80"><?= gettext('Order') ?></th>
+                    <th><?= gettext('Name') ?></th>
+                    <?php if ($mode === 'classes'): ?>
+                    <th class="admin-col-100"><?= gettext('Inactive') ?></th>
+                    <th class="admin-col-100"><?= gettext('In Directory') ?></th>
+                    <?php endif; ?>
+                    <th class="text-center no-export w-1"><?= gettext('Actions') ?></th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($optionRows as $idx => $option): ?>
+                <tr data-option-id="<?= $option->getOptionId() ?>" data-sequence="<?= $option->getOptionSequence() ?>">
+                    <td><span class="badge bg-light text-dark"><?= $option->getOptionSequence() ?></span></td>
+                    <td>
+                        <input class="form-control form-control-sm option-name-input" type="text"
+                               value="<?= InputUtils::escapeAttribute($option->getOptionName()) ?>" maxlength="40"
+                               data-original="<?= InputUtils::escapeAttribute($option->getOptionName()) ?>">
+                    </td>
+                    <?php if ($mode === 'classes'): ?>
+                    <td>
+                        <div class="form-check">
+                            <input type="checkbox" class="form-check-input inactive-toggle"
+                                   <?= in_array($option->getOptionId(), $inactiveClasses) ? 'checked' : '' ?>>
+                        </div>
+                    </td>
+                    <td>
+                        <div class="form-check">
+                            <input type="checkbox" class="form-check-input directory-toggle"
+                                   <?= in_array($option->getOptionId(), $directoryClasses) ? 'checked' : '' ?>>
+                        </div>
+                    </td>
+                    <?php endif; ?>
+                    <td class="w-1">
+                        <div class="dropdown">
+                            <button class="btn btn-sm btn-ghost-secondary" type="button" data-bs-toggle="dropdown" data-bs-display="static">
+                                <i class="fa-solid fa-ellipsis-vertical"></i>
+                            </button>
+                            <div class="dropdown-menu dropdown-menu-end">
+                                <button type="button" class="dropdown-item move-up-btn"><i class="fa-solid fa-arrow-up me-2"></i><?= gettext('Move up') ?></button>
+                                <button type="button" class="dropdown-item move-down-btn"><i class="fa-solid fa-arrow-down me-2"></i><?= gettext('Move down') ?></button>
+                                <div class="dropdown-divider"></div>
+                                <button type="button" class="dropdown-item text-danger delete-btn"><i class="fa-solid fa-trash me-2"></i><?= gettext('Delete') ?></button>
+                            </div>
+                        </div>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="d-flex mt-3 justify-content-center">
+    <button type="button" class="btn btn-primary me-2" id="saveChangesBtn">
+        <i class="fa-solid fa-floppy-disk"></i>
+        <?= gettext('Save Changes') ?>
+    </button>
+</div>
+
+<script nonce="<?= SystemURLs::getCSPNonce() ?>">
+(function() {
+    const listId = <?= (int) $listId ?>;
+    const mode = <?= InputUtils::jsonEncodeForScript($mode) ?>;
+    // Add new option
+    document.getElementById('addOptionBtn').addEventListener('click', function() {
+        const nameInput = document.getElementById('newOptionName');
+        const errorDiv = document.getElementById('newOptionError');
+        const name = nameInput.value.trim();
+
+        if (!name) {
+            errorDiv.textContent = i18next.t('You must enter a name');
+            errorDiv.classList.remove('d-none');
+            return;
+        }
+
+        errorDiv.classList.add('d-none');
+
+        window.CRM.AdminAPIRequest({
+            method: 'POST',
+            path: 'options/' + listId,
+            data: JSON.stringify({ name: name })
+        }).done(function() {
+            window.location.reload();
+        }).fail(function(xhr) {
+            const msg = xhr.responseJSON?.message || i18next.t('Failed to add option');
+            errorDiv.textContent = msg;
+            errorDiv.classList.remove('d-none');
+        });
+    });
+
+    // Save name changes
+    document.getElementById('saveChangesBtn').addEventListener('click', function() {
+        const rows = document.querySelectorAll('#optionsTable tbody tr');
+        const promises = [];
+
+        rows.forEach(function(row) {
+            const input = row.querySelector('.option-name-input');
+            const optionId = row.dataset.optionId;
+            const newName = input.value.trim();
+            const originalName = input.dataset.original;
+
+            if (newName !== originalName && newName !== '') {
+                promises.push(
+                    window.CRM.AdminAPIRequest({
+                        method: 'PATCH',
+                        path: 'options/' + listId + '/' + optionId,
+                        data: JSON.stringify({ name: newName })
+                    })
+                );
+            }
+        });
+
+        if (promises.length === 0) {
+            window.CRM.notify(i18next.t('No changes to save'), { type: 'info' });
+            return;
+        }
+
+        $.when.apply($, promises).done(function() {
+            window.CRM.notify(i18next.t('Changes saved successfully'), { type: 'success' });
+            window.location.reload();
+        }).fail(function(xhr) {
+            const msg = xhr.responseJSON?.message || i18next.t('Failed to save changes');
+            window.CRM.notify(msg, { type: 'error' });
+        });
+    });
+
+    // Move up/down
+    document.querySelectorAll('.move-up-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            const row = this.closest('tr');
+            const optionId = row.dataset.optionId;
+            window.CRM.AdminAPIRequest({
+                method: 'POST',
+                path: 'options/' + listId + '/' + optionId + '/reorder',
+                data: JSON.stringify({ direction: 'up' })
+            }).done(function() { window.location.reload(); });
+        });
+    });
+
+    document.querySelectorAll('.move-down-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            const row = this.closest('tr');
+            const optionId = row.dataset.optionId;
+            window.CRM.AdminAPIRequest({
+                method: 'POST',
+                path: 'options/' + listId + '/' + optionId + '/reorder',
+                data: JSON.stringify({ direction: 'down' })
+            }).done(function() { window.location.reload(); });
+        });
+    });
+
+    // Delete
+    document.querySelectorAll('.delete-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            const row = this.closest('tr');
+            const optionId = row.dataset.optionId;
+            const name = row.querySelector('.option-name-input').value;
+
+            window.CRM.confirmAction(
+              i18next.t('Delete Confirmation'),
+              i18next.t('Are you sure you want to delete') + ' "' + window.CRM.escapeHtml(name) + '"?',
+              () => {
+                window.CRM.AdminAPIRequest({
+                    method: 'DELETE',
+                    path: 'options/' + listId + '/' + optionId + '?mode=' + encodeURIComponent(mode)
+                }).done(function() {
+                    window.CRM.notify(i18next.t('Item deleted successfully'), { type: 'success' });
+                    window.location.reload();
+                }).fail(function(xhr) {
+                    const msg = xhr.responseJSON?.message || i18next.t('Failed to delete');
+                    window.CRM.notify(msg, { type: 'error' });
+                });
+              },
+              { confirmLabel: i18next.t('Delete'), cancelLabel: i18next.t('Cancel') },
+            );
+        });
+    });
+
+    // Inactive / In Directory toggles (classes mode only)
+    [['.inactive-toggle', 'inactive'], ['.directory-toggle', 'directory']].forEach(function(toggle) {
+        document.querySelectorAll(toggle[0]).forEach(function(checkbox) {
+            checkbox.addEventListener('change', function() {
+                const optionId = this.closest('tr').dataset.optionId;
+                checkbox.disabled = true;
+                window.CRM.AdminAPIRequest({
+                    method: 'POST',
+                    path: 'options/' + listId + '/' + optionId + '/' + toggle[1],
+                    data: JSON.stringify({})
+                }).fail(function() {
+                    checkbox.checked = !checkbox.checked;
+                }).always(function() {
+                    checkbox.disabled = false;
+                });
+            });
+        });
+    });
+})();
+</script>
+
+<?php
+require SystemURLs::getDocumentRoot() . '/Include/Footer.php';

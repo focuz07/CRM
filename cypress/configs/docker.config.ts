@@ -1,0 +1,91 @@
+import { defineConfig } from 'cypress'
+import { verifyDownloadTasks } from 'cy-verify-downloads';
+import { registerRowCountGuard } from './row-count-guard';
+
+import base from './base.config'
+import { dbTasks, mailTasks, pluginFixtureTasks, gateCoverageTasks, exposeMailpitUrl, trackCurrentSpec } from './_shared'
+export default defineConfig({
+  chromeWebSecurity: false,
+  video: false,
+  videosFolder: 'cypress/videos',
+  screenshotOnRunFailure: true,
+  screenshotsFolder: 'cypress/screenshots',
+  pageLoadTimeout: 30000,
+  defaultCommandTimeout: 5000,
+  requestTimeout: 15000,
+  viewportHeight: 1080,
+  viewportWidth: 1920,
+  projectId: 'n4qnyb',
+  allowCypressEnv: false,
+  env: {
+    'admin.api.key': 'ajGwpy8Pdai22XDUpqjC5Ob04v0eG7EGgb4vz2bD2juT8YDmfM',
+    'user.api.key': 'JZJApQ9XOnF7nvupWZlTWBRrqMtHE9eNcWBTUzEWGqL4Sdqp6C',
+    'nofinance.api.key': 'judithMatthewsEditRecordsNoNotesApiKey1234',
+    'finance.only.api.key': 'financeOnlyApiKeyForTesting12345678901234',
+    'finance.only.username': 'grace.financeonly@example.com',
+    'finance.only.password': 'changeme',
+    'managegroups.only.api.key': 'manageGroupsOnlyApiKeyForTesting12345678901',
+    'managegroups.only.username': 'kyle.kioskonly@example.com',
+    'managegroups.only.password': 'changeme',
+    'nofundraiser.api.key': 'financeNoFundraiserApiKeyForTesting12345',
+    'nofundraiser.username': 'finance.nofundraiser',
+    'nofundraiser.password': 'changeme',
+    'plainauth.api.key': 'plainAuthReadOnlyApiKeyForTesting12345678901',
+    'editrecords.api.key': 'judithMatthewsEditRecordsNoNotesApiKey1234',
+    'teamleader.api.key': 'teamLeaderApiKeyForTesting1234567890123456',
+    'deceased.api.key': 'deceasedUserApiKeyForTesting1234567890123',
+    'inactive.api.key': 'inactiveUserApiKeyForTesting1234567890123',
+    'noperm.api.key': 'noPermUserApiKeyForTesting123456789012345678',
+    'admin.username': 'admin',
+    'admin.password': 'changeme',
+    'standard.username': 'tony.wade@example.com',
+    'standard.password': 'basicjoe',
+    'nofinance.username': 'judith.matthews@example.com',
+    'nofinance.password': 'noMoney$',
+  },
+  retries: 0,
+  numTestsKeptInMemory: 0,
+  // before:spec fires in `cypress open` too, so the database tasks know their caller.
+  experimentalInteractiveRunEvents: true,
+  e2e: {
+    ...base.e2e,
+    // Admin UI specs (cypress/e2e/ui-admin) run as a dedicated parallel CI job
+    // (docker-admin.config.ts / npm run test:ui-admin) and are intentionally
+    // excluded here, mirroring how new-system specs are excluded from this config.
+    specPattern: [
+      'cypress/e2e/api/**/*.spec.js',
+      'cypress/e2e/ui/**/*.spec.js'
+    ],
+    setupNodeEvents(on, config) {
+      // Narrows specPattern to this shard when CI sets SPLIT / SPLIT_INDEX (scripts/ci/shard-specs.js).
+      require('../../scripts/ci/shard-specs').applyShard(config);
+      const installLogsPrinter = require('cypress-terminal-report/src/installLogsPrinter');
+      installLogsPrinter(on, {
+        outputRoot: 'cypress/logs',
+        outputTarget: {
+          'cypress-terminal-report.txt': 'txt',
+          'cypress-terminal-report.json': 'json'
+        },
+        printLogsToConsole: 'onFail',
+        printLogsToFile: 'always'
+      });
+      // dbTasks adds db:query, the direct-MySQL task specs use to assert what has
+      // no HTTP surface (#9705); mailTasks adds the Mailpit reads (#9710).
+      on('task', { ...verifyDownloadTasks, ...dbTasks, ...mailTasks, ...pluginFixtureTasks, ...gateCoverageTasks });
+      exposeMailpitUrl(config);
+      // Test-database drift guard (#9769) — read-only row counts, plus the
+      // env flag cypress/support/e2e.js checks before arming the guard.
+      registerRowCountGuard(on, config);
+      // db:query and db:upgradeBlock answer only the files cypress/db-access.json lists (#10377).
+      trackCurrentSpec(on);
+      on('before:browser:launch', (browser, launchOptions) => {
+        if (browser.name === 'chrome') {
+          launchOptions.args.push('--disable-dev-shm-usage');
+        }
+        return launchOptions;
+      });
+      return config;
+    },
+    baseUrl: process.env.CYPRESS_BASE_URL || 'http://localhost/',
+  },
+})

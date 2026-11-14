@@ -1,0 +1,351 @@
+/**
+ * Dropdown Manager - Centralized country/state dropdown initialization
+ * Used across PersonEditor, CartToFamilyForm, CSVImport, FamilyEditor, and FamilyRegister
+ */
+
+/**
+ * TomSelect renders at most `maxOptions` entries (default 50), so the 256-country
+ * list stopped at China and the 59-entry US state list stopped at Tennessee.
+ * These are fixed enumerations the user picks from by scrolling, not searchable
+ * datasets, so every option has to be rendered. See issue #9677.
+ */
+const FULL_LIST_TOM_SELECT_OPTIONS = Object.freeze({ maxOptions: null });
+
+class DropdownManager {
+  /**
+   * Initialize a country dropdown with API data
+   * @param {string} countrySelectId - ID of the country select element
+   * @param {string} stateSelectId - Optional ID of the state select element (for auto-cascade)
+   * @param {Object} options - Configuration options
+   * @param {string} options.userSelected - Pre-selected country value
+   * @param {string} options.systemDefault - Default country from system config
+   * @param {boolean} options.initTomSelect - Whether to initialize TomSelect (default: true)
+   * @param {boolean} options.cascadeState - Whether to cascade to state select on change (default: false)
+   * @param {Function} options.onCountryChange - Callback when country changes
+   */
+  static initializeCountry(countrySelectId, stateSelectId = null, options = {}) {
+    const countrySelect = $(`#${countrySelectId}`);
+    if (countrySelect.length === 0) return;
+
+    const defaults = {
+      userSelected: countrySelect.data("user-selected") || "",
+      systemDefault: countrySelect.data("system-default") || "",
+      initTomSelect: true,
+      cascadeState: !!stateSelectId,
+      onCountryChange: null,
+    };
+
+    const config = { ...defaults, ...options };
+    let loadedCountry = null;
+
+    // Fetch and populate countries
+    $.ajax({
+      type: "GET",
+      url: window.CRM.root + "/api/public/data/countries",
+    }).done(function (data) {
+      countrySelect.empty();
+
+      if (config.userSelected === "" && config.systemDefault === "") {
+        countrySelect.append(new Option("", "", true, true));
+      }
+
+      let userSelectedMatched = false;
+      $.each(data, function (idx, country) {
+        let selected = false;
+
+        if (config.userSelected === "") {
+          selected = config.systemDefault === country.name || config.systemDefault === country.code;
+        } else {
+          selected = config.userSelected === country.name || config.userSelected === country.code;
+          userSelectedMatched = userSelectedMatched || selected;
+        }
+
+        countrySelect.append(new Option(country.name, country.code, selected, selected));
+      });
+
+      // A stored country the list does not know is kept as its own option; otherwise
+      // the browser selects the first country and an unchanged save rewrites it.
+      if (config.userSelected !== "" && !userSelectedMatched) {
+        countrySelect.prepend(new Option(config.userSelected, config.userSelected, true, true));
+      }
+
+      loadedCountry = countrySelect.val();
+
+      // Trigger change to cascade to state if needed
+      countrySelect.change();
+
+      if (config.initTomSelect) {
+        const el = countrySelect[0];
+        if (el && !el.tomselect) {
+          new TomSelect(el, FULL_LIST_TOM_SELECT_OPTIONS);
+        }
+      }
+    });
+
+    // Handle cascading to state dropdown if configured
+    if (config.cascadeState) {
+      countrySelect.off("change").on("change", function () {
+        // Only an ISO code has a state list; a kept unknown country gets the textbox.
+        const countryCode = /^[A-Za-z]{2}$/.test(this.value) ? this.value.toLowerCase() : "";
+        DropdownManager.initializeState(stateSelectId, countryCode, {
+          userSelected: $(`#${stateSelectId}`).data("user-selected") || "",
+          systemDefault: $(`#${stateSelectId}`).data("system-default") || "",
+          initTomSelect: true,
+          stateTextboxId: config.stateTextboxId,
+          stateOptionDivId: config.stateOptionDivId,
+          stateInputDivId: config.stateInputDivId,
+          keepUnknownState: this.value === loadedCountry,
+        });
+
+        if (config.onCountryChange) {
+          config.onCountryChange(this.value);
+        }
+      });
+    }
+  }
+
+  /**
+   * Initialize a state dropdown with API data
+   * @param {string} stateSelectId - ID of the state select element
+   * @param {string} countryCode - Country code to fetch states for
+   * @param {Object} options - Configuration options
+   * @param {string} options.userSelected - Pre-selected state value
+   * @param {string} options.systemDefault - Default state from system config
+   * @param {boolean} options.initTomSelect - Whether to initialize TomSelect (default: true)
+   * @param {string} options.stateTextboxId - Optional ID of textbox fallback for countries without states
+   * @param {string} options.stateOptionDivId - Optional ID of div to show/hide for state dropdown
+   * @param {string} options.stateInputDivId - Optional ID of div to show/hide for state textbox
+   * @param {boolean} options.keepUnknownState - Keep a stored state the list does not know as its own option
+   */
+  static initializeState(stateSelectId, countryCode, options = {}) {
+    const stateSelect = $(`#${stateSelectId}`);
+    if (stateSelect.length === 0) return;
+
+    const defaults = {
+      userSelected: stateSelect.data("user-selected") || "",
+      systemDefault: stateSelect.data("system-default") || "",
+      initTomSelect: true,
+      stateTextboxId: null,
+      stateOptionDivId: null,
+      stateInputDivId: null,
+      keepUnknownState: false,
+    };
+
+    const config = { ...defaults, ...options };
+
+    // Destroy existing TomSelect if present
+    const el = stateSelect[0];
+    if (el && el.tomselect) {
+      el.tomselect.destroy();
+    }
+
+    if (!countryCode) {
+      stateSelect.empty();
+      if (config.stateOptionDivId) {
+        $(`#${config.stateOptionDivId}`).addClass("d-none");
+      }
+      if (config.stateInputDivId) {
+        $(`#${config.stateInputDivId}`).removeClass("d-none");
+      }
+      return;
+    }
+
+    // Fetch and populate states
+    $.ajax({
+      type: "GET",
+      url: window.CRM.root + "/api/public/data/countries/" + countryCode + "/states",
+    })
+      .done(function (data) {
+        if (Object.keys(data).length > 0) {
+          // Country has states - populate dropdown
+          stateSelect.empty();
+
+          let userSelectedMatched = false;
+          $.each(data, function (code, name) {
+            let selected = false;
+
+            if (config.userSelected === "") {
+              selected = config.systemDefault === name || config.systemDefault === code;
+            } else {
+              selected = config.userSelected === name || config.userSelected === code;
+              userSelectedMatched = userSelectedMatched || selected;
+            }
+
+            stateSelect.append(new Option(name, code, selected, selected));
+          });
+
+          // Same as the country select: a stored state the list does not know stays selected,
+          // but only for the country it was stored with, not after the user picks another country.
+          if (config.keepUnknownState && config.userSelected !== "" && !userSelectedMatched) {
+            stateSelect.prepend(new Option(config.userSelected, config.userSelected, true, true));
+          }
+
+          stateSelect.change();
+
+          if (config.initTomSelect) {
+            const stateEl = stateSelect[0];
+            if (stateEl && !stateEl.tomselect) {
+              new TomSelect(stateEl, FULL_LIST_TOM_SELECT_OPTIONS);
+            }
+          }
+
+          // Show state dropdown, hide textbox fallback
+          if (config.stateOptionDivId) {
+            $(`#${config.stateOptionDivId}`).removeClass("d-none");
+          }
+          if (config.stateInputDivId) {
+            $(`#${config.stateInputDivId}`).addClass("d-none");
+          }
+          if (config.stateTextboxId) {
+            $(`#${config.stateTextboxId}`).val("");
+          }
+        } else {
+          // Country has no states - show textbox instead
+          if (config.stateOptionDivId) {
+            $(`#${config.stateOptionDivId}`).addClass("d-none");
+          }
+          if (config.stateInputDivId) {
+            $(`#${config.stateInputDivId}`).removeClass("d-none");
+          }
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        window.CRM.notify(
+          i18next.t("Unable to load state list. Please check your network connection or try again later."),
+          { type: "error", delay: 5000 },
+        );
+        // Optionally, show textbox fallback if config.stateInputDivId is set
+        if (config.stateOptionDivId) {
+          $(`#${config.stateOptionDivId}`).addClass("d-none");
+        }
+        if (config.stateInputDivId) {
+          $(`#${config.stateInputDivId}`).removeClass("d-none");
+        }
+      });
+  }
+
+  /**
+   * Initialize both country and state dropdowns with cascading
+   * @param {string} countrySelectId - ID of the country select element
+   * @param {string} stateSelectId - ID of the state select element
+   * @param {Object} options - Configuration options (merged with country and state options)
+   */
+  static initializeCountryState(countrySelectId, stateSelectId, options = {}) {
+    // Initialize country with state cascading
+    this.initializeCountry(countrySelectId, stateSelectId, {
+      userSelected: options.userSelected || $(`#${countrySelectId}`).data("user-selected") || "",
+      systemDefault: options.systemDefault || $(`#${countrySelectId}`).data("system-default") || "",
+      initTomSelect: true,
+      cascadeState: true,
+      ...options,
+    });
+  }
+
+  /**
+   * Initialize FamilyRegister-style country/state with dynamic container
+   * @param {string} countrySelectId - ID of the country select element
+   * @param {string} stateContainerId - ID of the container div for state field
+   * @param {string} stateFieldId - ID of the state field (input or select)
+   * @param {Object} options - Configuration options
+   */
+  static initializeFamilyRegisterCountryState(countrySelectId, stateContainerId, stateFieldId, options = {}) {
+    const countrySelect = $(`#${countrySelectId}`);
+    const stateContainer = $(`#${stateContainerId}`);
+
+    if (countrySelect.length === 0 || stateContainer.length === 0) return;
+
+    const defaults = {
+      userSelected: countrySelect.data("user-selected") || "",
+      systemDefault: countrySelect.data("system-default") || "",
+      stateDefault: $(`#${stateFieldId}`).data("default") || "",
+    };
+
+    const config = { ...defaults, ...options };
+
+    // Initialize country
+    $.ajax({
+      type: "GET",
+      url: window.CRM.root + "/api/public/data/countries",
+    }).done(function (data) {
+      countrySelect.empty();
+
+      let userSelectedMatched = false;
+      $.each(data, function (idx, country) {
+        let selected = false;
+
+        if (config.userSelected === "") {
+          selected = config.systemDefault === country.name || config.systemDefault === country.code;
+        } else {
+          selected = config.userSelected === country.name || config.userSelected === country.code;
+          userSelectedMatched = userSelectedMatched || selected;
+        }
+
+        countrySelect.append(new Option(country.name, country.code, selected, selected));
+      });
+
+      // A stored country the list does not know is kept as its own option; otherwise
+      // the browser selects the first country and an unchanged save rewrites it.
+      if (config.userSelected !== "" && !userSelectedMatched) {
+        countrySelect.prepend(new Option(config.userSelected, config.userSelected, true, true));
+      }
+
+      countrySelect.change();
+      const el = countrySelect[0];
+      if (el && !el.tomselect) {
+        new TomSelect(el, FULL_LIST_TOM_SELECT_OPTIONS);
+      }
+    });
+
+    // Handle country change
+    countrySelect.off("change").on("change", function () {
+      $.ajax({
+        type: "GET",
+        url: window.CRM.root + "/api/public/data/countries/" + this.value.toLowerCase() + "/states",
+      }).done(function (data) {
+        const defaultState = config.stateDefault || "";
+
+        if (Object.keys(data).length > 0) {
+          // Country has states - show dropdown
+          const $select = $(
+            `<select id="${stateFieldId}" name="${stateFieldId.replace(/^[^-]+_/, "")}" class="form-control" data-default="${defaultState}"></select>`,
+          );
+
+          $.each(data, function (code, name) {
+            const $option = $("<option></option>").val(code).text(name);
+            if (defaultState === code || defaultState === name) {
+              $option.prop("selected", true);
+            }
+            $select.append($option);
+          });
+
+          stateContainer.html($select);
+          new TomSelect($select[0], FULL_LIST_TOM_SELECT_OPTIONS);
+        } else {
+          // Country has no states - show text input
+          const $input = $(
+            `<input type="text" id="${stateFieldId}" name="${stateFieldId.replace(/^[^-]+_/, "")}" class="form-control" data-default="${defaultState}">`,
+          );
+          if (defaultState) {
+            $input.val(defaultState);
+          }
+          stateContainer.html($input);
+        }
+      });
+    });
+  }
+}
+
+// jQuery-style plugin initialization shorthand
+$.fn.initializeCountryDropdown = function (options) {
+  this.each(function () {
+    DropdownManager.initializeCountry($(this).attr("id"), null, options);
+  });
+  return this;
+};
+
+$.fn.initializeStateDropdown = function (countryCode, options) {
+  this.each(function () {
+    DropdownManager.initializeState($(this).attr("id"), countryCode, options);
+  });
+  return this;
+};

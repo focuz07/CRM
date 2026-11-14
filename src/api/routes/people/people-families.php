@@ -1,0 +1,423 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\model\ChurchCRM\FamilyQuery;
+use ChurchCRM\model\ChurchCRM\Map\FamilyTableMap;
+use ChurchCRM\model\ChurchCRM\NoteQuery;
+use ChurchCRM\model\ChurchCRM\Person;
+use ChurchCRM\model\ChurchCRM\PersonQuery;
+use ChurchCRM\Service\ConfirmReportService;
+use ChurchCRM\Service\FinancialService;
+use ChurchCRM\Slim\Middleware\Api\FamilyEmailDeprecationMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Auth\EditRecordsRoleAuthMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Auth\FinanceRoleAuthMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\DateTimeUtils;
+use Propel\Runtime\ActiveQuery\Criteria;
+use Propel\Runtime\Propel;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+
+$app->group('/families', function (RouteCollectorProxy $group): void {
+    $group->get('/latest', 'getLatestFamilies');
+    $group->get('/updated', 'getUpdatedFamilies');
+    $group->get('/anniversaries', 'getFamiliesWithAnniversaries');
+
+    /**
+     * @OA\Get(
+     *     path="/families/familiesInCart",
+     *     summary="Get families whose all members are in the session cart",
+     *     tags={"Families"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="List of family IDs where every member is in the cart",
+     *         @OA\JsonContent(@OA\Property(property="familiesInCart", type="array", @OA\Items(type="integer")))
+     *     )
+     * )
+     */
+    $group->get('/familiesInCart', function (Request $request, Response $response, array $args): Response {
+        $familiesInCart = [];
+
+        // Check if cart has items
+        if (!empty($_SESSION['aPeopleCart'])) {
+            $cartPersonIDs = $_SESSION['aPeopleCart'];
+
+            // Optimized query: Query people by IDs in cart, get their families
+            // This only loads people in cart (efficient) instead of all families
+            $people = PersonQuery::create()
+                ->filterById($cartPersonIDs)
+                ->find();
+
+            // Collect unique family IDs from the people in cart
+            $uniqueFamilyIds = [];
+            foreach ($people as $person) {
+                $familyId = $person->getFamId();
+                if (!in_array($familyId, $uniqueFamilyIds, false)) {
+                    $uniqueFamilyIds[] = $familyId;
+                    // Verify ALL members of this family are in cart
+                    $family = FamilyQuery::create()->findPk($familyId);
+                    if ($family && $family->checkAgainstCart()) {
+                        $familiesInCart[] = $familyId;
+                    }
+                }
+            }
+        }
+
+        return SlimUtils::renderJSON($response, ['familiesInCart' => $familiesInCart]);
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/families/email/without",
+     *     operationId="getFamiliesWithoutEmail",
+     *     summary="Get families with no email address on record",
+     *     tags={"Families"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="Families without any email address",
+     *         @OA\JsonContent(
+     *             @OA\Property(property="count", type="integer"),
+     *             @OA\Property(property="families", type="array", @OA\Items(ref="#/components/schemas/Family"))
+     *         )
+     *     )
+     * )
+     */
+    $group->get('/email/without', function (Request $request, Response $response, array $args): Response {
+        // Families where no member has an Email or WorkEmail. Uses raw PDO (via
+        // Propel::getConnection()) because Propel 2's ->having() does not reliably
+        // accept raw SQL strings — the GROUP BY + HAVING aggregation requires it.
+        $connection = Propel::getConnection();
+        $sql = 'SELECT fam_ID FROM family_fam'
+             . ' LEFT JOIN person_per ON person_per.per_fam_ID = family_fam.fam_ID'
+             . ' GROUP BY fam_ID'
+             . " HAVING MAX(COALESCE(person_per.per_Email, '')) = ''"
+             . " AND MAX(COALESCE(person_per.per_WorkEmail, '')) = ''";
+        $stmt = $connection->prepare($sql);
+        $stmt->execute();
+        $familyIds = array_column($stmt->fetchAll(\PDO::FETCH_ASSOC), 'fam_ID');
+
+        $familiesWithoutEmails = [];
+        if (count($familyIds) > 0) {
+            $families = FamilyQuery::create()
+                ->filterById($familyIds)
+                ->find();
+            foreach ($families as $family) {
+                $familiesWithoutEmails[] = $family->toArray();
+            }
+        }
+
+        return SlimUtils::renderJSON($response, ['count' => count($familiesWithoutEmails), 'families' => $familiesWithoutEmails]);
+    })->add(new FamilyEmailDeprecationMiddleware('private/get-families-without-email'));
+
+    /**
+     * @OA\Get(
+     *     path="/families/search/{query}",
+     *     summary="Search families by name, or by envelope number for finance users (max 15 results)",
+     *     tags={"Families"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="query", in="path", required=true, @OA\Schema(type="string")),
+     *     @OA\Response(response=200, description="Matching families",
+     *         @OA\JsonContent(@OA\Property(property="Families", type="array", @OA\Items(type="object")))
+     *     )
+     * )
+     */
+    $group->get('/search/{query}', function (Request $request, Response $response, array $args): Response {
+        $query = $args['query'];
+        $results = [];
+        $q = FamilyQuery::create()->filterByName("%$query%", Criteria::LIKE);
+        $byEnvelope = ctype_digit($query)
+            && SystemConfig::getBooleanValue('bUseDonationEnvelopes')
+            && AuthenticationManager::getCurrentUser()->isFinanceEnabled();
+        if ($byEnvelope) {
+            $q->_or()->filterByEnvelope((int) $query);
+        }
+        foreach ($q->limit(15)->find() as $family) {
+            $row = $family->toSearchArray();
+            if ($byEnvelope && $family->getEnvelope()) {
+                $row['displayName'] .= ' (' . gettext('Envelope') . ' #' . $family->getEnvelope() . ')';
+            }
+            $results[] = $row;
+        }
+
+        return SlimUtils::renderJSON($response, ['Families' => $results]);
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/families/self-register",
+     *     operationId="getSelfRegisteredFamilies",
+     *     summary="Get self-registered families still awaiting review",
+     *     tags={"Families"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="Self-registered families awaiting review, ordered by date entered descending",
+     *         @OA\JsonContent(@OA\Property(property="families", type="array", @OA\Items(allOf={
+     *             @OA\Schema(ref="#/components/schemas/Family"),
+     *             @OA\Schema(
+     *                 @OA\Property(property="Members", type="array", @OA\Items(type="string"), description="Members' first names"),
+     *                 @OA\Property(property="MemberEmails", type="array", @OA\Items(type="string")),
+     *                 @OA\Property(property="MemberPhones", type="array", @OA\Items(type="string"))
+     *             )
+     *         })))
+     *     )
+     * )
+     */
+    $group->get('/self-register', function (Request $request, Response $response, array $args): Response {
+        $families = FamilyQuery::create()
+            ->filterByEnteredBy(Person::SELF_REGISTER)
+            ->filterByNeedsReview(true)
+            ->orderByDateEntered(Criteria::DESC)
+            ->find();
+
+        $rows = $families->toArray();
+        $memberNames = [];
+        $memberEmails = [];
+        $memberPhones = [];
+        if ($rows) {
+            $members = PersonQuery::create()
+                ->filterByFamId(array_column($rows, 'Id'), Criteria::IN)
+                ->orderByFamId()
+                ->orderByFmrId()
+                ->find();
+            foreach ($members as $member) {
+                $famId = $member->getFamId();
+                $memberNames[$famId][] = $member->getFirstName();
+                foreach ([$member->getEmail(), $member->getWorkEmail()] as $email) {
+                    if ($email) {
+                        $memberEmails[$famId][$email] = $email;
+                    }
+                }
+                foreach ([$member->getCellPhone(), $member->getHomePhone(), $member->getWorkPhone()] as $phone) {
+                    if ($phone) {
+                        $memberPhones[$famId][$phone] = $phone;
+                    }
+                }
+            }
+        }
+        foreach ($rows as &$row) {
+            $row['Members'] = $memberNames[$row['Id']] ?? [];
+            $row['MemberEmails'] = array_values($memberEmails[$row['Id']] ?? []);
+            $row['MemberPhones'] = array_values($memberPhones[$row['Id']] ?? []);
+        }
+        unset($row);
+
+        return SlimUtils::renderJSON($response, ['families' => $rows]);
+    })->add(new FamilyEmailDeprecationMiddleware('private/get-self-registered-families'));
+
+    /**
+     * @OA\Get(
+     *     path="/families/self-verify",
+     *     operationId="getSelfVerifiedFamilies",
+     *     summary="Get the last 100 families with self-verification notes",
+     *     tags={"Families"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="Self-verification notes, each with the family that wrote it",
+     *         @OA\JsonContent(@OA\Property(property="families", type="array", @OA\Items(type="object",
+     *             @OA\Property(property="Family", ref="#/components/schemas/Family")
+     *         )))
+     *     )
+     * )
+     */
+    $group->get('/self-verify', function (Request $request, Response $response, array $args): Response {
+        $verificationNotes = NoteQuery::create()
+            ->filterByEnteredBy(Person::SELF_VERIFY)
+            ->orderByDateEntered(Criteria::DESC)
+            ->joinWithFamily()
+            ->limit(100)
+            ->find();
+
+        $rows = array_values($verificationNotes->toArray());
+        foreach ($verificationNotes as $i => $note) {
+            $rows[$i]['DateEnteredDisplay'] = DateTimeUtils::formatDate($note->getDateEntered('Y-m-d H:i:s'));
+        }
+
+        return SlimUtils::renderJSON($response, ['families' => $rows]);
+    })->add(new FamilyEmailDeprecationMiddleware('private/get-self-verified-families'))
+        ->add(new EditRecordsRoleAuthMiddleware());
+
+    /**
+     * @OA\Get(
+     *     path="/families/byCheckNumber/{scanString}",
+     *     summary="Find a family by check scan string",
+     *     tags={"Families"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="scanString", in="path", required=true, @OA\Schema(type="string")),
+     *     @OA\Response(response=200, description="Family member matched by check scan string")
+     * )
+     */
+    $group->get('/byCheckNumber/{scanString}', function (Request $request, Response $response, array $args): Response {
+        $scanString = $args['scanString'];
+
+        $financialService = new FinancialService();
+
+        return SlimUtils::renderJSON($response, $financialService->getMemberByScanString($scanString));
+    })->add(FinanceRoleAuthMiddleware::class);
+
+    /**
+     * @OA\Get(
+     *     path="/families/verify-email-preview",
+     *     operationId="getVerifyEmailPreview",
+     *     summary="Preview which families would receive a verification email",
+     *     description="Returns recipient count, recipient list, families without email, and a template preview. Used by the send-confirmation modal on the People Verify dashboard.",
+     *     tags={"Families"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="familyId", in="query", required=false, description="Limit preview to a single family", @OA\Schema(type="integer")),
+     *     @OA\Response(
+     *         response=200,
+     *         description="Preview data for the send-confirmation modal",
+     *         @OA\JsonContent(
+     *             @OA\Property(property="recipientCount", type="integer"),
+     *             @OA\Property(property="recipients", type="array", @OA\Items(type="object")),
+     *             @OA\Property(property="familiesWithoutEmail", type="array", @OA\Items(type="object")),
+     *             @OA\Property(property="templatePreview", type="object")
+     *         )
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Forbidden - insufficient role"),
+     *     @OA\Response(response=500, description="Server error")
+     * )
+     */
+    $group->get('/verify-email-preview', function (Request $request, Response $response, array $args): Response {
+        try {
+            $queryParams = $request->getQueryParams();
+            $familyId    = isset($queryParams['familyId']) && $queryParams['familyId'] !== ''
+                ? (int) $queryParams['familyId']
+                : null;
+
+            $service = new ConfirmReportService();
+            $preview = $service->getEmailPreview($familyId);
+
+            return SlimUtils::renderJSON($response, $preview);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON(
+                $response,
+                gettext('Failed to load email preview'),
+                [],
+                500,
+                $e,
+                $request
+            );
+        }
+    })->add(new EditRecordsRoleAuthMiddleware());
+});
+
+/**
+ * @OA\Get(
+ *     path="/families/anniversaries",
+ *     summary="Get families with wedding anniversaries within 7 days of today",
+ *     tags={"Families"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Families with upcoming/recent anniversaries (±7 days)",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="families", type="array", @OA\Items(
+ *                 @OA\Property(property="FamilyId", type="integer"),
+ *                 @OA\Property(property="Name", type="string"),
+ *                 @OA\Property(property="WeddingDate", type="string")
+ *             ))
+ *         )
+ *     )
+ * )
+ */
+function getFamiliesWithAnniversaries(Request $request, Response $response, array $args): Response
+{
+    // Get anniversaries for 14-day range: 7 days before to 7 days after today
+    // Use start of today (midnight) for consistent day-boundary calculations
+    $today = DateTimeUtils::getStartOfToday();
+    $conditions = [];
+
+    for ($i = -7; $i <= 7; $i++) {
+        $date = (clone $today)->modify("{$i} days");
+        $month = (int)$date->format('m');
+        $day = (int)$date->format('d');
+        // Values are safe: cast to int from DateTime::format()
+        $conditions[] = "(MONTH(" . FamilyTableMap::COL_FAM_WEDDINGDATE . ") = {$month} AND DAY(" . FamilyTableMap::COL_FAM_WEDDINGDATE . ") = {$day})";
+    }
+
+    $families = FamilyQuery::create()
+        ->filterByDateDeactivated(null)
+        ->filterByWeddingdate(null, Criteria::ISNOTNULL)
+        // Parentheses are required: Propel ANDs a raw where() onto the clause verbatim,
+        // so an unparenthesised top-level OR would escape the two filters above and pull
+        // in deactivated families.
+        ->where('(' . implode(' OR ', $conditions) . ')')
+        ->orderByWeddingdate('DESC')
+        ->find();
+
+    return SlimUtils::renderJSON($response, buildFormattedFamilies($families));
+}
+
+/**
+ * @OA\Get(
+ *     path="/families/latest",
+ *     summary="Get the 10 most recently added families",
+ *     tags={"Families"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="10 latest families by date entered",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="families", type="array", @OA\Items(
+ *                 @OA\Property(property="FamilyId", type="integer"),
+ *                 @OA\Property(property="Name", type="string"),
+ *                 @OA\Property(property="Created", type="string", format="date-time")
+ *             ))
+ *         )
+ *     )
+ * )
+ */
+function getLatestFamilies(Request $request, Response $response, array $args): Response
+{
+    $families = FamilyQuery::create()
+        ->orderByDateEntered('DESC')
+        ->limit(10)
+        ->find();
+
+    return SlimUtils::renderJSON($response, buildFormattedFamilies($families));
+}
+
+/**
+ * @OA\Get(
+ *     path="/families/updated",
+ *     summary="Get the 10 most recently updated families",
+ *     tags={"Families"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="10 families ordered by last edit date descending",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="families", type="array", @OA\Items(
+ *                 @OA\Property(property="FamilyId", type="integer"),
+ *                 @OA\Property(property="Name", type="string"),
+ *                 @OA\Property(property="LastEdited", type="string", format="date-time")
+ *             ))
+ *         )
+ *     )
+ * )
+ */
+function getUpdatedFamilies(Request $request, Response $response, array $args): Response
+{
+    $families = FamilyQuery::create()
+        ->orderByDateLastEdited('DESC')
+        ->limit(10)
+        ->find();
+
+    return SlimUtils::renderJSON($response, buildFormattedFamilies($families));
+}
+
+function buildFormattedFamilies($families): array
+{
+    $formattedList = [];
+
+    foreach ($families as $family) {
+        $formattedFamily = [];
+        $formattedFamily['FamilyId'] = $family->getId();
+        $formattedFamily['Name'] = $family->getName();
+        $formattedFamily['Address'] = $family->getAddress();
+        $formattedFamily['HasPhoto'] = $family->getPhoto()->hasUploadedPhoto();
+        $formattedFamily['IsActive'] = $family->isActive();
+        $formattedFamily['StatusText'] = $family->getStatusText();
+
+        $formattedFamily['Created'] = $family->getDateEntered() ? $family->getDateEntered()->format('c') : null; // ISO 8601
+        $formattedFamily['LastEdited'] = $family->getDateLastEdited() ? $family->getDateLastEdited()->format('c') : null; // ISO 8601
+        $formattedFamily['WeddingDate'] = $family->getWeddingdate() ? $family->getWeddingdate()->format('F j, Y') : null;
+
+        $formattedList[] = $formattedFamily;
+    }
+
+    return ['families' => $formattedList];
+}

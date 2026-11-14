@@ -1,0 +1,15 @@
+// Standalone pages (src/errors/template.php): stock Tabler, light and dark.
+
+.standalone-brand {
+  height: 5rem;
+  width: auto;
+}
+
+.standalone-icon {
+  font-size: 2.5rem;
+  line-height: 1;
+}
+
+.standalone-page .table th[scope="row"] {
+  font-weight: var(--tblr-font-weight-normal);
+}

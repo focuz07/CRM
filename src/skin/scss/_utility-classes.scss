@@ -1,0 +1,51 @@
+.pre-compact {
+  line-height: 1.2;
+}
+
+// !important beats the .d-* display utilities and component display rules.
+@media print {
+  button.btn,
+  a.btn,
+  input.btn,
+  .dropdown,
+  .modal,
+  .fab-container,
+  input,
+  select,
+  textarea,
+  .form-control,
+  .form-select,
+  .dt-search,
+  .dt-length,
+  .ts-wrapper {
+    display: none !important;
+  }
+
+  // Tab content prints inline below, so the tab strip is redundant.
+  .nav-pills,
+  .nav-tabs {
+    display: none !important;
+  }
+
+  .tab-pane {
+    display: block !important;
+    opacity: 1 !important;
+  }
+}
+
+// .money renders the configured currency symbol before or after a number that
+// already uses the configured separators (CurrencyFormatter::format()). Header.php
+// sets --currency-symbol and data-currency-position on <html>.
+// Usage: <span class="money">1,234.50</span>
+.money {
+  white-space: nowrap;
+
+  &::before {
+    content: var(--currency-symbol) "\00a0";
+  }
+}
+
+[data-currency-position="after"] .money {
+  &::before { content: none; }
+  &::after  { content: "\00a0" var(--currency-symbol); }
+}

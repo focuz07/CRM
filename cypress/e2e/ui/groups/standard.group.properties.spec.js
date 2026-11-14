@@ -1,0 +1,350 @@
+/// <reference types="cypress" />
+
+/**
+ * UI tests for group property assignment/removal on /groups/view/{id}.
+ *
+ * Requires: Docker / local environment with seeded data.
+ * - Group with ID=1 must exist
+ * - At least one group property definition must exist (pro_Class='g')
+ *
+ * API-based data setup runs BEFORE cy.freshAdminFormLogin(). Despite withCredentials:false
+ * on makePrivateAPICall, CI confirmed that cy.setupAdminSession() is not sufficient —
+ * the PHP session is still killed by cy.request(). cy.freshAdminFormLogin() is required.
+ */
+
+/**
+ * Direct login helper — bypasses cy.session() cache entirely.
+ * Call this after all API setup is complete; it clears cookies so the
+ * PHP session created by cy.request() is discarded and a real browser
+ * session is established instead.
+ */
+
+// ------------------------------------------------------------------ //
+// Group Property Assignment — /groups/view/{id}
+// ------------------------------------------------------------------ //
+describe("UI: Group Property Assignment (/groups/view/{id})", () => {
+    const groupID = 1;
+
+    // ------------------------------------------------------------------
+    // Assign a property — API setup BEFORE login
+    // ------------------------------------------------------------------
+    describe("Assign a property", () => {
+        it("assigns a no-prompt property and it appears in the list", () => {
+            // Step 1: API setup (pre-login — PHP session resets don't matter)
+            cy.wrap(null).as("prop");
+
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/groups/${groupID}/properties`,
+                null,
+                200
+            ).then((resp) => {
+                resp.body.forEach((p) =>
+                    cy.makePrivateAdminAPICall(
+                        "DELETE",
+                        `/api/groups/${groupID}/properties/${p.id}`,
+                        null,
+                        [200, 404]
+                    )
+                );
+            });
+
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/groups/properties",
+                null,
+                200
+            ).then((defsResp) => {
+                const noprompt = defsResp.body.find(
+                    (p) => !p.ProPrompt && !p.pro_Prompt
+                );
+                if (!noprompt) {
+                    cy.log(
+                        "No prompt-free group property definition — skipping"
+                    );
+                    return;
+                }
+                cy.wrap({
+                    id: noprompt.ProId ?? noprompt.pro_ID,
+                    name: noprompt.ProName ?? noprompt.pro_Name,
+                }).as("prop");
+            });
+
+            // Step 2: Login after all API setup
+            cy.freshAdminFormLogin();
+
+            // Step 3: UI only from here
+            cy.get("@prop").then((prop) => {
+                if (!prop) return;
+                cy.visit(`/groups/view/${groupID}`);
+                cy.get("#group-property-select").select(String(prop.id));
+                cy.get("#assign-group-property-btn").click();
+                cy.get("#group-properties-card").contains(prop.name).should("be.visible");
+            });
+
+            // Step 4: Cleanup at end
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/groups/${groupID}/properties`,
+                null,
+                200
+            ).then((resp) => {
+                resp.body.forEach((p) =>
+                    cy.makePrivateAdminAPICall(
+                        "DELETE",
+                        `/api/groups/${groupID}/properties/${p.id}`,
+                        null,
+                        [200, 404]
+                    )
+                );
+            });
+        });
+    });
+
+    // ------------------------------------------------------------------
+    // Remove an assigned property — API setup BEFORE login each time
+    // ------------------------------------------------------------------
+    describe("Remove an assigned property", () => {
+        beforeEach(() => {
+            // API setup: ensure at least one property is assigned
+            cy.makePrivateAdminAPICall(
+                "GET",
+                "/api/groups/properties",
+                null,
+                200
+            ).then((resp) => {
+                if (!resp.body.length) {
+                    cy.log("No group property definitions — skipping setup");
+                    return;
+                }
+                const propId = resp.body[0].ProId ?? resp.body[0].pro_ID;
+                cy.makePrivateAdminAPICall(
+                    "POST",
+                    `/api/groups/${groupID}/properties/${propId}`,
+                    {},
+                    [200, 409]
+                );
+            });
+
+            // Login AFTER API setup
+            cy.freshAdminFormLogin();
+        });
+
+        afterEach(() => {
+            // Teardown: clear all assignments
+            cy.makePrivateAdminAPICall(
+                "GET",
+                `/api/groups/${groupID}/properties`,
+                null,
+                200
+            ).then((resp) => {
+                resp.body.forEach((p) =>
+                    cy.makePrivateAdminAPICall(
+                        "DELETE",
+                        `/api/groups/${groupID}/properties/${p.id}`,
+                        null,
+                        [200, 404]
+                    )
+                );
+            });
+        });
+
+        it("clicking Remove opens a bootbox confirm; Cancel leaves property intact", () => {
+            cy.visit(`/groups/view/${groupID}`);
+
+            cy.get(".remove-group-property-btn").first().then(($btn) => {
+                const name = $btn.data("pro-name");
+
+                cy.wrap($btn).click();
+                cy.get(".bootbox").should("be.visible");
+
+                // Click cancel — dismiss without confirming
+                cy.get(".bootbox .btn-secondary").click({ force: true });
+
+                // The meaningful assertion: property was NOT removed
+                cy.get(`.remove-group-property-btn[data-pro-name="${name}"]`).should("exist");
+            });
+        });
+
+        it("confirming Remove fires DELETE and the property disappears", () => {
+            cy.visit(`/groups/view/${groupID}`);
+
+            cy.intercept(
+                "DELETE",
+                `**/api/groups/${groupID}/properties/*`
+            ).as("removeProperty");
+
+            cy.get(".remove-group-property-btn")
+                .first()
+                .then(($btn) => {
+                    const name = $btn.data("pro-name");
+
+                    cy.wrap($btn).click();
+                    cy.get(".bootbox-accept")
+                        .should("be.visible")
+                        .click();
+
+                    cy.wait("@removeProperty")
+                        .its("response.statusCode")
+                        .should("eq", 200);
+                    cy.get(
+                        `.remove-group-property-btn[data-pro-name="${name}"]`
+                    ).should("not.exist");
+                });
+        });
+    });
+
+    // ------------------------------------------------------------------
+    // Edit a property value — observational only, no data setup needed
+    // ------------------------------------------------------------------
+    describe("Edit a property value (has prompt)", () => {
+        beforeEach(() => {
+            cy.setupAdminSession();
+        });
+
+        it("Edit Value button opens a bootbox prompt; Cancel dismisses it", () => {
+            cy.visit(`/groups/view/${groupID}`);
+
+            cy.get("body").then(($body) => {
+                if (!$body.find(".edit-group-property-btn").length) {
+                    cy.log(
+                        "No editable (prompt-based) properties assigned — skipping"
+                    );
+                    return;
+                }
+                cy.get(".edit-group-property-btn").first().click();
+                cy.get(".bootbox").should("be.visible");
+                cy.get(".bootbox .btn-secondary").click({ force: true });
+                cy.get(".bootbox").should("not.be.visible");
+            });
+        });
+    });
+});
+
+// ------------------------------------------------------------------ //
+// GroupPropsFormEditor Delete button — CSP regression (#8520)
+// Uses groupID=1 (same as tests above) to test that the form field
+// delete button has data-* attributes and triggers bootbox correctly.
+// ------------------------------------------------------------------ //
+
+describe("UI: GroupPropsFormEditor Delete button (CSP regression #8520)", () => {
+    const fieldName = "Cypress Group Delete Test";
+    const groupID = 1;
+
+    before(() => {
+        // Enable group-specific properties via API (required for the form editor)
+        cy.makePrivateAdminAPICall(
+            "POST",
+            `/api/groups/${groupID}/setGroupSpecificPropertyStatus`,
+            { GroupSpecificPropertyStatus: true },
+            200,
+        );
+
+        // Now login and create a test field via UI
+        cy.freshAdminFormLogin();
+        cy.visit(`/groups/${groupID}/properties/form`);
+        cy.get("select#newFieldType").select("1");
+        cy.get("input#newFieldName").clear().type(fieldName);
+        cy.get('button[name="AddField"]').click();
+        cy.get(`input[value="${fieldName}"]`).should("exist");
+    });
+
+    beforeEach(() => {
+        cy.freshAdminFormLogin();
+        cy.visit(`/groups/${groupID}/properties/form`);
+    });
+
+    it("Delete button has data-field-name/data-prop-id/data-field-id attrs and no onclick", () => {
+        cy.get(`.js-delete-field[data-field-name="${fieldName}"]`).then(
+            ($btn) => {
+                expect($btn).to.have.attr("data-prop-id");
+                expect($btn).to.have.attr("data-field-id");
+                expect($btn).to.not.have.attr("onclick");
+            },
+        );
+    });
+
+    it("clicking Delete opens bootbox; Cancel leaves field intact", () => {
+        cy.get(`.js-delete-field[data-field-name="${fieldName}"]`)
+            .closest(".dropdown")
+            .find("[data-bs-toggle='dropdown']")
+            .click();
+
+        cy.get(`.js-delete-field[data-field-name="${fieldName}"]`).click();
+
+        cy.get(".bootbox").should("be.visible");
+        cy.get(".bootbox .btn-secondary").click({ force: true });
+
+        cy.get(`input[value="${fieldName}"]`).should("exist");
+    });
+
+    it("confirming Delete navigates away and field is removed", () => {
+        // Intercept the API delete call so we can wait for it
+        cy.intercept("DELETE", `**/api/groups/${groupID}/formprops/*`).as("deleteFormProp");
+
+        cy.get(`.js-delete-field[data-field-name="${fieldName}"]`)
+            .closest(".dropdown")
+            .find("[data-bs-toggle='dropdown']")
+            .click();
+
+        cy.get(`.js-delete-field[data-field-name="${fieldName}"]`).click();
+
+        cy.get(".bootbox-accept").should("be.visible").click();
+
+        // Wait for the API call, then the page reload
+        cy.wait("@deleteFormProp").its("response.statusCode").should("eq", 200);
+
+        // After reload, the field should be gone
+        cy.url().should("include", "/properties/form");
+        cy.get(`input[value="${fieldName}"]`, { timeout: 10000 }).should("not.exist");
+    });
+});
+
+// ------------------------------------------------------------------ //
+// Back button + Show in Profile label — #9381
+// Verifies the two UI improvements added in #9381:
+//   1. A "Back to Group" button that navigates to the group view
+//   2. The "Show in Profile" column header with an accessible tooltip
+// ------------------------------------------------------------------ //
+describe("UI: GroupPropsFormEditor Back button and Show in Profile (#9381)", () => {
+    const groupID = 1;
+    const testFieldName = "Cypress Back Button Test Field";
+
+    before(() => {
+        // Ensure group-specific properties are enabled
+        cy.makePrivateAdminAPICall(
+            "POST",
+            `/api/groups/${groupID}/setGroupSpecificPropertyStatus`,
+            { GroupSpecificPropertyStatus: true },
+            200,
+        );
+
+        // Login and create a test field if it doesn't already exist
+        cy.freshAdminFormLogin();
+        cy.visit(`/groups/${groupID}/properties/form`);
+        cy.get("body").then(($body) => {
+            if (!$body.find(`input[value="${testFieldName}"]`).length) {
+                cy.get("select#newFieldType").select("1");
+                cy.get("input#newFieldName").clear().type(testFieldName);
+                cy.get('button[name="AddField"]').click();
+            }
+        });
+        cy.get(`input[value="${testFieldName}"]`).should("exist");
+    });
+
+    beforeEach(() => {
+        cy.freshAdminFormLogin();
+        cy.visit(`/groups/${groupID}/properties/form`);
+    });
+
+    it("labels the column 'Show in Profile' and saves the form without errors", () => {
+        cy.get("th").contains("Show in Profile").should("be.visible");
+        // Bootstrap 5 Tooltip._fixTitle() moves `title` into `data-bs-original-title`.
+        cy.get('th [data-bs-toggle="tooltip"]')
+            .should("have.attr", "data-bs-original-title")
+            .and("contain", "profile page");
+        cy.get('button[name="SaveChanges"]').should("be.visible").click();
+        cy.url().should("include", "/properties/form");
+        cy.get(".alert-danger:not(.crm-system-notification)").should("not.exist");
+    });
+});

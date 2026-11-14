@@ -1,0 +1,47 @@
+# .github/release.yml
+
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+    # Locale syncs, marketing-visual refreshes, OpenAPI regeneration and
+    # changelog syncs. The release notes cover them with one standard line.
+    authors:
+      - github-actions[bot]
+  categories:
+    - title: 🛠 Breaking Changes 
+      labels:
+        - Semver-Major
+        - breaking-change
+    - title: 🎉 Exciting New Features 
+      labels:
+        - Semver-Minor
+        - enhancement
+        - 'Feature Request'
+        - new
+        - UI
+        - API 
+    - title: 🪲 Bugs
+      labels:
+        - bug
+        - 'P0 - Urgent'
+    - title: Core Functionality
+      labels:
+        - 'Installation and Upgrade'
+        - Configuration
+    - title: 💬 Localization
+      labels:
+        - Localization
+    - title: 'Inner Beauty'
+      labels: 
+        - development
+        - build
+        - 'Code Smell'
+        - 'Backend System'
+    - title: 👒 Dependencies 
+      labels:
+        - dependencies
+        - 'Package Dependencies'
+    - title: Other Changes
+      labels:
+        - "*"

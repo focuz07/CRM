@@ -1,0 +1,8 @@
+name: CodeQL Config
+paths-ignore:
+  - tests/docker/test-compose-security.test.js
+queries:
+  - uses: security-extended
+languages:
+  - javascript-typescript
+  - php

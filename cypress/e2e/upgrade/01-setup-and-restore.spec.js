@@ -1,0 +1,344 @@
+/// <reference types="cypress" />
+
+/**
+ * Upgrade Restore Test — ChurchCRM 6.0.0 → current
+ *
+ * Installs a fresh ChurchCRM via the setup wizard, then restores a
+ * ChurchCRM 6.0.0 database backup and verifies the auto-upgrade completes
+ * successfully.
+ *
+ * Upgrade source: ChurchCRM 6.0.0 → current
+ *   Password format: SHA-256 salted (migrated silently to bcrypt on first login;
+ *   no forced password change required)
+ *
+ * Environment variables:
+ *   CYPRESS_UPGRADE_SQL_FILE              — path to the SQL file to restore (relative to project root)
+ *   CYPRESS_UPGRADE_ADMIN_USER            — admin username in the restored database (default: Admin)
+ *   CYPRESS_UPGRADE_ADMIN_PASS            — admin password in the restored database (default: changeme)
+ *   CYPRESS_UPGRADE_FORCE_PASSWORD_CHANGE — set to "true" when the restored source forces a
+ *                                           mandatory password change after the first post-migration login
+ *
+ * Password hash formats supported after migration:
+ *   - bcrypt ($2y$)   — current format (all new hashes)
+ *   - SHA-256 salted  — ChurchCRM 6.x legacy (migrated on login, no forced change)
+ */
+
+describe('Upgrade via Restore', () => {
+    let dbConfig = {
+        host: 'database-new-system',
+        port: '3306',
+        name: 'churchcrm',
+        user: 'churchcrm',
+        password: 'changeme'
+    };
+
+    let setupAdmin = {
+        username: 'admin',
+        password: 'changeme'
+    };
+
+    let upgradeSqlFile;
+    let upgradeAdminUser = 'Admin';
+    let upgradeAdminPass = 'changeme';
+
+    // New password set during forced password change on the fresh install.
+    // Configured in upgrade.config.ts so it can be overridden without editing this file.
+    let newAdminPassword = 'AdminP@ss1234!';
+
+    // Whether the restored source forces a password change on the first post-migration
+    // login (true for ChurchInfo 1.x MD5 accounts). Absent/false for ChurchCRM 6.x,
+    // which migrates SHA-256 → bcrypt silently without requiring a change.
+    let forcesPasswordChange = false;
+
+    // Password configured for the post-forced-change login (ChurchInfo 1.x / MD5 path only).
+    let postUpgradePassword = 'PostMigrateP@ss9012!';
+
+    // Effective password for all Step 3 verification logins: the forced-change value when
+    // the source requires it, otherwise the original restored password (silent migration).
+    let verifyPassword = upgradeAdminPass;
+
+    before(() => {
+        cy.rememberTestEnv([
+            'db.host',
+            'db.port',
+            'db.name',
+            'db.user',
+            'db.password',
+            'admin.username',
+            'admin.password',
+            'UPGRADE_SQL_FILE',
+            'UPGRADE_ADMIN_USER',
+            'UPGRADE_ADMIN_PASS',
+            'admin.new.password',
+            'UPGRADE_FORCE_PASSWORD_CHANGE',
+            'admin.post.upgrade.password',
+        ]).then(() => {
+            dbConfig = {
+                host: Cypress.testEnv('db.host') || 'database-new-system',
+                port: Cypress.testEnv('db.port') || '3306',
+                name: Cypress.testEnv('db.name') || 'churchcrm',
+                user: Cypress.testEnv('db.user') || 'churchcrm',
+                password: Cypress.testEnv('db.password') || 'changeme'
+            };
+            setupAdmin = {
+                username: Cypress.testEnv('admin.username') || 'admin',
+                password: Cypress.testEnv('admin.password') || 'changeme'
+            };
+            upgradeSqlFile = Cypress.testEnv('UPGRADE_SQL_FILE');
+            upgradeAdminUser = Cypress.testEnv('UPGRADE_ADMIN_USER') || 'Admin';
+            upgradeAdminPass = Cypress.testEnv('UPGRADE_ADMIN_PASS') || 'changeme';
+            newAdminPassword = Cypress.testEnv('admin.new.password') || 'AdminP@ss1234!';
+            forcesPasswordChange = String(Cypress.testEnv('UPGRADE_FORCE_PASSWORD_CHANGE')).toLowerCase() === 'true';
+            postUpgradePassword = Cypress.testEnv('admin.post.upgrade.password') || 'PostMigrateP@ss9012!';
+            verifyPassword = forcesPasswordChange ? postUpgradePassword : upgradeAdminPass;
+        });
+    });
+
+    describe('Step 1: Fresh Install via Setup Wizard', () => {
+        it('should complete setup wizard', () => {
+            cy.visit('/');
+            cy.url().should('include', '/setup');
+
+            // Step 1: Prerequisites
+            cy.get('#prerequisites-next-btn', { timeout: 30000 }).should('not.be.disabled');
+            cy.get('#prerequisites-next-btn').click();
+
+            // Step 2: Database configuration
+            cy.get('#step-database').should('have.class', 'active');
+            cy.get('#DB_SERVER_NAME').clear().type(dbConfig.host);
+            cy.get('#DB_SERVER_PORT').clear().type(dbConfig.port);
+            cy.get('#DB_NAME').clear().type(dbConfig.name);
+            cy.get('#DB_USER').clear().type(dbConfig.user);
+            cy.get('#DB_PASSWORD').clear().type(dbConfig.password);
+            cy.get('#DB_PASSWORD_CONFIRM').clear().type(dbConfig.password);
+
+            cy.get('#submit-setup').click();
+
+            // Wait for setup to complete
+            cy.get('#setupModal', { timeout: 60000 }).should('be.visible');
+            cy.get('#setup-success', { timeout: 120000 }).should('be.visible');
+            cy.contains('Installation Complete!').should('be.visible');
+
+            // Continue to login
+            cy.get('#setup-footer', { timeout: 10000 }).should('be.visible');
+            cy.get('#continue-to-login').should('be.visible').click();
+            cy.location('pathname', { timeout: 10000 }).should('match', /\/admin\/$/);
+            cy.get('input[name=User]', { timeout: 10000 }).should('be.visible');
+        });
+
+        it('should complete forced password change', () => {
+            cy.visit('/login');
+            cy.get('input[name=User]').type(setupAdmin.username);
+            cy.get('input[name=Password]').type(setupAdmin.password + '{enter}');
+            cy.url({ timeout: 15000 }).should('include', '/changepassword');
+
+            cy.get('#OldPassword').type(setupAdmin.password);
+            cy.get('#NewPassword1').type(newAdminPassword);
+            cy.get('#NewPassword2').type(newAdminPassword);
+            cy.get('button[type=submit]').click();
+
+            cy.url({ timeout: 15000 }).should('include', '/admin/system/church-info');
+        });
+
+        it('should fill church info to complete first-run setup', () => {
+            cy.visit('/login');
+            cy.get('input[name=User]').type(setupAdmin.username);
+            cy.get('input[name=Password]').type(newAdminPassword + '{enter}');
+            cy.url({ timeout: 15000 }).should('include', '/admin/system/church-info');
+
+            cy.get('#sChurchCountry', { timeout: 10000 }).siblings('.ts-wrapper').should('exist');
+            cy.get('#sChurchName').clear().type('Upgrade Test Church');
+            cy.get('#sChurchPhone').clear().type('(555) 000-0000');
+            cy.get('#sChurchEmail').clear().type('test@upgrade.org');
+            cy.get('#sChurchAddress').clear().type('1 Test Street');
+            cy.get('#sChurchCity').clear().type('Springfield');
+            cy.get('#sChurchState', { timeout: 10000 }).siblings('.ts-wrapper').should('exist');
+            cy.tomSelectByValue('#sChurchState', 'IL');
+            cy.get('#sChurchZip').clear().type('62701');
+
+            // Wait for the form submit button to be interactive before submitting
+            cy.get('#church-info-form button[type=submit], #church-info-form input[type=submit]').should('not.be.disabled');
+            cy.get('#church-info-form').submit();
+            // Save geocodes before the redirect. CI often gets no hit, which
+            // still saves the church and shows the manual-coordinates warning.
+            cy.contains(
+                /Church information saved successfully|could not be auto-located/,
+                { timeout: 45000 },
+            ).should('be.visible');
+        });
+
+        it('should verify fresh install is working', () => {
+            cy.visit('/login');
+            cy.get('input[name=User]').type(setupAdmin.username);
+            cy.get('input[name=Password]').type(newAdminPassword + '{enter}');
+            cy.expectStaffSignedIn({ timeout: 15000 });
+            cy.get('.page, .page-wrapper, .navbar').should('exist');
+        });
+    });
+
+    describe('Step 2: Restore Old Database', () => {
+        it('should have a SQL file configured for restore', () => {
+            expect(upgradeSqlFile, 'CYPRESS_UPGRADE_SQL_FILE must be set').to.be.a('string').and.not.be.empty;
+            cy.log('Will restore: ' + upgradeSqlFile);
+        });
+
+        it('should navigate to restore page', () => {
+            cy.visit('/login');
+            cy.get('input[name=User]').type(setupAdmin.username);
+            cy.get('input[name=Password]').type(newAdminPassword + '{enter}');
+            cy.expectStaffSignedIn({ timeout: 15000 });
+
+            cy.visit('/admin/system/restore');
+            cy.contains('Restore Database').should('be.visible');
+        });
+
+        it('should restore the old SQL file and auto-upgrade', () => {
+            cy.visit('/login');
+            cy.get('input[name=User]').type(setupAdmin.username);
+            cy.get('input[name=Password]').type(newAdminPassword + '{enter}');
+            cy.expectStaffSignedIn({ timeout: 15000 });
+
+            cy.visit('/admin/system/restore');
+
+            // Upload the old SQL file
+            cy.get('#restoreFile').selectFile(upgradeSqlFile, { force: true });
+            cy.get('#fileInfo').should('be.visible');
+
+            // Click restore
+            cy.get('#submitRestore').click();
+
+            // Wait for restore to process (includes auto-upgrade of all migrations)
+            cy.get('#statusRunning', { timeout: 10000 }).should('be.visible');
+
+            // Success modal — may take a while for ChurchInfo (30+ migrations)
+            cy.get('#restoreSuccessModal', { timeout: 180000 }).should('be.visible');
+
+            // Wait for page to redirect to login after restore completes
+            cy.location('pathname', { timeout: 30000 }).should('match', /\/admin\/$/);
+            cy.get('input[name=User]', { timeout: 30000 }).should('be.visible');
+        });
+    });
+
+    // Step 2.5 only runs for sources that force a password change after migration
+    // (ChurchInfo 1.x / MD5). For ChurchCRM 6.x (SHA-256 silent migration) it is skipped.
+    // The flag is assigned in before(), so the suite must skip at runtime.
+    describe('Step 2.5: Complete Forced Password Change (MD5 Migration)', () => {
+        before(function () {
+            if (!forcesPasswordChange) {
+                this.skip();
+            }
+        });
+
+        // The restored legacy account authenticates via the MD5 fallback in
+        // User::isPasswordValid(), which forces a password change on that first
+        // login (the weak, potentially-compromised MD5 plaintext must not remain
+        // in use just because the stored hash got upgraded to bcrypt). This is the
+        // one and only login that uses the original restored credentials — every
+        // later login in this spec uses postUpgradePassword.
+        it('should force a password change after the MD5-migrated login', () => {
+            cy.visit('/login');
+            cy.get('input[name=User]').type(upgradeAdminUser);
+            cy.get('input[name=Password]').type(upgradeAdminPass + '{enter}');
+            cy.url({ timeout: 30000 }).should('include', '/changepassword');
+
+            cy.get('#OldPassword').type(upgradeAdminPass);
+            cy.get('#NewPassword1').type(postUpgradePassword);
+            cy.get('#NewPassword2').type(postUpgradePassword);
+            cy.get('button[type=submit]').click();
+
+            cy.url({ timeout: 15000 }).should('not.include', '/changepassword');
+        });
+    });
+
+    describe('Step 3: Verify Upgraded System', () => {
+        // Establish (and cache) a login session with the upgraded admin credentials.
+        // Uses the post-forced-change password for MD5-migration sources, or the original
+        // restored password for sources with silent migration (e.g. ChurchCRM 6.0.0).
+        // cy.setupLoginSession() validates the session cookie so stale caches are detected.
+        beforeEach(() => {
+            cy.setupLoginSession('upgraded-admin', upgradeAdminUser, verifyPassword);
+        });
+
+        it('should show the login page after upgrade', () => {
+            cy.clearCookies();
+            cy.clearLocalStorage();
+            cy.visit('/login');
+            cy.get('input[name=User]', { timeout: 15000 }).should('be.visible');
+            cy.get('input[name=Password]').should('be.visible');
+        });
+
+        it('should login with the upgraded admin credentials', () => {
+            cy.clearCookies();
+            cy.clearLocalStorage();
+            cy.visit('/login');
+            cy.get('input[name=User]').type(upgradeAdminUser);
+            cy.get('input[name=Password]').type(verifyPassword + '{enter}');
+            // After a successful upgrade, admin credentials must work (post-change for MD5,
+            // original restored password for SHA-256 silent migration).
+            cy.expectStaffSignedIn({ timeout: 30000 });
+        });
+
+        it('should report current software version and healthy API after upgrade', () => {
+            // VersionMiddleware stamps every /api response with the installed version.
+            // A non-empty X-CRM-Version header confirms the app is upgraded and serving.
+            cy.request({
+                method: 'GET',
+                url: '/api/persons/latest',
+                timeout: 30000,
+            }).then((response) => {
+                expect(response.status).to.equal(200);
+                expect(response.body).to.be.an('object');
+                const version = response.headers['x-crm-version'];
+                expect(version, 'X-CRM-Version header must be present').to.exist;
+                expect(String(version), 'X-CRM-Version must be non-empty').to.not.equal('');
+                cy.log(`Upgraded system reporting version: ${version}`);
+            });
+        });
+
+        it('should access the admin dashboard', () => {
+            cy.visit('/admin/');
+            cy.contains('Admin Dashboard', { timeout: 15000 }).should('be.visible');
+        });
+
+        it('should have a working people API', () => {
+            cy.request({
+                method: 'GET',
+                url: '/api/persons/latest',
+                timeout: 30000
+            }).then((response) => {
+                expect(response.status).to.equal(200);
+                expect(response.body).to.have.property('people');
+                cy.log(`Found ${response.body.people.length} people after upgrade`);
+            });
+        });
+
+        it('should have a working families API', () => {
+            cy.request({
+                method: 'GET',
+                url: '/api/families/latest',
+                timeout: 30000
+            }).then((response) => {
+                expect(response.status).to.equal(200);
+                expect(response.body).to.have.property('families');
+                cy.log(`Found ${response.body.families.length} families after upgrade`);
+            });
+        });
+
+        // churchcrm-6.0.0.sql has a cash payment (row 35) under the key of the Diaz pledge.
+        it('should give a payment that shared a pledge GroupKey its own key (#10725)', function () {
+            if (!upgradeSqlFile.includes('churchcrm-6.0.0')) {
+                this.skip();
+            }
+            const pledgeKey = 'cash|0|9|1|2019-09-19';
+            cy.request(`/api/payments/pledges/${encodeURIComponent(pledgeKey)}`).then(({ body }) => {
+                expect(body.pledgeOrPayment).to.equal('Pledge');
+                expect(body.funds).to.have.length(2);
+            });
+            cy.request(`/api/payments/pledges/${encodeURIComponent(`${pledgeKey}|35`)}`).then(({ body }) => {
+                expect(body.pledgeOrPayment).to.equal('Payment');
+                expect(body.depositId).to.equal(5);
+                expect(body.total).to.be.closeTo(25, 0.01);
+            });
+        });
+    });
+});

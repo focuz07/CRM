@@ -1,0 +1,72 @@
+name: 'JUnit test report'
+description: 'Uploads the JUnit XML, then writes the dorny summary for this job. Run actions/checkout first.'
+
+inputs:
+  name:
+    description: 'Check run name'
+    required: true
+  path:
+    description: 'Glob of JUnit XML files'
+    required: true
+  reporter:
+    description: 'Report format'
+    required: false
+    default: 'java-junit'
+  fail-on-error:
+    description: 'Fail the step when the report has failing tests'
+    required: false
+    default: 'true'
+  fail-on-empty:
+    description: 'Fail the step when no report files match'
+    required: false
+    default: 'false'
+  list-suites:
+    description: 'Suites to list: all, failed or none'
+    required: false
+    default: 'all'
+  list-tests:
+    description: 'Tests to list: all, failed or none'
+    required: false
+    default: 'failed'
+  max-annotations:
+    description: 'Maximum annotations per check'
+    required: false
+    default: '50'
+  use-actions-summary:
+    description: 'Write the report to the job summary'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Name the JUnit artifact
+      id: junit
+      if: always()
+      shell: bash
+      env:
+        REPORT_NAME: ${{ inputs.name }}
+      run: |
+        slug=$(printf '%s' "$REPORT_NAME" | tr ': /' '---' | tr -cd 'A-Za-z0-9._()-')
+        echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+    - name: Upload JUnit report
+      if: always()
+      uses: ./.github/actions/upload-artifact
+      with:
+        name: cypress-junit-${{ steps.junit.outputs.slug }}-${{ github.run_id }}
+        path: ${{ inputs.path }}
+        retention-days: '1'
+        if-no-files-found: ignore
+
+    - uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        reporter: ${{ inputs.reporter }}
+        fail-on-error: ${{ inputs.fail-on-error }}
+        fail-on-empty: ${{ inputs.fail-on-empty }}
+        list-suites: ${{ inputs.list-suites }}
+        list-tests: ${{ inputs.list-tests }}
+        max-annotations: ${{ inputs.max-annotations }}
+        use-actions-summary: ${{ inputs.use-actions-summary }}

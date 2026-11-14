@@ -1,0 +1,403 @@
+name: Build, Test and Package
+
+concurrency:
+  # PRs: de-dup by PR number (cancel superseded runs).
+  # Pushes: per-commit group so back-to-back master/branch pushes all run
+  # concurrently without waiting or cancelling each other.
+  group: >-
+    ${{ github.event_name == 'pull_request'
+        && format('pr-{0}', github.event.number)
+        || format('{0}-{1}', github.workflow, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  checks: write
+  actions: read
+
+on:
+  pull_request:
+    branches:
+      - master
+      - develop
+      - 'hotfix/**'
+    paths:
+      # Files the suite neither runs nor ships do not start it. A pull request also skips generated translations; the master push build below packages them.
+      - '**'
+      - '!**/*.md'
+      - '!.github/PULL_REQUEST_TEMPLATE.md'
+      - '!docs/**'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!.gitattributes'
+      - '!.githooks/**'
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.claudecode/**'
+      - '!.cursor/**'
+      - '!.editorconfig'
+      - '!.codespellrc'
+      - '!.devskim.json'
+      - '!CODEOWNERS'
+      - '!.coderabbit.yaml'
+      - '!playwright/**'
+      - '!locale/terms/**'
+      - '!locale/scripts/**'
+      - '!locale/messages.po'
+      - '!locale/messages.json'
+      - '!.github/FUNDING.yml'
+      - '!.github/release.yml'
+      - '!.github/dependabot.yml'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - '!.github/issue-comments/**'
+      - '!.github/workflows/**'
+      - '!src/locale/i18n/**'
+      - '!src/locale/textdomain/**'
+      # Re-include: only these two workflow files run this pipeline.
+      - '.github/workflows/build-test-package.yml'
+      - '.github/workflows/build-test-nightly.yml'
+  push:
+    branches:
+      - master
+      - develop
+      - 'hotfix/**'
+      - 'release/**'
+    paths:
+      # Translations are not skipped here: the release ZIP comes from this build.
+      - '**'
+      - '!**/*.md'
+      - '!.github/PULL_REQUEST_TEMPLATE.md'
+      - '!docs/**'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!.gitattributes'
+      - '!.githooks/**'
+      - '!.agents/**'
+      - '!.claude/**'
+      - '!.claudecode/**'
+      - '!.cursor/**'
+      - '!.editorconfig'
+      - '!.codespellrc'
+      - '!.devskim.json'
+      - '!CODEOWNERS'
+      - '!.coderabbit.yaml'
+      - '!playwright/**'
+      - '!locale/terms/**'
+      - '!locale/scripts/**'
+      - '!locale/messages.po'
+      - '!locale/messages.json'
+      - '!.github/FUNDING.yml'
+      - '!.github/release.yml'
+      - '!.github/dependabot.yml'
+      - '!.github/ISSUE_TEMPLATE/**'
+      - '!.github/issue-comments/**'
+      - '!.github/workflows/**'
+      # Re-include: only these two workflow files run this pipeline.
+      - '.github/workflows/build-test-package.yml'
+      - '.github/workflows/build-test-nightly.yml'
+  workflow_dispatch:
+
+jobs:
+  # PHP 8.4 only. PHP 8.5 runs in build-test-nightly.yml.
+  configure:
+    runs-on: ubuntu-24.04
+    outputs:
+      php-versions: ${{ steps.set-matrix.outputs.php-versions }}
+    steps:
+    - id: set-matrix
+      run: echo 'php-versions=["8.4"]' >> "$GITHUB_OUTPUT"
+
+  # Runs beside `build`, which takes longer, so it adds no wall-clock time. A red lint
+  # stops the Cypress jobs before they start instead of after 160 runner-minutes.
+  lint:
+    if: ${{ !startsWith(github.head_ref, 'locale/') }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - uses: ./.github/actions/checkout-node-npm
+
+    - uses: ./.github/actions/composer-install
+
+    - name: Install PHP test tooling
+      run: npm run test:php:install
+
+    - name: Lint and fast regression tests
+      run: npm run lint
+
+    - name: Upload PHP test results
+      if: always()
+      uses: ./.github/actions/upload-artifact
+      with:
+        name: php-unit-${{ github.run_id }}
+        path: temp/php-tests/*.xml
+        if-no-files-found: ignore
+
+  build:
+    # Locale PRs only touch translations. Skip here, not in `configure`: a skipped
+    # `configure` leaves the test jobs' fromJSON(php-versions) matrix empty, which fails the run.
+    if: ${{ !startsWith(github.head_ref, 'locale/') }}
+    needs: configure
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - uses: ./.github/actions/checkout-node-npm
+
+    - name: Declare variables
+      id: vars
+      shell: bash
+      run: |
+        branch_name="${GITHUB_REF#refs/heads/}"
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          branch_name="pr-${{ github.event.number }}"
+        fi
+        safe_branch=$(echo "$branch_name" | sed 's/[\/\\<>:"|?*]/-/g')
+        echo "branch=$branch_name" >> $GITHUB_OUTPUT
+        echo "safe_branch=$safe_branch" >> $GITHUB_OUTPUT
+
+    - name: Get package version
+      id: package-version
+      run: echo "current-version=$(node -p 'require("./package.json").version')" >> $GITHUB_OUTPUT
+
+    - uses: ./.github/actions/composer-install
+
+    - name: Build app
+      run: npm run package
+
+    - name: Validate PHP syntax
+      run: npm run build:php:validate -- --all
+
+    - name: Build Docker images
+      run: |
+        PHP_VERSIONS='${{ needs.configure.outputs.php-versions }}'
+        for version in $(echo "$PHP_VERSIONS" | jq -r '.[]'); do
+          echo "Building Docker image for PHP $version..."
+          docker build --target test \
+            --build-arg PHP_VERSION=$version \
+            -t churchcrm/crm:php${version}-test \
+            -f docker/Dockerfile.churchcrm-apache-php8 docker/
+          docker save churchcrm/crm:php${version}-test | gzip > temp/docker-image-${version}.tar.gz
+          echo "Saved: $(du -h temp/docker-image-${version}.tar.gz | cut -f1)"
+        done
+
+    - name: Upload build artifact
+      uses: ./.github/actions/upload-artifact
+      with:
+        name: build-${{ github.run_id }}
+        path: |
+          src/
+          temp/
+          !src/logs
+        retention-days: 1
+
+    # The release workflow downloads this zip from the run that is green on the release tip.
+    - name: Upload release artifact
+      uses: ./.github/actions/upload-artifact
+      with:
+        name: >-
+          ${{ github.ref == 'refs/heads/master' &&
+              format('ChurchCRM-{0}', steps.package-version.outputs.current-version) ||
+              (github.event_name == 'pull_request' &&
+               format('ChurchCRM-{0}-PR{1}', steps.package-version.outputs.current-version, github.event.number) ||
+               format('ChurchCRM-{0}-{1}', steps.package-version.outputs.current-version, steps.vars.outputs.safe_branch)) }}
+        path: temp/ChurchCRM-*.zip
+        retention-days: 90
+        if-no-files-found: error
+
+    - name: Build summary
+      run: |
+        {
+          echo "## Build Summary"
+          echo ""
+          echo "**Version:** ${{ steps.package-version.outputs.current-version }}"
+          echo "**Branch:** ${{ steps.vars.outputs.branch }}"
+          echo "**Commit:** ${{ github.sha }}"
+          for file in temp/ChurchCRM-*.zip; do
+            [ -f "$file" ] && echo "- \`$(basename "$file")\` ($(du -h "$file" | cut -f1))"
+          done
+        } >> "$GITHUB_STEP_SUMMARY"
+
+  test-root:
+    needs: [configure, build, lint]
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      checks: write
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ${{ fromJSON(needs.configure.outputs.php-versions) }}
+        test-type:
+          - name: api-shard-0
+            spec: "cypress/e2e/api/**/*.spec.js"
+            config: "cypress/configs/docker-api.config.ts"
+            split-index: "0"
+            shard-total: 2
+        include:
+          # api, admin-ui and ui specs sharded by recorded duration (cypress/split-timings.json)
+          # (PHP 8.4 only; 8.5 ui covered by build-test-nightly.yml)
+          # split-index values are strings to avoid JS falsy coercion of 0
+          - php-version: "8.4"
+            test-type: { name: api-shard-1, config: "cypress/configs/docker-api.config.ts", spec: "cypress/e2e/api/**/*.spec.js" }
+            split-index: "1"
+            shard-total: 2
+          - php-version: "8.4"
+            test-type: { name: admin-ui-shard-0, config: "cypress/configs/docker-admin.config.ts", spec: "cypress/e2e/ui-admin/**/*.spec.js" }
+            split-index: "0"
+            shard-total: 3
+          - php-version: "8.4"
+            test-type: { name: admin-ui-shard-1, config: "cypress/configs/docker-admin.config.ts", spec: "cypress/e2e/ui-admin/**/*.spec.js" }
+            split-index: "1"
+            shard-total: 3
+          - php-version: "8.4"
+            test-type: { name: admin-ui-shard-2, config: "cypress/configs/docker-admin.config.ts", spec: "cypress/e2e/ui-admin/**/*.spec.js" }
+            split-index: "2"
+            shard-total: 3
+          - php-version: "8.4"
+            test-type: { name: ui-shard-0, config: "cypress/configs/docker-ui.config.ts", spec: "cypress/e2e/ui/**/*.spec.js" }
+            split-index: "0"
+            shard-total: 4
+          - php-version: "8.4"
+            test-type: { name: ui-shard-1, config: "cypress/configs/docker-ui.config.ts", spec: "cypress/e2e/ui/**/*.spec.js" }
+            split-index: "1"
+            shard-total: 4
+          - php-version: "8.4"
+            test-type: { name: ui-shard-2, config: "cypress/configs/docker-ui.config.ts", spec: "cypress/e2e/ui/**/*.spec.js" }
+            split-index: "2"
+            shard-total: 4
+          - php-version: "8.4"
+            test-type: { name: ui-shard-3, config: "cypress/configs/docker-ui.config.ts", spec: "cypress/e2e/ui/**/*.spec.js" }
+            split-index: "3"
+            shard-total: 4
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - uses: ./.github/actions/checkout-node-npm
+      with:
+        cache-cypress: 'true'
+
+    - name: Download build artifact
+      uses: ./.github/actions/download-artifact
+      with:
+        name: build-${{ github.run_id }}
+        path: .
+
+    - name: Load Docker image
+      run: |
+        docker load < temp/docker-image-${{ matrix.php-version }}.tar.gz
+        docker tag churchcrm/crm:php${{ matrix.php-version }}-test churchcrm/crm:php8-debian
+
+    - name: Start Docker (root path)
+      run: |
+        cp docker/Config.root.php src/Include/Config.php
+        docker compose -f docker/docker-compose.yaml -f docker/docker-compose.parallel.yaml --profile ci-root up -d
+
+    - name: Wait for server (root path)
+      uses: ./.github/actions/wait-for-server
+      with:
+        url: 'http://127.0.0.1/api/public/echo'
+        docker-compose-profile: 'ci-root'
+        docker-compose-files: 'docker/docker-compose.yaml,docker/docker-compose.parallel.yaml'
+
+    - name: Run Cypress ${{ matrix.test-type.name }} tests (root, PHP ${{ matrix.php-version }})
+      uses: ./.github/actions/run-cypress-tests
+      with:
+        config-file: ${{ matrix.test-type.config }}
+        spec: ${{ matrix.test-type.spec }}
+        test-name: ${{ matrix.test-type.name }}
+        php-version: ${{ matrix.php-version }}
+        deployment: root
+        shard-total: ${{ matrix.test-type.shard-total || matrix.shard-total || '' }}
+        shard-index: ${{ matrix.test-type.split-index || matrix.split-index || '0' }}
+        docker-compose-profile: ci-root
+        # ci-root publishes MySQL on 3306. The guard reads this inside the action.
+        extra-env: |
+          ROW_GUARD_DB_PORT=3306
+          ROW_GUARD_REQUIRED=1
+
+    - name: Stop Docker
+      if: always()
+      run: npm run docker:ci:root:down
+
+  test-new-system:
+    needs: [configure, build, lint]
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      checks: write
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ${{ fromJSON(needs.configure.outputs.php-versions) }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - uses: ./.github/actions/checkout-node-npm
+      with:
+        cache-cypress: 'true'
+
+    - name: Download build artifact
+      uses: ./.github/actions/download-artifact
+      with:
+        name: build-${{ github.run_id }}
+        path: .
+
+    - name: Load Docker image
+      run: |
+        docker load < temp/docker-image-${{ matrix.php-version }}.tar.gz
+        docker tag churchcrm/crm:php${{ matrix.php-version }}-test churchcrm/crm:php8-debian
+
+    - name: Generate file signatures
+      run: node scripts/build/generate-signatures-node.js
+
+    - name: Remove Config.php for fresh install test
+      run: rm -f src/Include/Config.php
+
+    - name: Start Docker (new system)
+      run: docker compose -f docker/docker-compose.yaml -f docker/docker-compose.parallel.yaml --profile ci-new-system up -d
+
+    - name: Wait for server (new system)
+      uses: ./.github/actions/wait-for-server
+      with:
+        url: 'http://127.0.0.1:8081/'
+        docker-compose-profile: 'ci-new-system'
+
+    - name: Run Cypress tests (setup wizard, PHP ${{ matrix.php-version }})
+      uses: ./.github/actions/run-cypress-tests
+      with:
+        config-file: cypress/configs/new-system.config.ts
+        spec: cypress/e2e/new-system/**/*.spec.js
+        test-name: setup
+        php-version: ${{ matrix.php-version }}
+        deployment: new-system
+        shard-total: 1
+        shard-index: '0'
+        docker-compose-profile: ci-new-system
+
+    - name: Stop Docker
+      if: always()
+      run: npm run docker:ci:new-system:down
+
+  test-summary:
+    needs: [build, test-root, test-new-system]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Test overview
+      uses: ./.github/actions/test-run-summary

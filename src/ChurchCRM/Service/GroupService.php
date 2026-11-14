@@ -1,0 +1,411 @@
+<?php
+
+namespace ChurchCRM\Service;
+
+use ChurchCRM\model\ChurchCRM\GroupQuery;
+use ChurchCRM\model\ChurchCRM\ListOption;
+use ChurchCRM\model\ChurchCRM\ListOptionQuery;
+use ChurchCRM\model\ChurchCRM\Map\GroupTableMap;
+use ChurchCRM\model\ChurchCRM\Person;
+use ChurchCRM\model\ChurchCRM\Person2group2roleP2g2r;
+use ChurchCRM\model\ChurchCRM\Person2group2roleP2g2rQuery;
+use ChurchCRM\model\ChurchCRM\PersonQuery;
+use ChurchCRM\Service\AuthService;
+use ChurchCRM\Utils\FunctionsUtils;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\Utils\LoggerUtils;
+use Propel\Runtime\ActiveQuery\Criteria;
+use Propel\Runtime\Propel;
+
+class GroupService
+{
+    /**
+     * Add person to group-specific properties table.
+     *
+     * @param int $groupID  Group ID
+     * @param int $personID Person ID to add to group properties
+     * @return void
+     */
+    private function addPersonToGroupProperties(int $groupID, int $personID): void
+    {
+        $connection = Propel::getConnection();
+        $sql = 'INSERT IGNORE INTO groupprop_' . (int)$groupID . ' (per_ID) VALUES (:personId)';
+        $stmt = $connection->prepare($sql);
+        $stmt->bindValue(':personId', $personID, \PDO::PARAM_INT);
+        $stmt->execute();
+    }
+
+    /**
+     *  removeUserFromGroup.
+     *
+     * @param int $groupID  Group ID from which  to remove the user
+     * @param int $personID UserID to remove from the group
+     */
+    public function removeUserFromGroup(int $groupID, int $personID): void
+    {
+        AuthService::requireUserGroupMembership('bManageGroups');
+        $sSQL = 'DELETE FROM person2group2role_p2g2r WHERE p2g2r_per_ID = ' . $personID . ' AND p2g2r_grp_ID = ' . $groupID;
+        FunctionsUtils::runQuery($sSQL);
+
+        // Check if this group has special properties
+        $sSQL = 'SELECT grp_hasSpecialProps FROM group_grp WHERE grp_ID = ' . $groupID;
+        $rsTemp = FunctionsUtils::runQuery($sSQL);
+        $rowTemp = mysqli_fetch_row($rsTemp);
+        $bHasProp = $rowTemp[0];
+
+        if ($bHasProp === '1') {
+            $sSQL = 'DELETE FROM groupprop_' . $groupID . " WHERE per_ID = '" . $personID . "'";
+            FunctionsUtils::runQuery($sSQL);
+        }
+
+        (new CustomFieldService())->clearGroupMemberReferences((int) $groupID, (int) $personID);
+    }
+
+    /**
+     *  addUserToGroup.
+     *
+     * @param int $groupID  Group ID from which  to remove the user
+     * @param int $personID UserID to remove from the group
+     * @param int $roleID   Role ID to set to the person
+     */
+    public function addUserToGroup(int $iGroupID, int $iPersonID, int $iRoleID): array
+    {
+        AuthService::requireUserGroupMembership('bManageGroups');
+        //
+        // Adds a person to a group with specified role.
+        // Returns false if the operation fails. (such as person already in group)
+        //
+
+        // Was a RoleID passed in?
+        if ($iRoleID === 0) {
+            // No, get the Default Role for this Group
+            $group = GroupQuery::create()->findOneById($iGroupID);
+            $iRoleID = $group->getDefaultRole();
+        }
+
+        $result = false;
+        try {
+            $person2group2role = new Person2group2roleP2g2r();
+            $person2group2role
+                ->setPersonId($iPersonID)
+                ->setGroupId($iGroupID)
+                ->setRoleId($iRoleID);
+            $person2group2role->save();
+            $result = true;
+        } catch (\Throwable $t) {
+            $logger = LoggerUtils::getAppLogger();
+            $logger->warning('Failed to add person to group', [
+                'groupId' => $iGroupID,
+                'personId' => $iPersonID,
+                'roleId' => $iRoleID,
+                'error' => $t->getMessage(),
+            ]);
+        }
+
+        if ($result) {
+            // Check if this group has special properties
+            $group = GroupQuery::create()->findOneById($iGroupID);
+            if ($group->getHasSpecialProps()) {
+                $this->addPersonToGroupProperties($iGroupID, $iPersonID);
+            }
+        }
+
+        return $this->getGroupMembers($iGroupID, $iPersonID);
+    }
+
+
+    /**
+     * Add a user to a group without performing Auth checks. Intended for trusted imports.
+     * Reuses the same internal behavior as addUserToGroup (special props handling).
+     *
+     * @param int $iGroupID
+     * @param int $iPersonID
+     * @param int $iRoleID
+     * @return array
+     */
+    public function addUserToGroupInternal(int $iGroupID, int $iPersonID, int $iRoleID): array
+    {
+        $result = false;
+        try {
+            $person2group2role = new Person2group2roleP2g2r();
+            $person2group2role
+                ->setPersonId($iPersonID)
+                ->setGroupId($iGroupID)
+                ->setRoleId($iRoleID);
+            $person2group2role->save();
+            $result = true;
+        } catch (\Throwable $t) {
+            $logger = LoggerUtils::getAppLogger();
+            $logger->warning('Failed to add person to group (internal import)', [
+                'groupId' => $iGroupID,
+                'personId' => $iPersonID,
+                'roleId' => $iRoleID,
+                'error' => $t->getMessage(),
+            ]);
+        }
+
+        if ($result) {
+            // Check if this group has special properties
+            $group = GroupQuery::create()->findOneById($iGroupID);
+            if ($group && $group->getHasSpecialProps()) {
+                $this->addPersonToGroupProperties($iGroupID, $iPersonID);
+            }
+        }
+
+        return $this->getGroupMembers($iGroupID, $iPersonID);
+    }
+
+    /**
+     *  getGroupRoles.
+     *
+     * @param int $groupID ID of the group
+     *
+     * @return array representing the roles of the group
+     */
+    public function getGroupRoles(int $groupID): array
+    {
+        $groupRoles = [];
+        $sSQL = 'SELECT grp_ID, lst_OptionName, lst_OptionID, lst_OptionSequence
+              FROM group_grp
+              LEFT JOIN list_lst ON
+              list_lst.lst_ID = group_grp.grp_RoleListID
+              WHERE group_grp.grp_ID = ' . $groupID;
+        $rsList = FunctionsUtils::runQuery($sSQL);
+
+        // Validate that this list ID is really for a group roles list. (for security)
+        if (mysqli_num_rows($rsList) === 0) {
+            throw new \Exception('invalid request');
+        }
+
+        while ($row = mysqli_fetch_assoc($rsList)) {
+            $groupRoles[] = $row;
+        }
+
+        return $groupRoles;
+    }
+
+    public function setGroupRoleOrder(string $groupID, string $groupRoleID, string $groupRoleOrder): void
+    {
+        AuthService::requireUserGroupMembership('bManageGroups');
+        $sSQL = 'UPDATE list_lst
+                 INNER JOIN group_grp
+                    ON group_grp.grp_RoleListID = list_lst.lst_ID
+                 SET list_lst.lst_OptionSequence = "' . $groupRoleOrder . '"
+                 WHERE group_grp.grp_ID = "' . $groupID . '"
+                    AND list_lst.lst_OptionID = ' . $groupRoleID;
+        FunctionsUtils::runQuery($sSQL);
+    }
+
+    /**
+     * Delete one of a group's roles. Role IDs are never renumbered, because memberships and
+     * the group's default role hold them; only the display order closes up (#10338).
+     * If the deleted role was the default, the first remaining role becomes the default;
+     * members who had it move to the default.
+     *
+     * @return array the remaining roles, as getGroupRoles() returns them
+     */
+    public function deleteGroupRole(int $groupID, int $groupRoleID): array
+    {
+        AuthService::requireUserGroupMembership('bManageGroups');
+
+        $con = Propel::getWriteConnection(GroupTableMap::DATABASE_NAME);
+        $con->beginTransaction();
+        try {
+            // Locking the group serializes deletes on its roles, so two cannot both pass the
+            // last-role check below.
+            $group = GroupQuery::create()->filterById($groupID)->lockForUpdate()->findOne($con);
+            if ($group === null) {
+                throw new \InvalidArgumentException('Group not found', 404);
+            }
+            $roleListId = $group->getRoleListId();
+            $roles = fn (): ListOptionQuery => ListOptionQuery::create()->filterById($roleListId);
+            $role = $roles()->filterByOptionId($groupRoleID)->findOne($con);
+            if ($role === null) {
+                throw new \InvalidArgumentException('Group role not found', 404);
+            }
+            if ($roles()->count($con) <= 1) {
+                throw new \InvalidArgumentException('A group must keep at least one role', 400);
+            }
+
+            $deletedSequence = $role->getOptionSequence();
+            $role->delete($con);
+
+            $laterRoles = $roles()
+                ->filterByOptionSequence($deletedSequence, Criteria::GREATER_THAN)
+                ->find($con);
+            foreach ($laterRoles as $laterRole) {
+                $laterRole->setOptionSequence($laterRole->getOptionSequence() - 1);
+                $laterRole->save($con);
+            }
+
+            if ((int) $group->getDefaultRole() === $groupRoleID) {
+                $group->setDefaultRole($roles()->orderByOptionSequence()->findOne($con)->getOptionId());
+                $group->save($con);
+            }
+            Person2group2roleP2g2rQuery::create()
+                ->filterByGroupId($groupID)
+                ->filterByRoleId($groupRoleID)
+                ->update(['RoleId' => (int) $group->getDefaultRole()], $con);
+
+            $con->commit();
+        } catch (\Throwable $e) {
+            $con->rollBack();
+            throw $e;
+        }
+
+        return $this->getGroupRoles($groupID);
+    }
+
+    public function addGroupRole(string $groupID, string $groupRoleName): array
+    {
+        AuthService::requireUserGroupMembership('bManageGroups');
+        if (strlen($groupRoleName) === 0) {
+            throw new \Exception('New field name cannot be blank');
+        }
+
+        // Sanitize role name to prevent XSS
+        $groupRoleName = InputUtils::sanitizeText($groupRoleName);
+
+        // Get the group to find its role list ID
+        $group = GroupQuery::create()->findOneById((int)$groupID);
+        if ($group === null) {
+            throw new \Exception('Group not found');
+        }
+        
+        $listID = $group->getRoleListId();
+
+        // Check for duplicate option name using Propel
+        $existingOption = ListOptionQuery::create()
+            ->filterById($listID)
+            ->filterByOptionName($groupRoleName)
+            ->findOne();
+
+        if ($existingOption !== null) {
+            throw new \Exception('Field ' . $groupRoleName . ' already exists');
+        }
+
+        // Get count of options and max option ID
+        $options = ListOptionQuery::create()
+            ->filterById($listID)
+            ->find();
+
+        $numRows = count($options);
+        $newOptionSequence = $numRows + 1;
+
+        // Find max OptionID
+        $maxOptionID = 0;
+        foreach ($options as $option) {
+            if ($option->getOptionId() > $maxOptionID) {
+                $maxOptionID = $option->getOptionId();
+            }
+        }
+        $newOptionID = $maxOptionID + 1;
+
+        // Insert into the appropriate options table
+        $listOption = new ListOption();
+        $listOption
+            ->setId($listID)
+            ->setOptionId($newOptionID)
+            ->setOptionName($groupRoleName)
+            ->setOptionSequence($newOptionSequence);
+        $listOption->save();
+
+        return [
+            'newRole' => [
+                'roleID'   => $newOptionID,
+                'roleName' => $groupRoleName,
+                'sequence' => $newOptionSequence,
+            ],
+        ];
+    }
+
+    public function enableGroupSpecificProperties(string $groupID): void
+    {
+        AuthService::requireUserGroupMembership('bManageGroups');
+        $sSQL = 'UPDATE group_grp SET grp_hasSpecialProps = true
+            WHERE grp_ID = ' . $groupID;
+        FunctionsUtils::runQuery($sSQL);
+        $sSQLp = 'CREATE TABLE IF NOT EXISTS groupprop_' . $groupID . " (
+                        per_ID mediumint(8) unsigned NOT NULL default '0',
+                        PRIMARY KEY  (per_ID),
+                          UNIQUE KEY per_ID (per_ID)
+                        ) ENGINE=InnoDB;";
+        FunctionsUtils::runQuery($sSQLp);
+
+        $groupMembers = $this->getGroupMembers($groupID);
+
+        foreach ($groupMembers as $member) {
+            $sSQLr = 'INSERT IGNORE INTO groupprop_' . $groupID . " ( per_ID ) VALUES ( '" . $member['per_ID'] . "' );";
+            FunctionsUtils::runQuery($sSQLr);
+        }
+    }
+
+    public function disableGroupSpecificProperties(string $groupID): void
+    {
+        AuthService::requireUserGroupMembership('bManageGroups');
+        $sSQLp = 'DROP TABLE groupprop_' . $groupID;
+        FunctionsUtils::runQuery($sSQLp);
+
+        // need to delete the master index stuff
+        $sSQLp = 'DELETE FROM groupprop_master WHERE grp_ID = ' . $groupID;
+        FunctionsUtils::runQuery($sSQLp);
+
+        $sSQL = 'UPDATE group_grp SET grp_hasSpecialProps = false
+            WHERE grp_ID = ' . $groupID;
+
+        FunctionsUtils::runQuery($sSQL);
+    }
+
+    /**
+     * @return array<mixed, array<'displayName'|'groupRole', mixed>>
+     */
+    public function getGroupMembers(string $groupID, $personID = null): array
+    {
+        // Use ORM with eager-loading to avoid N+1: one query instead of 1 + N
+        $query = Person2group2roleP2g2rQuery::create()
+            ->filterByGroupId((int)$groupID)
+            ->joinWithPerson();
+
+        if (is_numeric($personID)) {
+            $query->filterByPersonId((int)$personID);
+        }
+
+        $memberships = $query->find();
+
+        // Batch-load role names using the group's RoleListId (avoids N+1 on ListOption lookups).
+        // Person2group2roleP2g2r has no FK to list_lst — the role name is resolved via
+        // group_grp.grp_RoleListID (lst_ID) + p2g2r_rle_ID (lst_OptionID).
+        $roleNameMap = [];
+        if (count($memberships) > 0) {
+            $group = GroupQuery::create()->findOneById((int)$groupID);
+            if ($group !== null) {
+                $listId = $group->getRoleListId();
+                $roleIds = [];
+                foreach ($memberships as $membership) {
+                    $roleIds[] = $membership->getRoleId();
+                }
+                $roleOptions = ListOptionQuery::create()
+                    ->filterById($listId)
+                    ->filterByOptionId(array_unique($roleIds))
+                    ->find();
+                foreach ($roleOptions as $option) {
+                    $roleNameMap[$option->getOptionId()] = $option->getOptionName();
+                }
+            }
+        }
+
+        $members = [];
+        foreach ($memberships as $membership) {
+            $person = $membership->getPerson();
+            if ($person !== null) {
+                $members[] = [
+                    'per_ID' => $person->getId(),
+                    'displayName' => $person->getFullName(),
+                    'groupRole' => $roleNameMap[$membership->getRoleId()] ?? '',
+                ];
+            }
+        }
+
+        return $members;
+    }
+}

@@ -1,0 +1,594 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\Dashboard\EventsMenuItems;
+use ChurchCRM\dto\FullCalendarEvent;
+use ChurchCRM\dto\SystemCalendars;
+use ChurchCRM\model\ChurchCRM\Calendar;
+use ChurchCRM\model\ChurchCRM\CalendarQuery;
+use ChurchCRM\model\ChurchCRM\EventQuery;
+use ChurchCRM\model\ChurchCRM\User;
+use ChurchCRM\Volunteer\Middleware\VolunteerV2EnabledMiddleware;
+use ChurchCRM\Volunteer\Service\VolunteerAssignmentService;
+use ChurchCRM\Volunteer\Service\VolunteerCalendarService;
+use ChurchCRM\Volunteer\VolunteerException;
+use ChurchCRM\Slim\Middleware\Api\CalendarMiddleware;
+use ChurchCRM\Slim\Middleware\InputSanitizationMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Auth\AddEventsRoleAuthMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Auth\CalendarWriteRoleAuthMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\Utils\MiscUtils;
+use Propel\Runtime\Collection\ObjectCollection;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Exception\HttpNotFoundException;
+use Slim\Routing\RouteCollectorProxy;
+
+$app->group('/calendar', function (RouteCollectorProxy $group): void {
+    $group->get('/events-counters', 'getEventsCounters');
+});
+
+$app->group('/calendars', function (RouteCollectorProxy $group): void {
+    $group->get('', 'getUserCalendars');
+    $group->post('', 'NewCalendar')->add(new InputSanitizationMiddleware(['Name' => 'text']))->add(AddEventsRoleAuthMiddleware::class);
+    $group->get('/', 'getUserCalendars');
+    $group->post('/', 'NewCalendar')->add(new InputSanitizationMiddleware(['Name' => 'text']))->add(AddEventsRoleAuthMiddleware::class);
+    $group->get('/pinnable', 'getPinnableCalendars');
+    $group->get('/{id}', 'getUserCalendars');
+    $group->delete('/{id}', 'deleteUserCalendar')->add(CalendarMiddleware::class)->add(AddEventsRoleAuthMiddleware::class);
+    $group->get('/{id}/events', 'getUserCalendarEvents')->add(CalendarMiddleware::class);
+    $group->get('/{id}/fullcalendar', 'getUserCalendarFullCalendarEvents')->add(CalendarMiddleware::class);
+    // Administering ONE existing calendar is a per-row question once a ministry can own a
+    // calendar (§5.3), so these two use CalendarWriteRoleAuthMiddleware rather than the
+    // global Add Events gate. It is listed FIRST so Slim runs it LAST — after
+    // CalendarMiddleware has put the row it needs on the request.
+    $group->post('/{id}/NewAccessToken', 'NewAccessToken')->add(CalendarWriteRoleAuthMiddleware::class)->add(CalendarMiddleware::class);
+    $group->delete('/{id}/AccessToken', 'DeleteAccessToken')->add(CalendarWriteRoleAuthMiddleware::class)->add(CalendarMiddleware::class);
+    $group->get('/{id}/ministries', 'getCalendarMinistryGrants')->add(CalendarMiddleware::class)->add(AddEventsRoleAuthMiddleware::class)->add(new VolunteerV2EnabledMiddleware());
+    $group->put('/{id}/ministries', 'putCalendarMinistryGrants')->add(CalendarMiddleware::class)->add(AddEventsRoleAuthMiddleware::class)->add(new VolunteerV2EnabledMiddleware());
+});
+
+$app->group('/systemcalendars', function (RouteCollectorProxy $group): void {
+    $group->get('', 'getSystemCalendars');
+    $group->get('/', 'getSystemCalendars');
+    $group->get('/{id}/events', 'getSystemCalendarEvents');
+    $group->get('/{id}/events/{eventid}', 'getSystemCalendarEventById');
+    $group->get('/{id}/fullcalendar', 'getSystemCalendarFullCalendarEvents');
+});
+
+/**
+ * @OA\Get(
+ *     path="/systemcalendars",
+ *     operationId="getSystemCalendars",
+ *     summary="List all system calendars",
+ *     description="Returns built-in system calendars (birthdays, anniversaries, events). Fundraisers is listed, and its events served, only to users who may manage fundraisers; for anyone else /systemcalendars/{id} answers 404 for it.",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Array of system calendar objects"),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ */
+function getSystemCalendars(Request $request, Response $response, array $args): Response
+{
+    return SlimUtils::renderStringJSON($response, SystemCalendars::getCalendarList(AuthenticationManager::getCurrentUser())->toJSON());
+}
+
+/**
+ * @OA\Get(
+ *     path="/systemcalendars/{id}/events",
+ *     operationId="getSystemCalendarEvents",
+ *     summary="Get events from a system calendar",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, description="System calendar ID", @OA\Schema(type="integer", example=1)),
+ *     @OA\Parameter(name="start", in="query", required=false, description="Filter start date (ISO 8601)", @OA\Schema(type="string", format="date")),
+ *     @OA\Parameter(name="end", in="query", required=false, description="Filter end date (ISO 8601)", @OA\Schema(type="string", format="date")),
+ *     @OA\Response(response=200, description="Array of event objects"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=404, description="System calendar not found")
+ * )
+ */
+function getSystemCalendarEvents(Request $request, Response $response, array $args): Response
+{
+    $Calendar = SystemCalendars::getCalendarById((int) $args['id'], AuthenticationManager::getCurrentUser());
+    if (!$Calendar) {
+        throw new HttpNotFoundException($request, 'Calendar ID not found!');
+    }
+
+    $start = $request->getQueryParams()['start'] ?? '';
+    $end = $request->getQueryParams()['end'] ?? '';
+
+    $events = $Calendar->getEvents($start, $end);
+
+    return SlimUtils::renderJSON($response, $events->toArray());
+}
+
+/**
+ * @OA\Get(
+ *     path="/systemcalendars/{id}/events/{eventid}",
+ *     operationId="getSystemCalendarEventById",
+ *     summary="Get a single event from a system calendar",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="eventid", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Event object"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=404, description="Calendar or event not found")
+ * )
+ */
+function getSystemCalendarEventById(Request $request, Response $response, array $args): Response
+{
+    $Calendar = SystemCalendars::getCalendarById((int) $args['id'], AuthenticationManager::getCurrentUser());
+    if (!$Calendar) {
+        throw new HttpNotFoundException($request, 'Calendar ID not found!');
+    }
+
+    $event = $Calendar->getEventById((int) $args['eventid']);
+    if ($event === null) {
+        throw new HttpNotFoundException($request, 'Event not found!');
+    }
+
+    return SlimUtils::renderJSON($response, $event->toArray());
+}
+
+/**
+ * @OA\Get(
+ *     path="/systemcalendars/{id}/fullcalendar",
+ *     operationId="getSystemCalendarFullCalendarEvents",
+ *     summary="Get system calendar events in FullCalendar format",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="start", in="query", required=false, @OA\Schema(type="string", format="date")),
+ *     @OA\Parameter(name="end", in="query", required=false, @OA\Schema(type="string", format="date")),
+ *     @OA\Response(response=200, description="FullCalendar-compatible event array"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=404, description="Calendar or events not found")
+ * )
+ */
+function getSystemCalendarFullCalendarEvents(Request $request, Response $response, array $args): Response
+{
+    if (!is_numeric($args['id'])) {
+        throw new InvalidArgumentException('Calendar ID must be an integer!');
+    }
+
+    $calendarId = (int) $args['id'];
+    $Calendar = SystemCalendars::getCalendarById($calendarId, AuthenticationManager::getCurrentUser());
+    if (!$Calendar) {
+        throw new HttpNotFoundException($request, 'Calendar ID not found!');
+    }
+
+    $start = $request->getQueryParams()['start'] ?? '';
+    $end = $request->getQueryParams()['end'] ?? '';
+    $Events = $Calendar->getEvents($start, $end);
+    if (!$Events) {
+        throw new HttpNotFoundException($request, 'Events not found!');
+    }
+
+    return SlimUtils::renderJSON($response, EventsObjectCollectionToFullCalendar($Events, SystemCalendars::toPropelCalendar($Calendar)));
+}
+
+/**
+ * @OA\Get(
+ *     path="/calendars",
+ *     operationId="getUserCalendars",
+ *     summary="List user-created calendars",
+ *     description="Returns all user calendars. Optionally filter by ID using GET /calendars/{id}. AccessToken (the public feed link) is null unless the caller may administer that calendar.",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Array of calendar objects"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=404, description="No calendars found")
+ * )
+ * @OA\Get(
+ *     path="/calendars/{id}",
+ *     operationId="getUserCalendarById",
+ *     summary="Get a specific user calendar",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Calendar object"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=404, description="Calendar not found")
+ * )
+ */
+function getUserCalendars(Request $request, Response $response, array $args): Response
+{
+    $CalendarQuery = CalendarQuery::create();
+    if (isset($args['id'])) {
+        $CalendarQuery->filterById($args['id']);
+    }
+    $Calendars = $CalendarQuery->find();
+    if (!$Calendars) {
+        throw new HttpNotFoundException($request, 'No calendars returned');
+    }
+
+    $user = AuthenticationManager::getCurrentUser();
+    $calendarService = new VolunteerCalendarService();
+    $rows = [];
+    foreach ($Calendars as $calendar) {
+        $row = $calendar->toArray();
+        if (!$calendarService->mayAdminister($user, $calendar)) {
+            $row['AccessToken'] = null;
+        }
+        $rows[] = $row;
+    }
+
+    $response = $response
+        ->withHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        ->withHeader('Pragma', 'no-cache');
+
+    return SlimUtils::renderJSON($response, ['Calendars' => $rows]);
+}
+
+/**
+ * @OA\Get(
+ *     path="/calendars/{id}/fullcalendar",
+ *     operationId="getUserCalendarFullCalendarEvents",
+ *     summary="Get user calendar events in FullCalendar format",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="start", in="query", required=true, @OA\Schema(type="string", format="date")),
+ *     @OA\Parameter(name="end", in="query", required=true, @OA\Schema(type="string", format="date")),
+ *     @OA\Response(response=200, description="FullCalendar-compatible event array"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=404, description="Calendar or events not found")
+ * )
+ */
+function getUserCalendarFullCalendarEvents(Request $request, Response $response, array $args): Response
+{
+    $calendar = $request->getAttribute('calendar');
+    $start = $request->getQueryParams()['start'];
+    $end = $request->getQueryParams()['end'];
+    $Events = EventQuery::create()
+        ->filterByStart(['min' => $start])
+        ->filterByEnd(['max' => $end])
+        ->filterByCalendar($calendar)
+        ->find();
+    if (!$Events) {
+        throw new HttpNotFoundException($request, 'Events not found!');
+    }
+
+    return SlimUtils::renderJSON($response, EventsObjectCollectionToFullCalendar($Events, $calendar));
+}
+
+/**
+ * @OA\Get(
+ *     path="/calendars/{id}/events",
+ *     operationId="getUserCalendarEvents",
+ *     summary="Get events for a user calendar",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="start", in="query", required=false, @OA\Schema(type="string", format="date")),
+ *     @OA\Parameter(name="end", in="query", required=false, @OA\Schema(type="string", format="date")),
+ *     @OA\Response(response=200, description="Array of event objects"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=404, description="Calendar not found")
+ * )
+ */
+function getUserCalendarEvents(Request $request, Response $response, array $args): Response
+{
+    $calendar = $request->getAttribute('calendar');
+    $start = $request->getQueryParams()['start'] ?? '';
+    $end = $request->getQueryParams()['end'] ?? '';
+
+    $events = $calendar->getEvents($start, $end);
+
+    return SlimUtils::renderJSON($response, $events);
+}
+
+function EventsObjectCollectionToFullCalendar(ObjectCollection $events, Calendar $calendar): array
+{
+    // Volunteer v2 staffing for the whole feed in ONE call (#9713, design §3.5). Resolving
+    // it per event would turn a month of calendar into one query per row, and the scoping
+    // — which events' staffing this caller may see at all — belongs in one place.
+    $eventIds = [];
+    foreach ($events as $event) {
+        $eventIds[] = (int) $event->getId();
+    }
+
+    $staffing = [];
+    if (User::isVolunteerV2Enabled() && AuthenticationManager::isUserAuthenticated()) {
+        $staffing = (new VolunteerAssignmentService())->getEventStaffingSummary(
+            $eventIds,
+            AuthenticationManager::getCurrentUser()
+        );
+    }
+
+    $formattedEvents = [];
+    foreach ($events as $event) {
+        $fce = FullCalendarEvent::createFromEvent(
+            $event,
+            $calendar,
+            $staffing[(int) $event->getId()] ?? null
+        );
+        $formattedEvents[] = $fce;
+    }
+
+    return $formattedEvents;
+}
+
+/**
+ * @OA\Post(
+ *     path="/calendars/{id}/NewAccessToken",
+ *     operationId="newCalendarAccessToken",
+ *     summary="Generate a new public access token for a calendar",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Calendar object with new access token"),
+ *     @OA\Response(response=400, description="Missing or invalid calendar ID"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="AddEvents role required")
+ * )
+ */
+function NewAccessToken(Request $request, Response $response, array $args): Response
+{
+    $Calendar = $request->getAttribute('calendar');
+    $Calendar->setAccessToken(MiscUtils::randomToken());
+    $Calendar->save();
+
+    return SlimUtils::renderJSON($response, $Calendar->toArray());
+}
+
+/**
+ * @OA\Delete(
+ *     path="/calendars/{id}/AccessToken",
+ *     operationId="deleteCalendarAccessToken",
+ *     summary="Remove the public access token from a calendar",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Calendar object with access token cleared"),
+ *     @OA\Response(response=400, description="Missing or invalid calendar ID"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="AddEvents role required")
+ * )
+ */
+function DeleteAccessToken(Request $request, Response $response, array $args): Response
+{
+    $Calendar = $request->getAttribute('calendar');
+    $Calendar->setAccessToken(null);
+    $Calendar->save();
+
+    return SlimUtils::renderJSON($response, $Calendar->toArray());
+}
+
+/**
+ * @OA\Get(
+ *     path="/calendars/pinnable",
+ *     operationId="getPinnableCalendars",
+ *     summary="Calendars the caller may pin an event of a ministry to",
+ *     description="Volunteer v2 (D25). With the global AddEvent right, every calendar. Without it, the ministry's own calendar and the church calendars an administrator opened to that ministry, when the caller manages the ministry; otherwise none. The event editor offers exactly these.",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="ministryId", in="query", required=false, description="The event's volunteer ministry; omit it for an event with none", @OA\Schema(type="integer", example=3)),
+ *     @OA\Response(response=200, description="The calendar ids",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="ministryId", type="integer", nullable=true, example=3),
+ *             @OA\Property(property="calendarIds", type="array", @OA\Items(type="integer"), example={7,12})
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ */
+function getPinnableCalendars(Request $request, Response $response, array $args): Response
+{
+    $ministryId = InputUtils::filterInt($request->getQueryParams()['ministryId'] ?? null);
+    $ministryId = $ministryId > 0 ? $ministryId : null;
+
+    return SlimUtils::renderJSON($response, [
+        'ministryId' => $ministryId,
+        'calendarIds' => (new VolunteerCalendarService())->pinnableCalendarIds(
+            AuthenticationManager::getCurrentUser(),
+            $ministryId
+        ),
+    ]);
+}
+
+/**
+ * @OA\Get(
+ *     path="/calendars/{id}/ministries",
+ *     operationId="getCalendarMinistryGrants",
+ *     summary="The volunteer ministries a church calendar is opened to",
+ *     description="Volunteer v2 (D25). A coordinator of one of these ministries may pin that ministry's events to the calendar without the AddEvent right.",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="The grants",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="calendarId", type="integer", example=7),
+ *             @OA\Property(property="ministries", type="array", @OA\Items(type="object",
+ *                 @OA\Property(property="id", type="integer", example=3),
+ *                 @OA\Property(property="name", type="string", example="Children's Ministry"),
+ *                 @OA\Property(property="active", type="boolean", example=true)
+ *             ))
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="AddEvents role required, or Volunteer Management V2 is not enabled"),
+ *     @OA\Response(response=404, description="Calendar not found")
+ * )
+ */
+function getCalendarMinistryGrants(Request $request, Response $response, array $args): Response
+{
+    $calendar = $request->getAttribute('calendar');
+
+    return SlimUtils::renderJSON($response, [
+        'calendarId' => (int) $calendar->getId(),
+        'ministries' => (new VolunteerCalendarService())->getGrantedMinistries($calendar),
+    ]);
+}
+
+/**
+ * @OA\Put(
+ *     path="/calendars/{id}/ministries",
+ *     operationId="putCalendarMinistryGrants",
+ *     summary="Open a church calendar to exactly these volunteer ministries",
+ *     description="Volunteer v2 (D25). Replaces the calendar's grants; an empty list closes it to every ministry. Managing the calendar itself (name, colours, public link) is unaffected.",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\RequestBody(required=true, @OA\JsonContent(
+ *         required={"ministryIds"},
+ *         @OA\Property(property="ministryIds", type="array", @OA\Items(type="integer"), example={3,5})
+ *     )),
+ *     @OA\Response(response=200, description="The grants now in force, shaped like GET /calendars/{id}/ministries"),
+ *     @OA\Response(response=400, description="ministryIds missing or not a list of ids, or an unknown ministry"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="AddEvents role required, or Volunteer Management V2 is not enabled"),
+ *     @OA\Response(response=404, description="Calendar not found"),
+ *     @OA\Response(response=409, description="The calendar belongs to a ministry; only church calendars are opened to ministries")
+ * )
+ */
+function putCalendarMinistryGrants(Request $request, Response $response, array $args): Response
+{
+    $calendar = $request->getAttribute('calendar');
+    $body = (array) $request->getParsedBody();
+
+    $ministryIds = $body['ministryIds'] ?? null;
+    if (!is_array($ministryIds)) {
+        return SlimUtils::renderErrorJSON($response, gettext('ministryIds must be a list of ministry ids'), [], 400, null, $request);
+    }
+    foreach ($ministryIds as $ministryId) {
+        $isId = (is_int($ministryId) || (is_string($ministryId) && ctype_digit($ministryId))) && (int) $ministryId > 0;
+        if (!$isId) {
+            return SlimUtils::renderErrorJSON($response, gettext('ministryIds must be a list of ministry ids'), [], 400, null, $request);
+        }
+    }
+
+    try {
+        $ministries = (new VolunteerCalendarService())->replaceGrants(
+            $calendar,
+            array_map('intval', $ministryIds),
+            AuthenticationManager::getCurrentUser()
+        );
+    } catch (VolunteerException $e) {
+        return SlimUtils::renderErrorJSON($response, $e->getMessage(), $e->getExtra(), $e->getStatusCode(), null, $request);
+    }
+
+    return SlimUtils::renderJSON($response, [
+        'calendarId' => (int) $calendar->getId(),
+        'ministries' => $ministries,
+    ]);
+}
+
+/**
+ * @OA\Post(
+ *     path="/calendars",
+ *     operationId="newCalendar",
+ *     summary="Create a new calendar",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\RequestBody(required=true, @OA\JsonContent(
+ *         required={"Name","ForegroundColor","BackgroundColor"},
+ *         @OA\Property(property="Name", type="string", example="Youth Group"),
+ *         @OA\Property(property="ForegroundColor", type="string", example="#ffffff"),
+ *         @OA\Property(property="BackgroundColor", type="string", example="#3788d8")
+ *     )),
+ *     @OA\Response(response=200, description="New calendar object"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="AddEvents role required")
+ * )
+ */
+function NewCalendar(Request $request, Response $response, $args): Response
+{
+    $input = $request->getParsedBody();
+
+    // Validate required color fields
+    if (!isset($input['ForegroundColor']) || !isset($input['BackgroundColor'])) {
+        return SlimUtils::renderErrorJSON($response, gettext('ForegroundColor and BackgroundColor are required.'), [], 400);
+    }
+
+    // Validate color format to prevent stored XSS (only allow valid CSS hex colors: #RGB or #RRGGBB)
+    $colorPattern = '/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/';
+    $fgColor = $input['ForegroundColor'];
+    $bgColor = $input['BackgroundColor'];
+    if (!is_string($fgColor) || !is_string($bgColor) || !preg_match($colorPattern, $fgColor) || !preg_match($colorPattern, $bgColor)) {
+        return SlimUtils::renderErrorJSON($response, gettext('Invalid color format. Use hex colors like #FF0000.'), [], 400);
+    }
+
+    $Calendar = new Calendar();
+    $Calendar->setName($input['Name']);
+    // Strip leading '#' — the DB column stores 6-char hex; FullCalendarEvent.php prepends '#' on read.
+    $Calendar->setForegroundColor(ltrim($fgColor, '#'));
+    $Calendar->setBackgroundColor(ltrim($bgColor, '#'));
+    $Calendar->save();
+
+    return SlimUtils::renderJSON($response, $Calendar->toArray());
+}
+
+/**
+ * @OA\Delete(
+ *     path="/calendars/{id}",
+ *     operationId="deleteUserCalendar",
+ *     summary="Delete a user calendar",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+ *     @OA\Response(response=200, description="Calendar deleted",
+ *         @OA\JsonContent(@OA\Property(property="success", type="boolean", example=true))
+ *     ),
+ *     @OA\Response(response=400, description="Missing or invalid calendar ID"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="AddEvents role required"),
+ *     @OA\Response(response=409, description="Calendar still has events assigned; remove them first")
+ * )
+ */
+function deleteUserCalendar(Request $request, Response $response, array $args): Response
+{
+    $calendar = $request->getAttribute('calendar');
+
+    $eventCount = $calendar->countCalendarEvents();
+    if ($eventCount > 0) {
+        return SlimUtils::renderErrorJSON(
+            $response,
+            sprintf(
+                gettext('Cannot delete calendar: %d event(s) are still assigned to it. Remove or reassign them first.'),
+                $eventCount
+            ),
+            [],
+            409
+        );
+    }
+
+    $calendar->delete();
+
+    return SlimUtils::renderSuccessJSON($response);
+}
+
+/**
+ * Get today's event counters (birthdays, anniversaries, events)
+ * Called once on page load to populate menu badges
+ */
+/**
+ * @OA\Get(
+ *     path="/calendar/events-counters",
+ *     operationId="getEventsCounters",
+ *     summary="Get today's event counters for the dashboard menu badges",
+ *     description="Returns counts of upcoming birthdays, anniversaries, and events used to populate navigation badge counts.",
+ *     tags={"Calendar"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Response(response=200, description="Counter object",
+ *         @OA\JsonContent(type="object",
+ *             @OA\Property(property="birthdays", type="integer", example=2),
+ *             @OA\Property(property="anniversaries", type="integer", example=1),
+ *             @OA\Property(property="events", type="integer", example=3)
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ */
+function getEventsCounters(Request $request, Response $response, array $args): Response
+{
+    $dateParam = $request->getQueryParams()['date'] ?? null;
+    $date = null;
+    if ($dateParam !== null && preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateParam)) {
+        $date = new \DateTime($dateParam);
+    }
+    return SlimUtils::renderJSON($response, EventsMenuItems::getDashboardItemValue($date));
+}

@@ -1,0 +1,15 @@
+#groupsTable {
+  td {
+    white-space: nowrap;
+
+    &:first-child {
+      white-space: normal;
+    }
+  }
+
+  @media (max-width: 767.98px) {
+    td {
+      white-space: normal;
+    }
+  }
+}

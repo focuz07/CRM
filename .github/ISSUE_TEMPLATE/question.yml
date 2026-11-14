@@ -1,0 +1,24 @@
+name: ❓ Question / Support
+description: Ask a question or request help
+title: "Question: "
+type: Task
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Need an answer fast? [Ask on Discord](https://discord.gg/tuWyFzj3Nj). Open an issue when the answer should stay searchable for the next person. The [docs](https://docs.churchcrm.io/?utm_source=github&utm_medium=referral&utm_campaign=github_issue_templates&utm_content=question_docs) may already cover it.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Tell us your goal and anything you've already tried.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: ChurchCRM version (optional)
+      placeholder: "e.g. 7.1.0"

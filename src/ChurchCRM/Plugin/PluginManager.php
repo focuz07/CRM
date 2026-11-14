@@ -1,0 +1,1103 @@
+<?php
+
+namespace ChurchCRM\Plugin;
+
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Portal\Permissions\PortalPluginRoutes;
+use ChurchCRM\Utils\LoggerUtils;
+use Slim\Routing\RouteCollectorProxy;
+
+/**
+ * Manages ChurchCRM plugins: discovery, loading, activation, and lifecycle.
+ *
+ * Plugins can be:
+ * - Core plugins: Shipped with ChurchCRM (src/plugins/core/)
+ * - Community plugins: Third-party extensions (src/plugins/community/)
+ *
+ * Plugin state is stored in SystemConfig with prefixed keys (plugin.{id}.enabled).
+ */
+class PluginManager
+{
+    /** `$portalArea` in a plugin's portal routes file: pages under /portal/plugins/{id}. */
+    public const PORTAL_PAGES = 'pages';
+
+    /** `$portalArea` in a plugin's portal routes file: API under /api/portal/plugins/{id}. */
+    public const PORTAL_API = 'api';
+
+    /**
+     * Base path to plugins directory.
+     */
+    private static string $pluginsPath = '';
+
+    /**
+     * Discovered plugin metadata.
+     *
+     * @var array<string, PluginMetadata>
+     */
+    private static array $discoveredPlugins = [];
+
+    /**
+     * Currently loaded plugin instances.
+     *
+     * @var array<string, PluginInterface>
+     */
+    private static array $loadedPlugins = [];
+
+    /**
+     * Whether the manager has been initialized.
+     */
+    private static bool $initialized = false;
+
+    /**
+     * Initialize the plugin system.
+     *
+     * @param string $pluginsPath Base path to plugins directory
+     */
+    public static function init(string $pluginsPath): void
+    {
+        if (self::$initialized) {
+            return;
+        }
+
+        self::$pluginsPath = rtrim($pluginsPath, '/');
+        self::discoverPlugins();
+        self::loadActivePlugins();
+        self::$initialized = true;
+
+        LoggerUtils::getAppLogger()->debug('Plugin system initialized', [
+            'discovered' => count(self::$discoveredPlugins),
+            'active' => count(self::$loadedPlugins),
+        ]);
+    }
+
+    /**
+     * Discover all plugins from the filesystem.
+     *
+     * Scans src/plugins/core/ and src/plugins/community/ directories
+     * for plugin.json manifest files.
+     */
+    public static function discoverPlugins(): void
+    {
+        self::$discoveredPlugins = [];
+
+        $directories = ['core', 'community'];
+
+        foreach ($directories as $type) {
+            $typePath = self::$pluginsPath . '/' . $type;
+
+            if (!is_dir($typePath)) {
+                continue;
+            }
+
+            foreach (new \DirectoryIterator($typePath) as $dir) {
+                if ($dir->isDot() || !$dir->isDir()) {
+                    continue;
+                }
+
+                try {
+                    $manifestPath = $dir->getPathname() . '/plugin.json';
+                    $metadata = PluginMetadata::fromJsonFile($manifestPath);
+
+                    if ($metadata !== null && $metadata->isValid()) {
+                        self::$discoveredPlugins[$metadata->getId()] = $metadata;
+
+                        LoggerUtils::getAppLogger()->debug("Discovered plugin: {$metadata->getId()}", [
+                            'type' => $metadata->getType(),
+                            'version' => $metadata->getVersion(),
+                        ]);
+                    }
+                } catch (\Throwable $e) {
+                    LoggerUtils::getAppLogger()->warning(
+                        'Failed to load plugin manifest: ' . $dir->getFilename(),
+                        ['error' => $e->getMessage(), 'path' => $dir->getPathname()]
+                    );
+                }
+            }
+        }
+    }
+
+    /**
+     * Load and boot all active plugins.
+     */
+    private static function loadActivePlugins(): void
+    {
+        foreach (self::$discoveredPlugins as $pluginId => $metadata) {
+            if (self::isPluginActive($pluginId)) {
+                try {
+                    self::loadPlugin($pluginId);
+                } catch (\Throwable $e) {
+                    LoggerUtils::getAppLogger()->error(
+                        "Failed to load plugin: $pluginId",
+                        ['exception' => $e->getMessage()]
+                    );
+                    // Any throw from load/boot is grounds for automatic
+                    // quarantine. Better to sideline a single plugin
+                    // than to let it recurse into core error handling
+                    // on every subsequent request.
+                    self::quarantinePlugin(
+                        $pluginId,
+                        'Plugin failed to load: ' . $e->getMessage()
+                    );
+                }
+            }
+        }
+
+        // Bind per-plugin gettext textdomains so plugin PHP code can call
+        // dgettext('{pluginId}', '…') to translate without touching the
+        // core POeditor workflow. Only plugins that actually ship a
+        // locale/textdomain directory are bound.
+        $activeMetadata = [];
+        foreach (self::$loadedPlugins as $pluginId => $_plugin) {
+            if (isset(self::$discoveredPlugins[$pluginId])) {
+                $activeMetadata[$pluginId] = self::$discoveredPlugins[$pluginId];
+            }
+        }
+        PluginLocalization::bindPhpDomains($activeMetadata);
+    }
+
+    /**
+     * Load a single plugin by ID.
+     */
+    private static function loadPlugin(string $pluginId): ?PluginInterface
+    {
+        if (isset(self::$loadedPlugins[$pluginId])) {
+            return self::$loadedPlugins[$pluginId];
+        }
+
+        $metadata = self::$discoveredPlugins[$pluginId] ?? null;
+        if ($metadata === null) {
+            return null;
+        }
+
+        // Register plugin autoloader
+        self::registerPluginAutoloader($metadata);
+
+        $mainClass = $metadata->getMainClass();
+        if (!class_exists($mainClass)) {
+            LoggerUtils::getAppLogger()->error(
+                "Plugin main class not found: $mainClass",
+                ['plugin' => $pluginId]
+            );
+
+            return null;
+        }
+
+        // Instantiate the plugin
+        $plugin = new $mainClass($metadata->getPath());
+
+        if (!$plugin instanceof PluginInterface) {
+            LoggerUtils::getAppLogger()->error(
+                "Plugin class does not implement PluginInterface",
+                ['plugin' => $pluginId, 'class' => $mainClass]
+            );
+
+            return null;
+        }
+
+        // Boot the plugin
+        $plugin->boot();
+
+        self::$loadedPlugins[$pluginId] = $plugin;
+
+        LoggerUtils::getAppLogger()->debug("Plugin loaded: $pluginId");
+
+        return $plugin;
+    }
+
+    /**
+     * Register PSR-4 autoloader for a plugin.
+     */
+    private static function registerPluginAutoloader(PluginMetadata $metadata): void
+    {
+        $pluginPath = $metadata->getPath();
+        $srcPath = $pluginPath . '/src';
+
+        if (!is_dir($srcPath)) {
+            return;
+        }
+
+        // Simple PSR-4 autoloader registration
+        // The namespace is derived from the main class
+        $mainClass = $metadata->getMainClass();
+        $lastSeparator = strrpos($mainClass, '\\');
+        $namespace = $lastSeparator !== false ? substr($mainClass, 0, $lastSeparator + 1) : '';
+
+        if (!empty($namespace)) {
+            spl_autoload_register(function ($class) use ($namespace, $srcPath) {
+                if (strpos($class, $namespace) === 0) {
+                    $relativeClass = substr($class, strlen($namespace));
+                    $file = $srcPath . '/' . str_replace('\\', '/', $relativeClass) . '.php';
+
+                    if (file_exists($file)) {
+                        require_once $file;
+                    }
+                }
+            });
+        }
+    }
+
+    /**
+     * Check if a plugin is active.
+     *
+     * Checks the SystemConfig key plugin.{pluginId}.enabled
+     * Returns false if the config key doesn't exist (graceful degradation).
+     * Also returns false if the plugin is quarantined — quarantined
+     * plugins never run, even if their `enabled` flag is still 1.
+     */
+    public static function isPluginActive(string $pluginId): bool
+    {
+        if (self::isPluginQuarantined($pluginId)) {
+            return false;
+        }
+
+        try {
+            $enabledKey = "plugin.{$pluginId}.enabled";
+            return SystemConfig::getBooleanValue($enabledKey);
+        } catch (\Throwable $e) {
+            // Config key doesn't exist - plugin is not enabled
+            // This prevents plugin issues from breaking the main application
+            return false;
+        }
+    }
+
+    /**
+     * Is a plugin currently quarantined?
+     *
+     * A plugin is quarantined when its load or boot threw, or when the
+     * boot-time registry sync detected that a previously-verified
+     * plugin is no longer in the approved allowlist (revoked upstream).
+     * Quarantine is a hard disable: even if `enabled=1`, a quarantined
+     * plugin does not load, boot, or register routes.
+     */
+    public static function isPluginQuarantined(string $pluginId): bool
+    {
+        try {
+            $reason = SystemConfig::getValue("plugin.{$pluginId}.quarantined");
+
+            return $reason !== '' && $reason !== null && $reason !== '0';
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Quarantine a plugin with a human-readable reason.
+     *
+     * Writes the reason to `plugin.{id}.quarantined`. The reason is
+     * surfaced in `getAllPlugins()` so the admin UI can render a
+     * banner explaining why the plugin is sidelined.
+     *
+     * This also unloads any already-loaded instance so the plugin
+     * immediately stops running in the current request.
+     */
+    public static function quarantinePlugin(string $pluginId, string $reason): void
+    {
+        try {
+            $reason = trim($reason);
+            if ($reason === '') {
+                $reason = 'Plugin was quarantined (no reason recorded).';
+            }
+            SystemConfig::setValue("plugin.{$pluginId}.quarantined", $reason);
+        } catch (\Throwable $e) {
+            LoggerUtils::getAppLogger()->error('Could not record quarantine', [
+                'plugin' => $pluginId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        unset(self::$loadedPlugins[$pluginId]);
+
+        LoggerUtils::getAppLogger()->warning('Plugin quarantined', [
+            'plugin' => $pluginId,
+            'reason' => $reason,
+        ]);
+    }
+
+    /**
+     * Clear a quarantine flag. The admin UI calls this once the
+     * admin has verified the plugin is safe to run again (e.g. after
+     * the upstream author shipped a fix that the maintainers
+     * re-approved).
+     */
+    public static function clearQuarantine(string $pluginId): void
+    {
+        try {
+            SystemConfig::setValue("plugin.{$pluginId}.quarantined", '');
+        } catch (\Throwable $e) {
+            LoggerUtils::getAppLogger()->warning('Could not clear quarantine', [
+                'plugin' => $pluginId,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Read the stored quarantine reason, or null if the plugin is not
+     * quarantined.
+     */
+    public static function getQuarantineReason(string $pluginId): ?string
+    {
+        if (!self::isPluginQuarantined($pluginId)) {
+            return null;
+        }
+        try {
+            $reason = SystemConfig::getValue("plugin.{$pluginId}.quarantined");
+
+            return is_string($reason) && $reason !== '' ? $reason : null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Compute the verification status of a plugin.
+     *
+     * Core plugins are always `verified`. Community plugins are
+     * `verified` iff their recorded provenance matches the current
+     * ApprovedPluginRegistry entry (same URL, same SHA-256). Anything
+     * else (no provenance recorded, provenance is for an unverified
+     * install, or registry entry changed out from under us) is
+     * `unverified`.
+     *
+     * @return array{verified: bool, source: string, reason: string|null}
+     */
+    public static function getVerificationStatus(string $pluginId): array
+    {
+        $metadata = self::$discoveredPlugins[$pluginId] ?? null;
+        if ($metadata !== null && $metadata->getType() === 'core') {
+            return ['verified' => true, 'source' => 'core', 'reason' => null];
+        }
+
+        // Explicit unverified flag takes precedence.
+        try {
+            if (SystemConfig::getValue("plugin.{$pluginId}.unverified") === '1') {
+                return [
+                    'verified' => false,
+                    'source' => 'unverified-url',
+                    'reason' => 'Installed from a URL that is not on the approved plugin list.',
+                ];
+            }
+        } catch (\Throwable $e) {
+            // fall through
+        }
+
+        // Compare recorded provenance against the current registry.
+        try {
+            $provenanceJson = SystemConfig::getValue("plugin.{$pluginId}.provenance");
+        } catch (\Throwable $e) {
+            $provenanceJson = '';
+        }
+
+        if (!is_string($provenanceJson) || $provenanceJson === '') {
+            return [
+                'verified' => false,
+                'source' => 'unknown',
+                'reason' => 'No install provenance recorded — plugin was copied in manually.',
+            ];
+        }
+
+        $provenance = json_decode($provenanceJson, true);
+        if (!is_array($provenance) || ($provenance['source'] ?? null) !== 'registry') {
+            return [
+                'verified' => false,
+                'source' => 'unknown',
+                'reason' => 'Plugin provenance is missing or malformed.',
+            ];
+        }
+
+        $entry = ApprovedPluginRegistry::find($pluginId);
+        if ($entry === null) {
+            return [
+                'verified' => false,
+                'source' => 'revoked',
+                'reason' => 'Plugin is no longer on the approved list. It may have been revoked for a security issue.',
+            ];
+        }
+
+        $sameUrl = hash_equals((string) $entry['downloadUrl'], (string) ($provenance['downloadUrl'] ?? ''));
+        $sameSha = hash_equals(strtolower((string) $entry['sha256']), strtolower((string) ($provenance['sha256'] ?? '')));
+        if (!$sameUrl || !$sameSha) {
+            return [
+                'verified' => false,
+                'source' => 'registry-drift',
+                'reason' => 'Installed copy does not match the current approved registry entry. Reinstall to update.',
+            ];
+        }
+
+        return ['verified' => true, 'source' => 'registry', 'reason' => null];
+    }
+
+    /**
+     * Enable a plugin.
+     *
+     * @throws \RuntimeException If dependencies are not met
+     */
+    public static function enablePlugin(string $pluginId): bool
+    {
+        $metadata = self::$discoveredPlugins[$pluginId] ?? null;
+        if ($metadata === null) {
+            throw new \RuntimeException("Plugin not found: $pluginId");
+        }
+
+        // A quarantined plugin must not be re-enabled until the admin
+        // explicitly clears the quarantine flag. This is the final gate
+        // between a broken/revoked plugin and core code.
+        if (self::isPluginQuarantined($pluginId)) {
+            throw new \RuntimeException(
+                "Plugin '$pluginId' is quarantined: " . (self::getQuarantineReason($pluginId) ?? 'unknown reason')
+            );
+        }
+
+        // Check dependencies
+        foreach ($metadata->getDependencies() as $depId) {
+            if (!self::isPluginActive($depId)) {
+                throw new \RuntimeException(
+                    "Plugin '$pluginId' requires '$depId' to be active"
+                );
+            }
+        }
+
+        // Check ChurchCRM version
+        $crmVersion = $_SESSION['sSoftwareInstalledVersion'] ?? '5.0.0';
+        if (version_compare($crmVersion, $metadata->getMinimumCRMVersion(), '<')) {
+            throw new \RuntimeException(
+                "Plugin '$pluginId' requires ChurchCRM {$metadata->getMinimumCRMVersion()} or higher"
+            );
+        }
+
+        // Load the plugin
+        $plugin = self::loadPlugin($pluginId);
+        if ($plugin === null) {
+            return false;
+        }
+
+        // Call activate hook
+        $plugin->activate();
+
+        // Save state to SystemConfig
+        $enabledKey = "plugin.{$pluginId}.enabled";
+        SystemConfig::setValue($enabledKey, '1');
+
+        LoggerUtils::getAppLogger()->info("Plugin enabled: $pluginId");
+
+        return true;
+    }
+
+    /**
+     * Disable a plugin.
+     *
+     * @throws \RuntimeException If plugin not found or if other plugins depend on this one
+     */
+    public static function disablePlugin(string $pluginId): bool
+    {
+        // Verify the plugin exists
+        $metadata = self::$discoveredPlugins[$pluginId] ?? null;
+        if ($metadata === null) {
+            throw new \RuntimeException("Plugin not found: $pluginId");
+        }
+
+        // Check if other plugins depend on this one
+        $dependents = self::getPluginDependents($pluginId);
+        if (!empty($dependents)) {
+            throw new \RuntimeException(
+                "Cannot disable '$pluginId': required by " . implode(', ', $dependents)
+            );
+        }
+
+        // Call deactivate hook
+        $plugin = self::$loadedPlugins[$pluginId] ?? null;
+        if ($plugin !== null) {
+            $plugin->deactivate();
+        }
+
+        // Remove from loaded plugins
+        unset(self::$loadedPlugins[$pluginId]);
+
+        // Save state to SystemConfig
+        $enabledKey = "plugin.{$pluginId}.enabled";
+        SystemConfig::setValue($enabledKey, '0');
+
+        LoggerUtils::getAppLogger()->info("Plugin disabled: $pluginId");
+
+        return true;
+    }
+
+    /**
+     * Get plugins that depend on the given plugin.
+     *
+     * @return string[] Plugin IDs that depend on $pluginId
+     */
+    public static function getPluginDependents(string $pluginId): array
+    {
+        $dependents = [];
+
+        foreach (self::$discoveredPlugins as $id => $metadata) {
+            if (self::isPluginActive($id) && in_array($pluginId, $metadata->getDependencies(), true)) {
+                $dependents[] = $id;
+            }
+        }
+
+        return $dependents;
+    }
+
+    /**
+     * Get a loaded plugin instance by ID.
+     */
+    public static function getPlugin(string $pluginId): ?PluginInterface
+    {
+        return self::$loadedPlugins[$pluginId] ?? null;
+    }
+
+    /**
+     * Get metadata for a discovered plugin.
+     */
+    public static function getPluginMetadata(string $pluginId): ?PluginMetadata
+    {
+        return self::$discoveredPlugins[$pluginId] ?? null;
+    }
+
+    /**
+     * Metadata of every discovered plugin, active or not.
+     *
+     * @return array<string, PluginMetadata>
+     */
+    public static function getDiscoveredPluginMetadata(): array
+    {
+        return self::$discoveredPlugins;
+    }
+
+    /**
+     * Get all discovered plugins with their status.
+     *
+     * @return array<int, array{
+     *     id: string,
+     *     name: string,
+     *     description: string,
+     *     version: string,
+     *     author: string,
+     *     type: string,
+     *     isActive: bool,
+     *     isConfigured: bool,
+     *     settingsUrl: ?string
+     * }>
+     */
+    public static function getAllPlugins(): array
+    {
+        $result = [];
+
+        foreach (self::$discoveredPlugins as $id => $metadata) {
+            try {
+                $plugin = self::$loadedPlugins[$id] ?? null;
+                $isActive = self::isPluginActive($id);
+                $configError = $plugin?->getConfigurationError();
+                $verification = self::getVerificationStatus($id);
+                $quarantineReason = self::getQuarantineReason($id);
+                $registryEntry = $metadata->getType() === 'community'
+                    ? ApprovedPluginRegistry::find($id)
+                    : null;
+
+                $result[] = [
+                    'id' => $id,
+                    'name' => $metadata->getName(),
+                    'description' => $metadata->getDescription(),
+                    'version' => $metadata->getVersion(),
+                    'author' => $metadata->getAuthor(),
+                    'authorUrl' => $metadata->getAuthorUrl(),
+                    'type' => $metadata->getType(),
+                    'isActive' => $isActive,
+                    'isConfigured' => $plugin?->isConfigured() ?? false,
+                    'settingsUrl' => $metadata->getSettingsUrl(),
+                    'settings' => self::getPluginSettingsWithValues($id),
+                    'help' => $plugin?->getHelp() ?? $metadata->getHelp(),
+                    'hasTest' => $metadata->hasTest(),
+                    'hasError' => $configError !== null,
+                    'errorMessage' => $configError,
+                    // Verification + quarantine fields.
+                    'verified' => $verification['verified'],
+                    'verificationSource' => $verification['source'],
+                    'verificationReason' => $verification['reason'],
+                    'quarantined' => $quarantineReason !== null,
+                    'quarantineReason' => $quarantineReason,
+                    // Risk/permissions from the approved registry (null
+                    // for core plugins and unverified community ones).
+                    'risk' => $registryEntry['risk'] ?? null,
+                    'riskSummary' => $registryEntry['riskSummary'] ?? null,
+                    'permissions' => $registryEntry['permissions'] ?? null,
+                    // Admin-only: can this entry be deleted from disk?
+                    'canUninstall' => $metadata->getType() === 'community',
+                ];
+            } catch (\Throwable $e) {
+                // Plugin has an error - still show it in the list but mark as errored
+                LoggerUtils::getAppLogger()->warning(
+                    "Error loading plugin info: $id",
+                    ['error' => $e->getMessage()]
+                );
+
+                $result[] = [
+                    'id' => $id,
+                    'name' => $metadata->getName() ?? $id,
+                    'description' => $metadata->getDescription() ?? '',
+                    'version' => $metadata->getVersion() ?? 'unknown',
+                    'author' => $metadata->getAuthor() ?? 'Unknown',
+                    'authorUrl' => null,
+                    'type' => $metadata->getType() ?? 'community',
+                    'isActive' => false,
+                    'isConfigured' => false,
+                    'settingsUrl' => null,
+                    'hasError' => true,
+                    'errorMessage' => $e->getMessage(),
+                    'verified' => false,
+                    'verificationSource' => 'error',
+                    'verificationReason' => $e->getMessage(),
+                    'quarantined' => false,
+                    'quarantineReason' => null,
+                    'risk' => null,
+                    'riskSummary' => null,
+                    'permissions' => null,
+                    'canUninstall' => ($metadata->getType() ?? 'community') === 'community',
+                ];
+            }
+        }
+
+        // Sort: core plugins first, then by name
+        usort($result, function ($a, $b) {
+            if ($a['type'] !== $b['type']) {
+                return $a['type'] === 'core' ? -1 : 1;
+            }
+
+            return strcasecmp($a['name'], $b['name']);
+        });
+
+        return $result;
+    }
+
+    /**
+     * Get all active plugin instances.
+     *
+     * @return array<string, PluginInterface>
+     */
+    public static function getActivePlugins(): array
+    {
+        return self::$loadedPlugins;
+    }
+
+    /**
+     * Returns true if at least one discovered plugin is enabled.
+     * Uses isPluginActive() directly (config key read only) to avoid
+     * the exception-swallowing in getAllPlugins().
+     *
+     * IMPORTANT: Requires init() to have been called first. If the plugin
+     * system has not been initialized, $discoveredPlugins will be empty and
+     * this method will return false (with a debug log).
+     */
+    public static function hasAnyActivePlugin(): bool
+    {
+        if (!self::$initialized) {
+            LoggerUtils::getAppLogger()->debug(
+                'hasAnyActivePlugin() called before PluginManager::init() — returning false'
+            );
+            return false;
+        }
+
+        foreach (array_keys(self::$discoveredPlugins) as $pluginId) {
+            if (self::isPluginActive($pluginId)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Get the plugins base path.
+     */
+    public static function getPluginsPath(): string
+    {
+        return self::$pluginsPath;
+    }
+
+    /**
+     * Reset the plugin manager to its initial state.
+     */
+    public static function reset(): void
+    {
+        self::$discoveredPlugins = [];
+        self::$loadedPlugins = [];
+        self::$initialized = false;
+    }
+
+    /**
+     * Get plugin settings with current values from SystemConfig.
+     *
+     * Maps plugin setting keys to their corresponding SystemConfig keys.
+     * Password fields are masked to prevent leaking sensitive data in HTML.
+     */
+    public static function getPluginSettingsWithValues(string $pluginId): array
+    {
+        $metadata = self::$discoveredPlugins[$pluginId] ?? null;
+        if ($metadata === null) {
+            return [];
+        }
+
+        // Mapping of plugin setting keys to SystemConfig keys
+        $configKeyMap = self::getPluginConfigKeyMap($pluginId);
+
+        $settings = [];
+        foreach ($metadata->getSettings() as $setting) {
+            $settingKey = $setting['key'] ?? '';
+            $settingType = $setting['type'] ?? 'text';
+            $configKey = $configKeyMap[$settingKey] ?? null;
+
+            $currentValue = '';
+            $hasValue = false;
+            if ($configKey !== null) {
+                $currentValue = SystemConfig::getValue($configKey) ?? '';
+                $hasValue = !empty($currentValue);
+            }
+
+            // For password fields, don't expose the actual value in HTML
+            // Instead, indicate whether a value is set
+            if ($settingType === 'password' && $hasValue) {
+                $currentValue = ''; // Don't send password to client
+            }
+
+            $settings[] = array_merge($setting, [
+                'configKey' => $configKey,
+                'value' => $currentValue,
+                'hasValue' => $hasValue, // For password fields to show "configured" state
+            ]);
+        }
+
+        return $settings;
+    }
+
+    /**
+     * Get the mapping of plugin setting keys to SystemConfig keys.
+     *
+     * All plugin config keys use the format: plugin.{pluginId}.{settingKey}
+     * This method dynamically generates the mapping based on the plugin's settings schema.
+     */
+    private static function getPluginConfigKeyMap(string $pluginId): array
+    {
+        $metadata = self::$discoveredPlugins[$pluginId] ?? null;
+        if ($metadata === null) {
+            return [];
+        }
+
+        $map = [];
+        foreach ($metadata->getSettings() as $setting) {
+            $key = $setting['key'] ?? '';
+            if (!empty($key)) {
+                // Generate the SystemConfig key using plugin prefix
+                $map[$key] = "plugin.{$pluginId}.{$key}";
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Update a plugin setting value in SystemConfig.
+     *
+     * The setting key is automatically prefixed with plugin.{pluginId}.
+     */
+    public static function updatePluginSetting(string $pluginId, string $settingKey, string $value): bool
+    {
+        // Generate the full config key
+        $configKey = "plugin.{$pluginId}.{$settingKey}";
+
+        try {
+            SystemConfig::setValue($configKey, $value);
+            LoggerUtils::getAppLogger()->debug(
+                "Updated plugin setting: $pluginId.$settingKey",
+                ['configKey' => $configKey]
+            );
+            return true;
+        } catch (\Throwable $e) {
+            LoggerUtils::getAppLogger()->error(
+                "Failed to update plugin setting: $pluginId.$settingKey",
+                ['error' => $e->getMessage()]
+            );
+            return false;
+        }
+    }
+
+    // =========================================================================
+    // Head/Footer Content Injection
+    // =========================================================================
+
+    /**
+     * Get combined head content from all active plugins.
+     *
+     * Called by Header.php to inject plugin content into <head>.
+     *
+     * @return string Combined HTML/JS content from all active plugins
+     */
+    public static function getPluginHeadContent(): string
+    {
+        $content = '';
+
+        foreach (self::$loadedPlugins as $plugin) {
+            try {
+                $pluginContent = $plugin->getHeadContent();
+                if (!empty($pluginContent)) {
+                    $content .= "\n<!-- Plugin: {$plugin->getId()} -->\n";
+                    $content .= $pluginContent;
+                }
+            } catch (\Throwable $e) {
+                LoggerUtils::getAppLogger()->error(
+                    "Error getting head content from plugin: {$plugin->getId()}",
+                    ['error' => $e->getMessage()]
+                );
+            }
+        }
+
+        return $content;
+    }
+
+    /**
+     * Get combined footer content from all active plugins.
+     *
+     * Called by Footer.php to inject plugin content before </body>.
+     *
+     * @return string Combined HTML/JS content from all active plugins
+     */
+    public static function getPluginFooterContent(): string
+    {
+        $content = '';
+
+        foreach (self::$loadedPlugins as $plugin) {
+            try {
+                $pluginContent = $plugin->getFooterContent();
+                if (!empty($pluginContent)) {
+                    $content .= "\n<!-- Plugin: {$plugin->getId()} -->\n";
+                    $content .= $pluginContent;
+                }
+            } catch (\Throwable $e) {
+                LoggerUtils::getAppLogger()->error(
+                    "Error getting footer content from plugin: {$plugin->getId()}",
+                    ['error' => $e->getMessage()]
+                );
+            }
+        }
+
+        return $content;
+    }
+
+    /**
+     * Get combined client-side configuration from all active plugins.
+     *
+     * Called by Header.php to expose plugin configs to JavaScript via window.CRM.plugins
+     * Each plugin's getClientConfig() return value is included under its plugin ID key.
+     *
+     * Example output:
+     *   ['gravatar' => ['enabled' => true, 'defaultImage' => 'mp'], 'analytics' => ['trackingId' => 'G-XXX']]
+     *
+     * @return array<string, array> Plugin configs keyed by plugin ID
+     */
+    public static function getPluginsClientConfig(): array
+    {
+        $configs = [];
+
+        foreach (self::$loadedPlugins as $pluginId => $plugin) {
+            try {
+                $config = $plugin->getClientConfig();
+                if (!empty($config)) {
+                    $configs[$pluginId] = $config;
+                }
+            } catch (\Throwable $e) {
+                LoggerUtils::getAppLogger()->error(
+                    "Error getting client config from plugin: {$pluginId}",
+                    ['error' => $e->getMessage()]
+                );
+            }
+        }
+
+        // Merge in plugin-local i18next resources for the current user
+        // locale. Plugins that do not ship translations contribute nothing.
+        // Resources end up at window.CRM.plugins.{pluginId}.i18n — the
+        // frontend does NOT need any changes to locale-loader.js.
+        try {
+            $localeInfo = \ChurchCRM\Bootstrapper::getCurrentLocale();
+            $currentLocale = $localeInfo->getLocale() ?: 'en_US';
+        } catch (\Throwable $e) {
+            $currentLocale = 'en_US';
+        }
+
+        $activeMetadata = [];
+        foreach (self::$loadedPlugins as $pluginId => $_plugin) {
+            if (isset(self::$discoveredPlugins[$pluginId])) {
+                $activeMetadata[$pluginId] = self::$discoveredPlugins[$pluginId];
+            }
+        }
+        $i18nResources = PluginLocalization::collectJsResources($activeMetadata, $currentLocale);
+        foreach ($i18nResources as $pluginId => $strings) {
+            if (!isset($configs[$pluginId]) || !is_array($configs[$pluginId])) {
+                $configs[$pluginId] = [];
+            }
+            $configs[$pluginId]['i18n'] = $strings;
+        }
+
+        return $configs;
+    }
+
+    /**
+     * Get combined menu items from all active plugins.
+     *
+     * Collects menu items from all active plugins that have getMenuItems() defined.
+     * Returns items grouped by their parent menu key.
+     *
+     * @return array<string, array<int, array{label: string, url: string, icon?: string, permission?: string}>>
+     *               Menu items grouped by parent menu key (e.g., 'email', 'admin')
+     */
+    public static function getPluginMenuItems(): array
+    {
+        $menuItems = [];
+
+        foreach (self::$loadedPlugins as $pluginId => $plugin) {
+            try {
+                $items = $plugin->getMenuItems();
+                if (!empty($items)) {
+                    foreach ($items as $item) {
+                        $parent = strtolower($item['parent'] ?? 'custom');
+                        if (!isset($menuItems[$parent])) {
+                            $menuItems[$parent] = [];
+                        }
+                        $menuItems[$parent][] = $item;
+                    }
+                }
+            } catch (\Throwable $e) {
+                LoggerUtils::getAppLogger()->error(
+                    "Error getting menu items from plugin: {$pluginId}",
+                    ['error' => $e->getMessage()]
+                );
+            }
+        }
+
+        return $menuItems;
+    }
+
+    /**
+     * The Member Portal nav items of the active plugins (member sign-in design
+     * §8.5), each with a root-path URL and an id. Items without a label, a
+     * capability or a `/portal/` URL are dropped.
+     *
+     * @return array<int, array{id: string, label: string, url: string, icon: string, capability: string}>
+     */
+    public static function getPortalNavItems(): array
+    {
+        $items = [];
+        foreach (self::$loadedPlugins as $pluginId => $plugin) {
+            try {
+                foreach (array_values($plugin->getPortalNavItems()) as $index => $item) {
+                    $label = $item['label'] ?? null;
+                    $url = $item['url'] ?? null;
+                    $capability = $item['capability'] ?? null;
+                    if (!is_string($label) || $label === '' || !is_string($capability) || $capability === '' || !is_string($url) || !str_starts_with($url, '/portal/')) {
+                        continue;
+                    }
+                    $items[] = [
+                        'id' => is_string($item['id'] ?? null) ? $item['id'] : 'plugin.' . $pluginId . '.' . $index,
+                        'label' => $label,
+                        'url' => SystemURLs::getRootPath() . $url,
+                        'icon' => is_string($item['icon'] ?? null) ? $item['icon'] : 'fa-solid fa-puzzle-piece',
+                        'capability' => $capability,
+                    ];
+                }
+            } catch (\Throwable $e) {
+                LoggerUtils::getAppLogger()->error("Error getting portal nav items from plugin: {$pluginId}", [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return $items;
+    }
+
+    /**
+     * Mount the `portalRoutesFile` of every active plugin under
+     * `{group}/plugins/{id}` (member sign-in design §8.5). The file is included
+     * with `$routes` (a `PortalPluginRoutes` for that sub-group, so every route
+     * names its capability), `$portalArea` (PORTAL_PAGES or PORTAL_API) and
+     * `$plugin`, once for the portal pages and once for its API.
+     */
+    public static function registerPortalRoutes(RouteCollectorProxy $group, string $portalArea): void
+    {
+        foreach (self::$loadedPlugins as $pluginId => $plugin) {
+            $metadata = self::$discoveredPlugins[$pluginId] ?? null;
+            $routesFile = $metadata?->getPortalRoutesFile();
+            if ($routesFile === null || $routesFile === '') {
+                continue;
+            }
+
+            $pluginPath = realpath($metadata->getPath());
+            $routesPath = realpath($metadata->getPath() . '/' . $routesFile);
+            if ($pluginPath === false || $routesPath === false || !str_starts_with($routesPath, $pluginPath . DIRECTORY_SEPARATOR)) {
+                LoggerUtils::getAppLogger()->warning('Plugin portal routes file not found', ['plugin' => $pluginId]);
+                continue;
+            }
+
+            try {
+                $group->group('/plugins/' . $pluginId, function (RouteCollectorProxy $group) use ($routesPath, $portalArea, $plugin): void {
+                    self::includePortalRoutes($routesPath, new PortalPluginRoutes($group), $portalArea, $plugin);
+                });
+            } catch (\Throwable $e) {
+                LoggerUtils::getAppLogger()->error("Error loading plugin portal routes: $pluginId", ['error' => $e->getMessage()]);
+            }
+        }
+    }
+
+    /** The routes file sees only these three variables, never the raw route group. */
+    private static function includePortalRoutes(string $routesPath, PortalPluginRoutes $routes, string $portalArea, PluginInterface $plugin): void
+    {
+        require $routesPath;
+    }
+
+    /**
+     * Register routes for all active plugins that have a routesFile.
+     *
+     * This should be called after the Slim app is created and before $app->run().
+     * The routes file will receive the $app variable in its scope.
+     *
+     * @param mixed $app The Slim application instance
+     */
+    public static function registerPluginRoutes($app): void
+    {
+        foreach (self::$loadedPlugins as $pluginId => $plugin) {
+            try {
+                $metadata = self::$discoveredPlugins[$pluginId] ?? null;
+                if ($metadata === null) {
+                    continue;
+                }
+
+                $routesFile = $metadata->getRoutesFile();
+                if (empty($routesFile)) {
+                    continue;
+                }
+
+                $routesPath = $metadata->getPath() . '/' . $routesFile;
+                if (!file_exists($routesPath)) {
+                    LoggerUtils::getAppLogger()->warning(
+                        "Plugin routes file not found: $routesPath",
+                        ['plugin' => $pluginId]
+                    );
+                    continue;
+                }
+
+                // Include the routes file - it has access to $app
+                require $routesPath;
+
+                LoggerUtils::getAppLogger()->debug(
+                    "Loaded plugin routes: $pluginId",
+                    ['routesFile' => $routesFile]
+                );
+            } catch (\Throwable $e) {
+                LoggerUtils::getAppLogger()->error(
+                    "Error loading plugin routes: $pluginId",
+                    ['error' => $e->getMessage()]
+                );
+            }
+        }
+    }
+}

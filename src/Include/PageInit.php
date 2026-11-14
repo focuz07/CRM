@@ -1,0 +1,117 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\Cart;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Plugin\PluginManager;
+use ChurchCRM\Service\PersonService;
+use ChurchCRM\Service\SystemService;
+use ChurchCRM\Utils\FunctionsUtils;
+use ChurchCRM\Utils\RedirectUtils;
+
+
+$personService = new PersonService();
+$systemService = new SystemService();
+
+// Basic security checks:
+if (empty($bSuppressSessionTests)) {  // This is used for the login page only.
+    AuthenticationManager::ensureAuthentication();
+
+    // Confine EditSelf-only users to the Member Portal — every legacy page is
+    // part of the admin shell, which a self-service account never sees (#9863).
+    // Zero-permission users are NOT blocked here — they keep read-only access to
+    // people and family records (read-default policy, #9003). Writes are denied
+    // by the per-page permission guards.
+    $currentUser = AuthenticationManager::getCurrentUser();
+    if ($currentUser->isEditSelfExclusive()) {
+        RedirectUtils::redirect(SystemURLs::getRootPath() . '/portal/');
+    }
+
+    // Boot plugins early so hook listeners are registered before any ORM saves.
+    // Legacy pages process form submissions before including Header.php, so without
+    // this the PERSON_CREATED / FAMILY_CREATED hooks never fire on those pages.
+    // PluginManager::init() is idempotent — Header.php's later call is a no-op.
+    PluginManager::init(SystemURLs::getDocumentRoot() . '/plugins');
+}
+
+$sGlobalMessageClass = 'success';
+
+// Handle session-based messages (from redirects)
+if (isset($_SESSION['sGlobalMessage'])) {
+    $sGlobalMessage = $_SESSION['sGlobalMessage'];
+    $sGlobalMessageClass = $_SESSION['sGlobalMessageClass'] ?? 'success';
+    unset($_SESSION['sGlobalMessage']);
+    unset($_SESSION['sGlobalMessageClass']);
+}
+
+if (isset($_GET['PDFEmailed'])) {
+    if ($_GET['PDFEmailed'] == 1) {
+        $sGlobalMessage = gettext('Verification email sent to family members.');
+        $sGlobalMessageClass = 'success';
+    } else {
+        $sGlobalMessage = gettext('Failed to email PDF to family members.');
+        $sGlobalMessageClass = 'danger';
+    }
+}
+
+// Are they adding an entire group to the cart?
+// Note: AddGroupToPeopleCart is legacy - cart now managed through API routes
+if (isset($_GET['AddGroupToPeopleCart'])) {
+    $sGlobalMessage = gettext('Group successfully added to the Cart.');
+    $sGlobalMessageClass = 'success';
+}
+
+// Are they removing an entire group from the Cart?
+// Note: RemoveGroupFromPeopleCart is legacy - cart now managed through API routes
+if (isset($_GET['RemoveGroupFromPeopleCart'])) {
+    $sGlobalMessage = gettext('Group successfully removed from the Cart.');
+    $sGlobalMessageClass = 'success';
+}
+
+// Are they removing a person from the Cart?
+// Note: RemoveFromPeopleCart is legacy - cart now managed through API routes
+if (isset($_GET['RemoveFromPeopleCart'])) {
+    $sGlobalMessage = gettext('Selected record successfully removed from the Cart.');
+    $sGlobalMessageClass = 'success';
+}
+
+if (isset($_POST['BulkAddToCart'])) {
+    $aItemsToProcess = explode(',', $_POST['BulkAddToCart']);
+
+    if (isset($_POST['AndToCartSubmit'])) {
+        if (isset($_SESSION['aPeopleCart'])) {
+            $_SESSION['aPeopleCart'] = array_intersect($_SESSION['aPeopleCart'], $aItemsToProcess);
+        }
+    } elseif (isset($_POST['NotToCartSubmit'])) {
+        if (isset($_SESSION['aPeopleCart'])) {
+            $_SESSION['aPeopleCart'] = array_diff($_SESSION['aPeopleCart'], $aItemsToProcess);
+        }
+    } else {
+        for ($iCount = 0; $iCount < count($aItemsToProcess); $iCount++) {
+            Cart::addPerson(str_replace(',', '', $aItemsToProcess[$iCount]));
+        }
+        $sGlobalMessage = sprintf(ngettext('%d Person added to the Cart.', '%d People added to the Cart.', $iCount), $iCount);
+        $sGlobalMessageClass = 'success';
+    }
+}
+
+//
+// Global function shim — delegates to FunctionsUtils::runQuery().
+// Legacy pages call RunQuery() directly; actual implementation lives in the Utils class.
+// Call sites can be updated over time to use FunctionsUtils::runQuery() directly.
+//
+function RunQuery(string $sSQL, bool $bStopOnError = true)
+{
+    return FunctionsUtils::runQuery($sSQL, $bStopOnError);
+}
+
+//
+// Global function shim for parameterized prepared statements.
+// Use in place of RunQuery() when user-supplied values must be bound as parameters
+// rather than string-concatenated into the SQL. Returns a mysqli_result for SELECTs
+// and true for write queries, preserving compatibility with mysqli_fetch_array().
+//
+function RunPreparedQuery(string $sSQL, string $types = '', array $params = [], bool $bStopOnError = true)
+{
+    return FunctionsUtils::runPreparedQuery($sSQL, $types, $params, $bStopOnError);
+}

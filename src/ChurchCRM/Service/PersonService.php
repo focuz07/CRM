@@ -1,0 +1,538 @@
+<?php
+
+namespace ChurchCRM\Service;
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\model\ChurchCRM\FamilyQuery;
+use ChurchCRM\model\ChurchCRM\ListOptionQuery;
+use ChurchCRM\model\ChurchCRM\GroupQuery;
+use ChurchCRM\model\ChurchCRM\Person;
+use ChurchCRM\model\ChurchCRM\Person2group2roleP2g2rQuery;
+use ChurchCRM\model\ChurchCRM\PersonQuery;
+use ChurchCRM\model\ChurchCRM\PersonVolunteerOpportunity;
+use ChurchCRM\model\ChurchCRM\PersonVolunteerOpportunityQuery;
+use ChurchCRM\model\ChurchCRM\RecordPropertyQuery;
+use ChurchCRM\model\ChurchCRM\UserQuery;
+use Propel\Runtime\ActiveQuery\Criteria;
+
+class PersonService
+{
+    /** @var array<int, string>|null */
+    private static ?array $loginDeletionBlockedReasons = null;
+
+    /**
+     * Reasons the signed-in user may not delete each person who has a login, keyed by person ID.
+     * People without a login, or whom the user may delete, are absent.
+     *
+     * @return array<int, string>
+     */
+    public static function getLoginDeletionBlockedReasons(): array
+    {
+        if (self::$loginDeletionBlockedReasons !== null) {
+            return self::$loginDeletionBlockedReasons;
+        }
+
+        if (!AuthenticationManager::getCurrentUser()->isDeleteRecordsEnabled()) {
+            return self::$loginDeletionBlockedReasons = [];
+        }
+
+        $personIds = [];
+        foreach (UserQuery::create()->find() as $user) {
+            $personIds[] = $user->getPersonId();
+        }
+
+        $reasons = [];
+        if ($personIds !== []) {
+            foreach (PersonQuery::create()->filterById($personIds)->find() as $person) {
+                $reason = $person->getLoginDeletionBlockedReason();
+                if ($reason !== null) {
+                    $reasons[(int) $person->getId()] = $reason;
+                }
+            }
+        }
+
+        return self::$loginDeletionBlockedReasons = $reasons;
+    }
+
+    /**
+     * @return array<mixed, array<'address'|'displayName'|'familyID'|'familyRole'|'firstName'|'id'|'lastName'|'role'|'photoURI'|'title'|'uri', mixed>>
+     */
+    /**
+     * Self-registered people reviewed on their own: individuals from the public form
+     * and people a member proposed for their existing family in the Member Portal
+     * (#9865). Members of a self-registered family are reviewed with that family.
+     */
+    public static function selfRegisteredPersonQuery(): PersonQuery
+    {
+        $query = PersonQuery::create()->filterByEnteredBy(Person::SELF_REGISTER);
+        $selfRegisteredFamilyIds = FamilyQuery::create()
+            ->filterByEnteredBy(Person::SELF_REGISTER)
+            ->select('Id')
+            ->find()
+            ->getData();
+        if ($selfRegisteredFamilyIds !== []) {
+            $query->filterByFamId($selfRegisteredFamilyIds, Criteria::NOT_IN);
+        }
+
+        return $query;
+    }
+
+    public function search(string $searchTerm, bool $includeFamilyRole = true): array
+    {
+        $searchLikeString = '%' . $searchTerm . '%';
+        $people = PersonQuery::create()
+            ->filterByFirstName($searchLikeString, Criteria::LIKE)
+            ->_or()->filterByMiddleName($searchLikeString, Criteria::LIKE)
+            ->_or()->filterByLastName($searchLikeString, Criteria::LIKE)
+            ->_or()->filterByEmail($searchLikeString, Criteria::LIKE)
+            ->limit(15)->find();
+        $return = [];
+        foreach ($people as $person) {
+            $values['id'] = $person->getId();
+            $values['familyID'] = $person->getFamId();
+            $values['firstName'] = $person->getFirstName();
+            $values['lastName'] = $person->getLastName();
+            $values['displayName'] = $person->getFullName();
+            $values['uri'] = $person->getViewURI();
+            $values['photoURI'] = $person->getPhoto()->getPhotoURI();
+            $values['title'] = $person->getTitle();
+            $values['address'] = $person->getAddress();
+            $values['role'] = $person->getFamilyRoleName();
+
+            if ($includeFamilyRole) {
+                $familyRole = '(';
+                if ($values['familyID']) {
+                    $roleText = $person->getFamilyRole() ? $person->getFamilyRoleName() : gettext('Part');
+                    $familyLink = '<a href="people/family/' . $values['familyID'] . '">' . $person->getFamily()->getName() . '</a>';
+                    $familyRole .= sprintf(gettext('%1$s of the %2$s family'), $roleText, $familyLink) . ' )';
+                } else {
+                    $familyRole = gettext('(No assigned family)');
+                }
+                $values['familyRole'] = $familyRole;
+            }
+            $return[] = $values;
+        }
+
+        return $return;
+    }
+
+    /**
+     * @return array<mixed, array<int|string, mixed>>
+     */
+    public function getPeopleEmailsAndGroups(): array
+    {
+        // Step 1: Load people with emails and their group memberships.
+        // Use LEFT JOIN so that people with an email but no group memberships are NOT silently
+        // excluded (an INNER JOIN would drop them).
+        // Group is NOT a direct relation of Person (it goes through Person2group2roleP2g2r),
+        // so it cannot be joined here; groups are batch-loaded separately below.
+        $people = PersonQuery::create()
+            ->filterByEmail('', Criteria::NOT_EQUAL)
+            ->leftJoinWithPerson2group2roleP2g2r()
+            ->orderById()
+            ->distinct()
+            ->find();
+
+        // Step 2: Collect all group IDs referenced by any membership.
+        $allGroupIds = [];
+        foreach ($people as $person) {
+            foreach ($person->getPerson2group2roleP2g2rs() as $membership) {
+                $gid = $membership->getGroupId();
+                if ($gid !== null && $gid > 0) {
+                    $allGroupIds[$gid] = true;
+                }
+            }
+        }
+
+        // Step 3: Batch-load all needed Group rows (single query — avoids N+1 on getGroup() calls).
+        $groupMap = [];
+        if (!empty($allGroupIds)) {
+            $groups = GroupQuery::create()->findPks(array_keys($allGroupIds));
+            foreach ($groups as $g) {
+                $groupMap[$g->getId()] = $g;
+            }
+        }
+
+        // Step 4: Collect all unique (listId, optionId) pairs needed for role names.
+        $roleLookupsNeeded = [];
+        foreach ($people as $person) {
+            foreach ($person->getPerson2group2roleP2g2rs() as $membership) {
+                $group = $groupMap[$membership->getGroupId()] ?? null;
+                if ($group !== null) {
+                    $listId = $group->getRoleListId();
+                    $optionId = $membership->getRoleId();
+                    if (!isset($roleLookupsNeeded[$listId])) {
+                        $roleLookupsNeeded[$listId] = [];
+                    }
+                    $roleLookupsNeeded[$listId][$optionId] = true;
+                }
+            }
+        }
+
+        // Batch-load all ListOption rows needed for role names: [listId][optionId] => optionName
+        $roleNameMap = [];
+        if (!empty($roleLookupsNeeded)) {
+            foreach ($roleLookupsNeeded as $listId => $optionIds) {
+                $optionIdArray = array_keys($optionIds);
+                $roles = ListOptionQuery::create()
+                    ->filterById($listId)
+                    ->filterByOptionId($optionIdArray)
+                    ->find();
+
+                if (!isset($roleNameMap[$listId])) {
+                    $roleNameMap[$listId] = [];
+                }
+                foreach ($roles as $role) {
+                    $roleNameMap[$listId][$role->getOptionId()] = $role->getOptionName();
+                }
+            }
+        }
+
+        // Build result using pre-loaded data (no N+1 queries)
+        $result = [];
+        $processedPersonIds = [];
+        foreach ($people as $person) {
+            $personId = $person->getId();
+            if (isset($processedPersonIds[$personId])) {
+                continue;
+            }
+            $processedPersonIds[$personId] = true;
+
+            $personData = [
+                'id' => $personId,
+                'email' => $person->getEmail(),
+                'firstName' => $person->getFirstName(),
+                'lastName' => $person->getLastName(),
+            ];
+
+            foreach ($person->getPerson2group2roleP2g2rs() as $membership) {
+                $group = $groupMap[$membership->getGroupId()] ?? null;
+                if ($group !== null) {
+                    $listId = $group->getRoleListId();
+                    $optionId = $membership->getRoleId();
+                    $roleName = $roleNameMap[$listId][$optionId] ?? '';
+                    $personData[$group->getName()] = $roleName;
+                }
+            }
+
+            $result[] = $personData;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Build the set of person IDs that should be excluded from mailing lists
+     * because the configured "Do Not Email" property is assigned to them.
+     *
+     * @param int[] $personIds Optional subset of person IDs to check (for efficiency).
+     *                         When empty, checks all records for the property.
+     * @return array<int, true> Map of personId → true
+     */
+    public function buildDoNotEmailSet(array $personIds = []): array
+    {
+        $propId = (int) SystemConfig::getValue('iDoNotEmailPropertyId');
+        if ($propId <= 0) {
+            return [];
+        }
+        $query = RecordPropertyQuery::create()->filterByPropertyId($propId);
+        if (!empty($personIds)) {
+            $query->filterByRecordId($personIds);
+        }
+        $set = [];
+        foreach ($query->find() as $r) {
+            $set[(int) $r->getRecordId()] = true;
+        }
+        return $set;
+    }
+
+    /**
+     * Returns mailing email lists for all active-family people, grouped by classification role.
+     * Respects the iDoNotEmailPropertyId exclusion setting.
+     *
+     * Member recipients only. The church default address (sToEmailAddress) is a system
+     * setting handled by the composer at render time, not returned here.
+     *
+     * `recipients` carries the person id and name next to each address so the composer can
+     * send by id (POST /api/email/send) instead of by address.
+     *
+     * @return array{emails: string[], byRole: array<string, string[]>, recipients: list<array{personId: int, familyId: null, name: string, email: string}>}
+     */
+    public function getMailingEmails(): array
+    {
+        $doNotEmailSet = $this->buildDoNotEmailSet();
+
+        $roleNameMap = [];
+        foreach (ListOptionQuery::create()->filterById(1)->find() as $opt) {
+            $roleNameMap[(int) $opt->getOptionId()] = $opt->getOptionName();
+        }
+
+        $persons = PersonQuery::create()
+            ->filterByFamId(null, Criteria::ISNOTNULL)
+            ->filterByFamId(0, Criteria::NOT_EQUAL)
+            ->leftJoinWithFamily()
+            ->useQuery('Family')
+                ->filterByDateDeactivated(null)
+            ->endUse()
+            ->filterByLiving()
+            ->filterByEmail('', Criteria::NOT_EQUAL)
+            ->find();
+
+        $emails = [];
+        $byRole = [];
+        $recipients = [];
+        $emailsSeen = [];
+
+        foreach ($persons as $person) {
+            if (isset($doNotEmailSet[(int) $person->getId()])) {
+                continue;
+            }
+            $email = trim((string) $person->getEmail());
+            if ($email === '' || isset($emailsSeen[strtolower($email)])) {
+                continue;
+            }
+            $emailsSeen[strtolower($email)] = true;
+            $emails[] = $email;
+            $recipients[] = self::mailingRecipient($person, $email);
+
+            $roleName = $roleNameMap[(int) $person->getClsId()] ?? gettext('Member');
+            $byRole[$roleName][] = $email;
+        }
+
+        return ['emails' => $emails, 'byRole' => $byRole, 'recipients' => $recipients];
+    }
+
+    /**
+     * One entry of the `recipients` array returned by the mailing-list methods.
+     *
+     * @return array{personId: int, familyId: null, name: string, email: string}
+     */
+    public static function mailingRecipient(Person $person, string $email): array
+    {
+        return [
+            'personId' => (int) $person->getId(),
+            'familyId' => null,
+            'name'     => $person->getFullName(),
+            'email'    => $email,
+        ];
+    }
+
+    /**
+     * Returns mailing email addresses for all members of a specific group,
+     * grouped by their group role.
+     * Respects the iDoNotEmailPropertyId exclusion setting.
+     *
+     * Member recipients only. The church default address (sToEmailAddress) is a system
+     * setting handled by the composer at render time, not returned here.
+     *
+     * @param \ChurchCRM\model\ChurchCRM\Group $group The Group object (already loaded by GroupMiddleware)
+     * @return array{emails: string[], byRole: array<string, string[]>, recipients: list<array{personId: int, familyId: null, name: string, email: string}>}
+     */
+    public function getGroupMailingEmails(\ChurchCRM\model\ChurchCRM\Group $group): array
+    {
+        $groupId = (int) $group->getId();
+        $memberships = Person2group2roleP2g2rQuery::create()
+            ->filterByGroupId($groupId)
+            ->innerJoinWithPerson()
+            ->find();
+
+        $personIds = [];
+        foreach ($memberships as $m) {
+            $person = $m->getPerson();
+            if ($person !== null) {
+                $personIds[] = (int) $person->getId();
+            }
+        }
+
+        // Short-circuit: no members → nothing to exclude (avoids a full RecordProperty scan)
+        $doNotEmailSet = $personIds !== [] ? $this->buildDoNotEmailSet($personIds) : [];
+
+        // Build role name map from the already-loaded Group (avoids an extra DB query)
+        $roleNameMap = [];
+        foreach (ListOptionQuery::create()->filterById((int) $group->getRoleListId())->find() as $opt) {
+            $roleNameMap[(int) $opt->getOptionId()] = $opt->getOptionName();
+        }
+
+        $emails = [];
+        $byRole = [];
+        $recipients = [];
+        $emailsSeen = [];
+
+        foreach ($memberships as $membership) {
+            $person = $membership->getPerson();
+            if ($person === null) {
+                continue;
+            }
+            if ($person->isDeceased()) {
+                continue;
+            }
+            if (isset($doNotEmailSet[(int) $person->getId()])) {
+                continue;
+            }
+            $email = trim((string) $person->getEmail());
+            if ($email === '' || isset($emailsSeen[strtolower($email)])) {
+                continue;
+            }
+            $emailsSeen[strtolower($email)] = true;
+            $emails[] = $email;
+            $recipients[] = self::mailingRecipient($person, $email);
+
+            $roleName = $roleNameMap[(int) $membership->getRoleId()] ?? gettext('Member');
+            $byRole[$roleName][] = $email;
+        }
+
+        return ['emails' => $emails, 'byRole' => $byRole, 'recipients' => $recipients];
+    }
+
+    /**
+     * Assign a volunteer opportunity to a person.
+     */
+    public function addVolunteerOpportunity(int $personId, int $opportunityId): bool
+    {
+        $assignment = new PersonVolunteerOpportunity();
+        $assignment->setPersonId($personId);
+        $assignment->setVolunteerOpportunityId($opportunityId);
+
+        return (bool)$assignment->save();
+    }
+
+    /**
+     * Remove a volunteer opportunity assignment from a person.
+     */
+    public function removeVolunteerOpportunity(int $personId, int $opportunityId): void
+    {
+        PersonVolunteerOpportunityQuery::create()
+            ->filterByPersonId($personId)
+            ->filterByVolunteerOpportunityId($opportunityId)
+            ->delete();
+    }
+
+    /**
+     * Get a list of families with head of household information.
+     *
+     * @param bool $allowAll When true, allows loading all families without search/classification filter
+     *
+     * @return array<int, string> Family list keyed by family ID, with formatted name and household head info
+     */
+    public function getFamilyList(string $dirRoleHead, string $dirRoleSpouse, int $classification = 0, ?string $searchTerm = null, bool $allowAll = false): array
+    {
+        // Require minimum 2 characters for search, or classification filter, to prevent loading entire database
+        $hasValidSearch = $searchTerm !== null && mb_strlen(trim($searchTerm)) >= 2;
+        $hasClassification = $classification > 0;
+
+        if (!$hasValidSearch && !$hasClassification && !$allowAll) {
+            return [];
+        }
+
+        // Build family query using Propel ORM
+        $familyQuery = FamilyQuery::create();
+
+        if ($hasClassification) {
+            // Get family IDs that have persons with this classification
+            $familyIds = PersonQuery::create()
+                ->filterByClsId((int) $classification)
+                ->filterByFamId(null, Criteria::ISNOTNULL)
+                ->select(['FamId'])
+                ->distinct()
+                ->find()
+                ->toArray();
+
+            if (empty($familyIds)) {
+                return [];
+            }
+            $familyQuery->filterById($familyIds);
+        }
+
+        if ($hasValidSearch) {
+            $familyQuery->filterByName('%' . trim($searchTerm) . '%', Criteria::LIKE);
+        }
+
+        $families = $familyQuery->orderByName()->find();
+
+        // Build head of household roles array
+        $headRoles = array_filter(array_map('intval', explode(',', $dirRoleHead ?: '1')));
+        $spouseRole = max(0, (int) $dirRoleSpouse);
+        if ($spouseRole > 0) {
+            $headRoles[] = $spouseRole;
+        }
+
+        // Get all heads of household and spouses
+        $headPersons = PersonQuery::create()
+            ->filterByFmrId($headRoles)
+            ->filterByFamId(null, Criteria::ISNOTNULL)
+            ->filterByFamId(0, Criteria::NOT_EQUAL)
+            ->orderByFamId()
+            ->find();
+
+        $aHead = [];
+        foreach ($headPersons as $person) {
+            $famId = $person->getFamId();
+            $firstName = $person->getFirstName();
+            if ($firstName) {
+                if (isset($aHead[$famId])) {
+                    $aHead[$famId] .= ' & ' . $firstName;
+                } else {
+                    $aHead[$famId] = $firstName;
+                }
+            }
+        }
+
+        // Build display array
+        $familyArray = [];
+        foreach ($families as $family) {
+            $name = $family->getName();
+            $famId = $family->getId();
+
+            if (isset($aHead[$famId])) {
+                $name .= ', ' . $aHead[$famId];
+            }
+            $name .= ' ' . $family->getAddress();
+
+            $familyArray[$famId] = $name;
+        }
+
+        return $familyArray;
+    }
+
+    /**
+     * Get count of people missing gender data.
+     *
+     * @return int Count of people with Gender = 0 (excluding system record)
+     */
+    public function getMissingGenderDataCount(): int
+    {
+        return PersonQuery::create()
+            ->filterByGender(0)
+            ->filterById(1, Criteria::NOT_EQUAL)
+            ->count();
+    }
+
+    /**
+     * Get count of people missing family role data.
+     *
+     * @return int Count of people with FmrId = 0 and assigned to a family
+     */
+    public function getMissingRoleDataCount(): int
+    {
+        return PersonQuery::create()
+            ->filterByFmrId(0)
+            ->filterById(1, Criteria::NOT_EQUAL)
+            ->filterByFamId(null, Criteria::ISNOTNULL)
+            ->filterByFamId(0, Criteria::NOT_EQUAL)
+            ->count();
+    }
+
+    /**
+     * Get count of people missing classification data.
+     *
+     * @return int Count of people with ClsId = 0 (excluding system record)
+     */
+    public function getMissingClassificationDataCount(): int
+    {
+        return PersonQuery::create()
+            ->filterByClsId(0)
+            ->filterById(1, Criteria::NOT_EQUAL)
+            ->count();
+    }
+}

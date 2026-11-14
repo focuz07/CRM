@@ -1,0 +1,35 @@
+# Disable directory listings
+Options -Indexes
+
+# Metadata is read locally by PHP; it should never be served over HTTP.
+<FilesMatch "^(composer\.json|composer\.lock|package\.json|package-lock\.json|upgrade\.json|installed\.json)$">
+    Require all denied
+</FilesMatch>
+
+RewriteEngine On
+
+# Automatically handle subdirectory installations
+# The RewriteRule will pass the matched path to index.php
+# ChurchCRM uses the $sRootPath from Config.php to handle subdirectories
+# 
+# NOTE: If you have issues with routing, you may need to set RewriteBase manually:
+# For root installation (/): RewriteBase /
+# For subdirectory (/churchcrm): RewriteBase /churchcrm
+# For subdirectory (/xyz): RewriteBase /xyz
+
+# Skip rewriting if the request matches an existing file or directory.
+# Two conditions are used (instead of the more common combined `!-f` + `!-d`)
+# because LiteSpeed sometimes resolves %{REQUEST_FILENAME} differently from
+# Apache, causing the negative test to fail and rewriting real files to
+# index.php. The positive `-f`/`-d` form works reliably on both servers.
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# Otherwise route everything to index.php
+RewriteRule ^(.*)$ index.php [QSA,L]
+
+<files rector.php>
+order allow,deny
+deny from all
+</files>

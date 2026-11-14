@@ -1,0 +1,378 @@
+<?php
+
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\Service\DepositReportService;
+use ChurchCRM\Service\MpdfRenderer;
+use ChurchCRM\Utils\PdfResponse;
+use ChurchCRM\model\ChurchCRM\DepositQuery;
+use ChurchCRM\Service\DepositService;
+use ChurchCRM\Utils\CsvExporter;
+use ChurchCRM\Slim\Middleware\Api\DepositMiddleware;
+use ChurchCRM\Slim\Middleware\InputSanitizationMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Auth\FinanceRoleAuthMiddleware;
+use ChurchCRM\Slim\Middleware\RequestParameterValidationMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\DateTimeUtils;
+use ChurchCRM\Utils\FiscalYearUtils;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+
+$app->group('/deposits', function (RouteCollectorProxy $group): void {
+    /**
+     * @OA\Post(
+     *     path="/deposits",
+     *     summary="Create a new deposit (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\RequestBody(required=true,
+     *         @OA\JsonContent(
+     *             required={"depositType"},
+     *             @OA\Property(property="depositType", type="string", enum={"Bank","CreditCard","BankDraft"}),
+     *             @OA\Property(property="depositComment", type="string"),
+     *             @OA\Property(property="depositDate", type="string", format="date")
+     *         )
+     *     ),
+     *     @OA\Response(response=200, description="Newly created deposit object"),
+     *     @OA\Response(response=400, description="Invalid or missing deposit type"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->post('', function (Request $request, Response $response, array $args): Response {
+        $depositService = new DepositService();
+        $input = $request->getParsedBody();
+        $depositType = $input['depositType'];
+        $depositComment = $input['depositComment'] ?? '';
+        $depositDate = $input['depositDate'] ?? DateTimeUtils::getTodayDate();
+
+        $deposit = $depositService->createDeposit($depositType, $depositComment, $depositDate);
+        return SlimUtils::renderJSON($response, $deposit->toArray());
+    })->add(new InputSanitizationMiddleware(['depositComment' => 'text']))
+      ->add(new RequestParameterValidationMiddleware(enums: ['depositType' => ['Bank', 'CreditCard', 'BankDraft']]));
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/dashboard",
+     *     summary="Get deposits from the last 90 days (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="Array of deposits within the last 90 days"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/dashboard', function (Request $request, Response $response, array $args): Response {
+        $list = DepositQuery::create()
+            ->filterByDate(['min' => DateTimeUtils::getRelativeDate('-90 days')])
+            ->orderByDate()
+            ->find();
+
+        return SlimUtils::renderJSON($response, $list->toArray());
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/deposits",
+     *     summary="Get all deposits (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="fyid", in="query", required=false, description="Fiscal year ID to filter by deposit date; omit for all time", @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="JSON array of deposits"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get(
+        '',
+        function (Request $request, Response $response, array $args): Response {
+            $queryParams = $request->getQueryParams();
+            $fyid = isset($queryParams['fyid']) ? (int) $queryParams['fyid'] : null;
+            $query = DepositQuery::create();
+            if ($fyid !== null && $fyid > 0) {
+                $fyDates = FiscalYearUtils::getFiscalYearDatesById($fyid);
+                $query->filterByDate(['min' => $fyDates['startDate'], 'max' => $fyDates['endDate']]);
+            }
+            return SlimUtils::renderStringJSON($response, $query->find()->toJSON());
+        }
+    );
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/{id}",
+     *     summary="Get a single deposit by ID (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="Deposit object"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/{id:[0-9]+}', function (Request $request, Response $response, array $args): Response {
+        return SlimUtils::renderJSON($response, $request->getAttribute('deposit')->toArray());
+    })->add(DepositMiddleware::class);
+
+    /**
+     * @OA\Post(
+     *     path="/deposits/{id}",
+     *     summary="Update an existing deposit (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\RequestBody(required=true,
+     *         @OA\JsonContent(
+     *             @OA\Property(property="depositType", type="string", enum={"Bank","CreditCard","BankDraft"}),
+     *             @OA\Property(property="depositComment", type="string"),
+     *             @OA\Property(property="depositDate", type="string", format="date"),
+     *             @OA\Property(property="depositClosed", type="boolean")
+     *         )
+     *     ),
+     *     @OA\Response(response=200, description="Updated deposit object"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->post('/{id:[0-9]+}', function (Request $request, Response $response, array $args): Response {
+        $input = $request->getParsedBody();
+        $deposit = $request->getAttribute('deposit');
+        // Type is not part of setDeposit(); save it first so closing a card or
+        // draft deposit still runs that method's uncleared-payment cleanup.
+        $deposit->setType($input['depositType']);
+        $deposit->save();
+        $depositService = new DepositService();
+        $depositService->setDeposit(
+            (string) $input['depositType'],
+            (string) ($input['depositComment'] ?? ''),
+            (string) $input['depositDate'],
+            (int) $deposit->getId(),
+            filter_var($input['depositClosed'] ?? false, FILTER_VALIDATE_BOOLEAN)
+        );
+        $deposit->reload();
+        return SlimUtils::renderJSON($response, $deposit->toArray());
+    })->add(new InputSanitizationMiddleware(['depositComment' => 'text']))
+      ->add(DepositMiddleware::class);
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/{id}/ofx",
+     *     summary="Get OFX export data for a deposit (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="OFX content for the deposit"),
+     *     @OA\Response(response=404, description="Deposit not found"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/{id:[0-9]+}/ofx', function (Request $request, Response $response, array $args): Response {
+        $OFX = $request->getAttribute('deposit')->getOFX();
+        header($OFX->header);
+        return SlimUtils::renderJSON($response, ['content' => $OFX->content]);
+    })->add(DepositMiddleware::class);
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/{id}/pdf",
+     *     summary="Generate and stream a PDF report for a deposit (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="PDF generated successfully"),
+     *     @OA\Response(response=404, description="Deposit not found or has no payments"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/{id:[0-9]+}/pdf', function (Request $request, Response $response, array $args): Response {
+        $id = (int) $args['id'];
+
+        // If there are no payments for this deposit, return a controlled response
+        $report = DepositReportService::report($id);
+        if ($report === null) {
+            // Some clients and probes use HEAD; respond with appropriate status without throwing
+            if (strtoupper($request->getMethod()) === 'HEAD') {
+                return $response->withStatus(404);
+            }
+
+            return SlimUtils::renderJSON($response->withStatus(404), ['message' => 'No Payments on this Deposit']);
+        }
+
+        $pdf = $request->getMethod() === 'HEAD' ? '' : (new MpdfRenderer())->renderToString('deposit', $report);
+
+        return PdfResponse::create($response, $pdf, DepositReportService::fileLabel($id));
+    })->add(DepositMiddleware::class);
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/csv",
+     *     summary="Bulk-download a RFC 4180-compliant CSV of payments for multiple deposits (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="ids", in="query", required=true,
+     *         @OA\Schema(type="string"),
+     *         description="Comma-separated list of deposit IDs, e.g. '1,2,3'"
+     *     ),
+     *     @OA\Response(response=200, description="CSV file attachment with payment data for all requested deposits"),
+     *     @OA\Response(response=400, description="No valid deposit IDs provided"),
+     *     @OA\Response(response=404, description="No payments found for the requested deposits"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/csv', function (Request $request, Response $response, array $args): Response {
+        $queryParams  = $request->getQueryParams();
+        $idsParam     = $queryParams['ids'] ?? '';
+        $ids          = array_filter(array_map('intval', explode(',', $idsParam)), fn(int $id): bool => $id > 0);
+
+        if (empty($ids)) {
+            return SlimUtils::renderErrorJSON($response, gettext('No valid deposit IDs provided'), [], 400);
+        }
+
+        $depositService = new DepositService();
+        $rows = $depositService->getDepositsForExport(array_values($ids));
+
+        if (empty($rows)) {
+            return SlimUtils::renderErrorJSON($response, gettext('No payments found for the selected deposits'), [], 404);
+        }
+
+        $filename = 'ChurchCRM-Deposits-' . date(SystemConfig::getValue('sDateFilenameFormat')) . '.csv';
+        // Headers defined once in DepositService::EXPORT_HEADERS — all CSV endpoints share this list
+        $headers  = array_map('gettext', DepositService::EXPORT_HEADERS);
+
+        $exporter = new CsvExporter();
+        $exporter->insertHeaders($headers);
+        foreach ($rows as $row) {
+            $exporter->insertRow(array_values($row));
+        }
+
+        $response = $response
+            ->withHeader('Content-Type', 'text/csv; charset=UTF-8')
+            ->withHeader('Content-Disposition', 'attachment; filename="' . $filename . '"');
+        $response->getBody()->write($exporter->getContent());
+
+        return $response;
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/{id}/csv",
+     *     summary="Download a RFC 4180-compliant CSV of payments for a single deposit (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="CSV file attachment with payment data"),
+     *     @OA\Response(response=404, description="No payments found for this deposit"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/{id:[0-9]+}/csv', function (Request $request, Response $response, array $args): Response {
+        $id = (int) $args['id'];
+
+        $depositService = new DepositService();
+        $rows = $depositService->getDepositsForExport([$id]);
+
+        if (empty($rows)) {
+            return SlimUtils::renderJSON(
+                $response->withStatus(404),
+                ['message' => gettext('No Payments on this Deposit')]
+            );
+        }
+
+        $filename = 'ChurchCRM-Deposit-' . $id . '-' . date(SystemConfig::getValue('sDateFilenameFormat')) . '.csv';
+        $headers  = array_map('gettext', DepositService::EXPORT_HEADERS);
+
+        $exporter = new CsvExporter();
+        $exporter->insertHeaders($headers);
+        foreach ($rows as $row) {
+            $exporter->insertRow(array_values($row));
+        }
+
+        $response = $response
+            ->withHeader('Content-Type', 'text/csv; charset=UTF-8')
+            ->withHeader('Content-Disposition', 'attachment; filename="' . $filename . '"');
+        $response->getBody()->write($exporter->getContent());
+
+        return $response;
+    });
+
+    /**
+     * @OA\Delete(
+     *     path="/deposits/{id}",
+     *     summary="Delete a deposit (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="Deposit deleted successfully"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->delete('/{id:[0-9]+}', function (Request $request, Response $response, array $args): Response {
+        $request->getAttribute('deposit')->delete();
+        return SlimUtils::renderSuccessJSON($response);
+    })->add(DepositMiddleware::class);
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/{id}/pledges",
+     *     summary="Get pledge items for a deposit (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="Pledge items associated with the deposit"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/{id:[0-9]+}/pledges', function (Request $request, Response $response, array $args): Response {
+        $id = (int) $args['id'];
+        $depositService = new DepositService();
+        $result = $depositService->getDepositItemsByType($id, 'Pledge');
+        return SlimUtils::renderJSON($response, $result);
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/{id}/payments",
+     *     summary="Get payment items for a deposit (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="id", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="Payment items associated with the deposit"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/{id:[0-9]+}/payments', function (Request $request, Response $response, array $args): Response {
+        $id = (int) $args['id'];
+        $depositService = new DepositService();
+        $result = $depositService->getDepositItemsByType($id, 'Payment');
+        return SlimUtils::renderJSON($response, $result);
+    });
+
+    /**
+     * @OA\Get(
+     *     path="/deposits/open-count",
+     *     summary="Get count of open (non-closed) deposits (Finance role required)",
+     *     tags={"Finance"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Response(response=200, description="Open deposit count"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Finance role required")
+     * )
+     */
+    $group->get('/open-count', function (Request $request, Response $response): Response {
+        try {
+            $openCount = (new DepositService())->getOpenDepositCount();
+            $response->getBody()->write(json_encode(['count' => $openCount]));
+            return $response
+                ->withHeader('Content-Type', 'application/json')
+                ->withStatus(200);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON($response, gettext('Failed to get deposit count'), [], 500, $e, $request);
+        }
+    });
+})->add(FinanceRoleAuthMiddleware::class);

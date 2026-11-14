@@ -1,0 +1,177 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\model\ChurchCRM\EventAttendQuery;
+use ChurchCRM\model\ChurchCRM\EventCountsQuery;
+use ChurchCRM\model\ChurchCRM\EventQuery;
+use ChurchCRM\model\ChurchCRM\PersonQuery;
+use ChurchCRM\model\ChurchCRM\User;
+use ChurchCRM\Service\EventAttendanceRosterService;
+use ChurchCRM\model\ChurchCRM\VolunteerMinistryQuery;
+use ChurchCRM\model\ChurchCRM\VolunteerOccurrenceQuery;
+use ChurchCRM\model\ChurchCRM\VolunteerScheduleQuery;
+use ChurchCRM\Volunteer\Service\VolunteerAssignmentService;
+use ChurchCRM\Utils\LoggerUtils;
+use Propel\Runtime\ActiveQuery\Criteria;
+use ChurchCRM\view\PageHeader;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Views\PhpRenderer;
+
+// GET /event/view/{id} — read-only event detail page (no edit permission required)
+$app->get('/view/{id}', function (Request $request, Response $response, array $args) {
+    $eventId = (int) $args['id'];
+
+    $event = EventQuery::create()->leftJoinWithEventType()->findOneById($eventId);
+    if ($event === null) {
+        LoggerUtils::getAppLogger()->warning('Event not found in view route: ' . $eventId);
+
+        return $response->withHeader('Location', SystemURLs::getRootPath() . '/event/dashboard')->withStatus(302);
+    }
+
+    // Build attendance roster
+    $attendees = EventAttendanceRosterService::build(
+        EventAttendQuery::create()->filterByEventId($eventId)->find()
+    );
+
+    // Attendance counts
+    $eventCounts = EventCountsQuery::create()
+        ->filterByEvtcntEventid($eventId)
+        ->orderByEvtcntCountid()
+        ->find();
+    $counts = [];
+    foreach ($eventCounts as $count) {
+        $counts[] = [
+            'name'  => $count->getEvtcntCountname(),
+            'count' => (int) $count->getEvtcntCountcount(),
+        ];
+    }
+
+    // Linked groups (audience)
+    $groups = $event->getGroups();
+    $linkedGroups = [];
+    foreach ($groups as $group) {
+        $linkedGroups[] = [
+            'id'   => (int) $group->getId(),
+            'name' => $group->getName(),
+            'url'  => $group->getViewURI(),
+        ];
+    }
+
+    // Compute non-attendees (group members who did not check in), shown only after event ends
+    $eventEnd = $event->getEnd();
+    $eventEnded = $eventEnd !== null && $eventEnd < new DateTime();
+    $nonAttendees = [];
+    if ($eventEnded && $groups->count() > 0) {
+        $members = PersonQuery::create()
+            ->joinWithPerson2group2roleP2g2r()
+            ->usePerson2group2roleP2g2rQuery()
+                ->filterByGroup($groups)
+            ->endUse()
+            ->leftJoinEventAttend()
+            ->addJoinCondition('EventAttend', 'event_attend.event_id = ?', $event->getId())
+            ->where('event_attend.event_id IS NULL')
+            ->groupBy('Person.Id')
+            ->find();
+
+        foreach ($members as $person) {
+            $nonAttendees[] = [
+                    'personId'  => $person->getId(),
+                    'fullName'  => $person->getFullName(),
+                    'email'     => $person->getEmail(),
+                    'cellPhone' => $person->getCellPhone(),
+                    'homePhone' => $person->getHomePhone(),
+                ];
+        }
+        usort($nonAttendees, fn ($a, $b) => strcmp($a['fullName'], $b['fullName']));
+    }
+
+    $nonAttendeeRecipients = [];
+    foreach ($nonAttendees as $na) {
+        if (!empty($na['email'])) {
+            $nonAttendeeRecipients[] = [
+                'personId' => (int) $na['personId'],
+                'familyId' => null,
+                'name'     => (string) $na['fullName'],
+                'email'    => (string) $na['email'],
+            ];
+        }
+    }
+
+    // Volunteer v2 staffing for this event (#9713, design §3.5).
+    //
+    // Gated twice: on the rollout flag, and on scope — `getEventStaffingSummary()` returns
+    // nothing at all unless the caller may manage at least one occurrence linked to this
+    // event, so a volunteer, a plain member or an events administrator with no ministry
+    // scope simply never sees the card. Read-only; the edit affordance is the link to
+    // /ministries/occurrences/{id}.
+    $volunteerOccurrences = [];
+    if (User::isVolunteerV2Enabled()) {
+        $assignments = new VolunteerAssignmentService();
+        $summary = $assignments->getEventStaffingSummary([$eventId], AuthenticationManager::getCurrentUser());
+        $occurrenceIds = $summary[$eventId]['occurrenceIds'] ?? [];
+
+        if ($occurrenceIds !== []) {
+            // One getGaps() call for every occurrence at once — §2.11.3's single gap
+            // implementation, never re-derived here.
+            $gaps = $assignments->getGaps($occurrenceIds);
+
+            $occurrences = VolunteerOccurrenceQuery::create()
+                ->filterById($occurrenceIds, Criteria::IN)
+                ->orderByOccurrenceDate()
+                ->find();
+
+            // A handful of rows at most — an event carries one occurrence per ministry
+            // scheduling it (UC3), not one per volunteer.
+            foreach ($occurrences as $occurrence) {
+                $schedule = VolunteerScheduleQuery::create()->findPk((int) $occurrence->getScheduleId());
+                $ministry = $schedule === null
+                    ? null
+                    : VolunteerMinistryQuery::create()->findPk((int) $schedule->getMinistryId());
+                $summaryRow = $gaps[(int) $occurrence->getId()] ?? [];
+
+                $volunteerOccurrences[] = [
+                    'occurrenceId'  => (int) $occurrence->getId(),
+                    'ministryName'  => $ministry === null ? gettext('Volunteer') : $ministry->getName(),
+                    'scheduleName'  => $schedule === null ? '' : $schedule->getName(),
+                    // The rollup the shared staffing formatter words (D34).
+                    'staffing'      => [
+                        'requiredCount' => (int) ($summaryRow['requiredCount'] ?? 0),
+                        'capacity'      => (int) ($summaryRow['capacity'] ?? 0),
+                        'liveCount'     => (int) ($summaryRow['liveCount'] ?? 0),
+                        'gapCount'      => (int) ($summaryRow['gapCount'] ?? 0),
+                        'openCount'     => (int) ($summaryRow['openCount'] ?? 0),
+                        'pendingCount'  => (int) ($summaryRow['pendingCount'] ?? 0),
+                    ],
+                    // How many positions the plan names at all. Zero means nobody has
+                    // said what this occurrence needs, which must never render as
+                    // "Fully staffed" (§2.10).
+                    'requirementCount' => (int) ($summaryRow['requirementCount'] ?? 0),
+                ];
+            }
+        }
+    }
+
+    $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+    return $renderer->render($response, 'view.php', [
+        'sRootPath'      => SystemURLs::getRootPath(),
+        'sPageTitle'     => $event->getTitle() ?: gettext('Event'),
+        'sPageSubtitle'  => $event->getEventType() ? $event->getEventType()->getName() : gettext('Event Details'),
+        'aBreadcrumbs'   => PageHeader::breadcrumbs([
+            [gettext('Events'), '/event/dashboard'],
+            [$event->getTitle() ?: gettext('Event Details')],
+        ]),
+        'event'          => $event,
+        'attendees'      => $attendees,
+        'counts'         => $counts,
+        'linkedGroups'   => $linkedGroups,
+        'canEditEvents'  => AuthenticationManager::getCurrentUser()->isAddEvent(),
+        'eventEnded'     => $eventEnded,
+        'nonAttendees'   => $nonAttendees,
+        'nonAttendeeRecipients' => $nonAttendeeRecipients,
+        'canEmail'       => AuthenticationManager::getCurrentUser()->isEmailEnabled(),
+        'volunteerOccurrences' => $volunteerOccurrences,
+    ]);
+});

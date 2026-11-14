@@ -1,0 +1,99 @@
+name: "Security: CodeQL"
+
+on:
+  push:
+    branches: [master, develop]
+    paths:
+      - '**/*.php'
+      - '**/*.js'
+      - '**/*.ts'
+      - '**/*.tsx'
+      - '**/*.json'
+      - '**/*.yml'
+      - '**/*.yaml'
+      - '**/*.sql'
+  pull_request:
+    branches: [master]
+    paths:
+      - '**/*.php'
+      - '**/*.js'
+      - '**/*.ts'
+      - '**/*.tsx'
+      - '**/*.json'
+      - '**/*.yml'
+      - '**/*.yaml'
+      - '**/*.sql'
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  codeql-analysis:
+    name: 'CodeQL (JS/TS)'
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    env:
+      CODEQL_ACTION_FILE_COVERAGE_ON_PRS: 'true'
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:javascript-typescript"
+
+  semgrep-analysis:
+    name: 'Semgrep (PHP/JS/Config)'
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Semgrep
+        run: pip install semgrep
+      - name: Test local PHP XSS rule
+        run: semgrep --test .semgrep/
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config p/php \
+            --config .semgrep/echoed-request.yml \
+            --config .semgrep/twig-templates.yml \
+            --exclude-rule php.lang.security.injection.echoed-request.echoed-request \
+            --exclude-rule generic.html-templates.security.var-in-href.var-in-href \
+            --exclude-rule generic.html-templates.security.var-in-script-tag.var-in-script-tag \
+            --exclude .semgrep/echoed-request.php \
+            --sarif \
+            --output semgrep.sarif \
+            --error
+        continue-on-error: true
+      - name: Upload Semgrep results to GitHub Security tab
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+          wait-for-processing: true

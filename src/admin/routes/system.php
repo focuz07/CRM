@@ -1,0 +1,1140 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\Authentication\Exceptions\PasswordChangeException;
+use ChurchCRM\data\Countries;
+use ChurchCRM\data\GradePresets;
+use ChurchCRM\dto\ChurchMetaData;
+use ChurchCRM\dto\LocaleInfo;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\model\ChurchCRM\GroupQuery;
+use ChurchCRM\model\ChurchCRM\ListOptionQuery;
+use ChurchCRM\model\ChurchCRM\PersonQuery;
+use ChurchCRM\model\ChurchCRM\User;
+use ChurchCRM\model\ChurchCRM\UserQuery;
+use ChurchCRM\Service\AppIntegrityService;
+use ChurchCRM\Service\ClassificationService;
+use ChurchCRM\Service\DatabaseVersionService;
+use ChurchCRM\Service\GradeService;
+use ChurchCRM\Service\LocaleService;
+use ChurchCRM\Service\UserService;
+use ChurchCRM\Slim\Middleware\CSRFMiddleware;
+use ChurchCRM\Slim\Middleware\InputSanitizationMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\ChurchCRMReleaseManager;
+use ChurchCRM\Utils\DateTimeUtils;
+use ChurchCRM\Utils\GeoUtils;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\Utils\VersionUtils;
+use ChurchCRM\view\PageHeader;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+use Slim\Views\PhpRenderer;
+
+$app->group('/system', function (RouteCollectorProxy $group): void {
+    
+    // Backup Database page
+    $group->get('/backup', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+        
+        $pageArgs = [
+            'sRootPath' => SystemURLs::getRootPath(),
+            'sPageTitle' => gettext('Backup Database'),
+            'sPageSubtitle' => gettext('Create a backup of your church database'),
+            'aBreadcrumbs' => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Backup Database')],
+            ]),
+            'sPageHeaderButtons' => PageHeader::buttons([
+                ['label' => gettext('Restore Database'), 'url' => '/admin/system/restore', 'icon' => 'fa-upload'],
+            ]),
+        ];
+        
+        return $renderer->render($response, 'backup.php', $pageArgs);
+    });
+
+    // Users page
+    $group->get('/users', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+        
+        $pageArgs = [
+            'sRootPath' => SystemURLs::getRootPath(),
+            'sPageTitle' => gettext('System Users'),
+            'sPageSubtitle' => gettext('Manage system users, permissions, and two-factor authentication settings'),
+            'aBreadcrumbs' => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('System Users')],
+            ]),
+            'sSettingsCollapseId' => 'userSettingsPanel',
+            'sPageHeaderButtons' => PageHeader::buttons([
+                ['label' => gettext('Settings'), 'icon' => 'fa-cog', 'collapse' => '#userSettingsPanel'],
+                ['label' => gettext('Add User'), 'url' => '/admin/system/users/new', 'icon' => 'fa-user-plus'],
+            ]),
+        ];
+        
+        return $renderer->render($response, 'users.php', $pageArgs);
+    });
+
+    // Admin change user password (GET shows form, POST processes it)
+    $group->get('/user/{id}/changePassword', 'adminChangeUserPassword');
+    $group->post('/user/{id}/changePassword', 'adminChangeUserPassword')->add(new CSRFMiddleware('admin_change_password'));
+
+    // Option Manager page — manage list options (classifications, family roles,
+    // group types, security groups, custom field options, etc.)
+    $group->get('/options', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+        $queryParams = $request->getQueryParams();
+        // Mode is a simple string — use sanitizeText (no SQL context needed).
+        // legacyFilterInput would open the legacy mysqli connection for nothing.
+        $mode = InputUtils::sanitizeText((string) ($queryParams['mode'] ?? ''));
+
+        $customListId = (int) ($queryParams['ListID'] ?? 0);
+
+        // Determine list config based on mode
+        $listConfig = match ($mode) {
+            'famroles' => ['listId' => 2, 'title' => gettext('Family Roles Editor'), 'noun' => gettext('Family Role')],
+            'classes' => ['listId' => 1, 'title' => gettext('Person Classifications Editor'), 'noun' => gettext('Person Classification')],
+            'grades' => ['listId' => GradeService::listId(), 'title' => gettext('Grades Editor'), 'noun' => gettext('Grade')],
+            'grptypes' => ['listId' => 3, 'title' => gettext('Group Types Editor'), 'noun' => gettext('Group Type')],
+            'securitygrp' => ['listId' => 5, 'title' => gettext('Security Groups Editor'), 'noun' => gettext('Security Group')],
+            'grproles' => $customListId > 0 && GroupQuery::create()->findOneByRoleListId($customListId) !== null
+                ? ['listId' => $customListId, 'title' => gettext('Group Member Roles Editor'), 'noun' => gettext('Group Member Role')]
+                : null,
+            'custom' => $customListId > 0 && ListOptionQuery::create()->filterById($customListId)->count() > 0
+                ? ['listId' => $customListId, 'title' => gettext('Person Custom List Options Editor'), 'noun' => gettext('Custom Option')]
+                : null,
+            'groupcustom' => $customListId > 0 && ListOptionQuery::create()->filterById($customListId)->count() > 0
+                ? ['listId' => $customListId, 'title' => gettext('Custom List Options Editor'), 'noun' => gettext('Custom Option')]
+                : null,
+            'famcustom' => $customListId > 0 && ListOptionQuery::create()->filterById($customListId)->count() > 0
+                ? ['listId' => $customListId, 'title' => gettext('Family Custom List Options Editor'), 'noun' => gettext('Custom Option')]
+                : null,
+            default => null,
+        };
+
+        if ($listConfig === null) {
+            return SlimUtils::renderRedirect($response, SystemURLs::getRootPath() . '/admin/');
+        }
+
+        // Load options server-side for initial render
+        $optionRows = \ChurchCRM\model\ChurchCRM\ListOptionQuery::create()
+            ->filterById($listConfig['listId'])
+            ->orderByOptionSequence()
+            ->find();
+
+        // For classifications mode, compute which options are inactive / included in the directory
+        $inactiveClasses = [];
+        $directoryClasses = [];
+        if ($mode === 'classes') {
+            $classificationService = new ClassificationService();
+            $inactiveClasses = $classificationService->getInactiveIds();
+            $directoryClasses = $classificationService->getDirectoryIds();
+        }
+
+        $breadcrumbParent = match ($mode) {
+            'grptypes', 'grproles', 'groupcustom' => [gettext('Groups'), '/groups/dashboard'],
+            'famroles', 'famcustom', 'classes', 'custom', 'grades' => [gettext('People'), '/people/dashboard'],
+            default => [gettext('Admin'), '/admin/'],
+        };
+        $pageArgs = [
+            'sRootPath' => SystemURLs::getRootPath(),
+            'sPageTitle' => $listConfig['title'],
+            'sPageSubtitle' => $mode === 'grades'
+                ? gettext('Every year each person moves to the next grade in this order, and the last grade is cleared.')
+                : sprintf(gettext('Manage %s options'), $listConfig['noun']),
+            'aBreadcrumbs' => PageHeader::breadcrumbs(array_values(array_filter([
+                $breadcrumbParent,
+                in_array($mode, ['famroles', 'famcustom', 'classes', 'custom', 'grades'], true)
+                    ? [gettext('People Settings'), '/admin/people']
+                    : null,
+                [$listConfig['title']],
+            ]))),
+            'sPageHeaderButtons' => in_array($mode, ['famroles', 'famcustom', 'classes', 'custom', 'grades'], true) ? PageHeader::peopleSettingsButton() : '',
+            'mode' => $mode,
+            'listId' => $listConfig['listId'],
+            'noun' => $listConfig['noun'],
+            'addLabel' => $mode === 'grades' ? gettext('Add New Grade') : gettext('Add New') . ' ' . $listConfig['noun'],
+            'optionRows' => $optionRows,
+            'inactiveClasses' => $inactiveClasses,
+            'directoryClasses' => $directoryClasses,
+            'gradePresets' => $mode === 'grades' ? array_map(static fn (array $preset): string => $preset['name'], GradePresets::all()) : [],
+            'currentGradePreset' => $mode === 'grades' ? GradeService::currentPresetKey() : '',
+        ];
+
+        return $renderer->render($response, 'option-manager.php', $pageArgs);
+    });
+
+    // Restore Database page
+    $group->get('/restore', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+        $params = $request->getQueryParams();
+        $isOnboarding = ($params['context'] ?? '') === 'onboarding';
+        
+        $pageArgs = [
+            'sRootPath'    => SystemURLs::getRootPath(),
+            'sPageTitle'   => gettext('Restore Database'),
+            'sPageSubtitle' => gettext('Restore your church database from a backup file'),
+            'aBreadcrumbs' => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Restore Database')],
+            ]),
+            'sPageHeaderButtons' => PageHeader::buttons([
+                ['label' => gettext('Create Backup'), 'url' => '/admin/system/backup', 'icon' => 'fa-download'],
+            ]),
+            'isOnboarding' => $isOnboarding,
+        ];
+        
+        return $renderer->render($response, 'restore.php', $pageArgs);
+    });
+
+    $group->get('/reset', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+        
+        $pageArgs = [
+            'sRootPath' => SystemURLs::getRootPath(),
+            'sPageTitle' => gettext('Database Reset Functions'),
+            'sPageSubtitle' => gettext('Clear all data and start fresh'),
+            'aBreadcrumbs' => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Database Reset')],
+            ]),
+        ];
+        
+        return $renderer->render($response, 'system-reset.php', $pageArgs);
+    });
+
+    // System Logs page (moved from v2/admin/logs)
+    $group->get('/logs', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+        $logsDir = SystemURLs::getDocumentRoot() . '/logs';
+        $logFiles = [];
+
+        if (is_dir($logsDir)) {
+            $files = scandir($logsDir, SCANDIR_SORT_DESCENDING);
+            foreach ($files as $file) {
+                if ($file !== '.' && $file !== '..' && $file !== '.htaccess' && pathinfo($file, PATHINFO_EXTENSION) === 'log') {
+                    $logFiles[] = [
+                        'name' => $file,
+                        'path' => $logsDir . '/' . $file,
+                        'size' => filesize($logsDir . '/' . $file),
+                        'modified' => filemtime($logsDir . '/' . $file),
+                    ];
+                }
+            }
+        }
+
+        $pageArgs = [
+            'sRootPath'  => SystemURLs::getRootPath(),
+            'sPageTitle' => gettext('System Logs'),
+            'sPageSubtitle' => gettext('View and manage system log files for debugging'),
+            'aBreadcrumbs' => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('System Logs')],
+            ]),
+            'sSettingsCollapseId' => 'logSettings',
+            'sPageHeaderButtons' => PageHeader::buttons([
+                ['label' => gettext('Settings'), 'icon' => 'fa-cog', 'collapse' => '#logSettings'],
+            ]),
+            'logFiles'   => $logFiles,
+        ];
+
+        return $renderer->render($response, 'logs.php', $pageArgs);
+    });
+
+    // Debug page (moved from v2/admin/debug)
+    $group->get('/debug', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+        $pageArgs = [
+            'sRootPath'  => SystemURLs::getRootPath(),
+            'sPageTitle' => gettext('Debug'),
+            'sPageSubtitle' => gettext('System diagnostic information and configuration'),
+            'aBreadcrumbs' => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Debug')],
+            ]),
+        ];
+
+        return $renderer->render($response, 'debug.php', $pageArgs);
+    });
+
+    // Orphaned Files Management page
+    $group->get('/orphaned-files', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+        $orphanedFiles = AppIntegrityService::getOrphanedFiles();
+
+        $pageArgs = [
+            'sRootPath'      => SystemURLs::getRootPath(),
+            'sPageTitle'     => gettext('Orphaned Files Management'),
+            'sPageSubtitle'  => gettext('Review and clean up files not associated with any record'),
+            'aBreadcrumbs'   => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Orphaned Files')],
+            ]),
+            'orphanedFiles'  => $orphanedFiles,
+            'orphanedCount'  => count($orphanedFiles),
+        ];
+
+        return $renderer->render($response, 'orphaned-files.php', $pageArgs);
+    });
+
+    // Upgrade page
+    $group->get('/upgrade', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+        
+        ChurchCRMReleaseManager::checkForUpdates();
+        
+        // Recompute update availability with fresh data
+        $updateInfo = ChurchCRMReleaseManager::checkSystemUpdateAvailable();
+        $_SESSION['systemUpdateAvailable'] = $updateInfo['available'];
+        $_SESSION['systemUpdateVersion'] = $updateInfo['version'];
+        $_SESSION['systemLatestVersion'] = $updateInfo['latestVersion'];
+        
+        $integrityCheckFailed = AppIntegrityService::getIntegrityCheckStatus() === gettext("Failed");
+        $orphanedFiles = AppIntegrityService::getOrphanedFiles();
+        $hasOrphanedFiles = count($orphanedFiles) > 0;
+        $hasWarnings = $integrityCheckFailed || $hasOrphanedFiles;
+        
+        // Get integrity check data if failed or orphaned files exist
+        $integrityCheckData = [];
+        if ($integrityCheckFailed || $hasOrphanedFiles) {
+            $integrityCheckData = [
+                'status' => AppIntegrityService::getIntegrityCheckStatus(),
+                'message' => AppIntegrityService::getIntegrityCheckMessage(),
+                'files' => AppIntegrityService::getFilesFailingIntegrityCheck(),
+                'orphanedFiles' => $orphanedFiles,
+            ];
+        }
+        
+        // Get version information
+        $currentVersion = VersionUtils::getInstalledVersion();
+        $availableVersion = null;
+        $latestGitHubVersion = null;
+        $isUpdateAvailable = false;
+        
+        // Check if update information is available in session
+        if (isset($_SESSION['systemUpdateAvailable']) && $_SESSION['systemUpdateAvailable'] === true) {
+            $isUpdateAvailable = true;
+            if (isset($_SESSION['systemUpdateVersion']) && $_SESSION['systemUpdateVersion'] !== null) {
+                $availableVersion = $_SESSION['systemUpdateVersion']->__toString();
+            }
+        }
+        
+        // Get the latest GitHub version (always show this, even if no update available)
+        if (isset($_SESSION['systemLatestVersion']) && $_SESSION['systemLatestVersion'] !== null) {
+            $latestGitHubVersion = $_SESSION['systemLatestVersion']->__toString();
+        }
+
+        // Detect "running ahead of stable" — e.g. a prerelease or dev build installed
+        // that is newer than the latest stable release known from GitHub.
+        $isAheadOfStable = false;
+        if ($latestGitHubVersion !== null && !$isUpdateAvailable) {
+            $isAheadOfStable = version_compare($currentVersion, $latestGitHubVersion) > 0;
+        }
+        
+        $pageArgs = [
+            'sRootPath'             => SystemURLs::getRootPath(),
+            'sPageTitle'            => gettext('System Upgrade'),
+            'sPageSubtitle'         => gettext('Check for updates and upgrade your ChurchCRM installation'),
+            'aBreadcrumbs'          => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('System Upgrade')],
+            ]),
+            'sSettingsCollapseId'   => 'upgradeSettingsPanel',
+            'sPageHeaderButtons'    => PageHeader::buttons([
+                ['label' => gettext('Settings'), 'icon' => 'fa-cog', 'collapse' => '#upgradeSettingsPanel'],
+            ]),
+            'hasWarnings'           => $hasWarnings,
+            'integrityCheckFailed'  => $integrityCheckFailed,
+            'integrityCheckData'    => $integrityCheckData,
+            'hasOrphanedFiles'      => $hasOrphanedFiles,
+            'currentVersion'        => $currentVersion,
+            'availableVersion'      => $availableVersion,
+            'latestGitHubVersion'   => $latestGitHubVersion,
+            'isUpdateAvailable'     => $isUpdateAvailable,
+            'isAheadOfStable'       => $isAheadOfStable,
+            'databaseBlockMessage'  => DatabaseVersionService::getUpgradeBlockMessage(),
+        ];
+
+        return $renderer->render($response, 'upgrade.php', $pageArgs);
+    });
+
+    // Report Settings page: the letterhead PDF letters print
+    $group->get('/report-settings', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+        $labels = [
+            'sDear'             => gettext('Greeting'),
+            'sConfirmSincerely' => gettext('Closing'),
+            'sConfirmSigner'    => gettext('Signer'),
+        ];
+        $letterSettings = array_map(function (array $setting) use ($labels): array {
+            $setting['label'] = $labels[$setting['name']];
+            if ($setting['tooltip'] === $setting['label']) {
+                unset($setting['tooltip']);
+            }
+
+            return $setting;
+        }, SystemConfig::getSettingsConfig(array_keys($labels)));
+
+        return $renderer->render($response, 'report-settings.php', [
+            'letterSettings' => $letterSettings,
+            'sRootPath' => SystemURLs::getRootPath(),
+            'sPageTitle' => gettext('Report Settings'),
+            'sPageSubtitle' => gettext('Set the letterhead that PDF letters print'),
+            'aBreadcrumbs' => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Report Settings')],
+            ]),
+        ]);
+    });
+
+    // Church Information page
+    $group->get('/church-info', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+        // Read flash message from session (set by POST handler)
+        $sGlobalMessage      = '';
+        $sGlobalMessageClass = 'success';
+        if (isset($_SESSION['sGlobalMessage'])) {
+            $sGlobalMessage      = $_SESSION['sGlobalMessage'];
+            $sGlobalMessageClass = $_SESSION['sGlobalMessageClass'] ?? 'success';
+            unset($_SESSION['sGlobalMessage'], $_SESSION['sGlobalMessageClass']);
+        }
+
+        // iChurchLatitude / iChurchLongitude are stored as strings in
+        // config_cfg but are semantically floats. Cast on read so the view
+        // can compare numerically without "0.0 vs '0' string" surprises, and
+        // emit empty string when unset so the form input renders blank
+        // instead of "0".
+        $rawLat = (string) SystemConfig::getValue('iChurchLatitude');
+        $rawLng = (string) SystemConfig::getValue('iChurchLongitude');
+        $latFloat = $rawLat === '' ? 0.0 : (float) $rawLat;
+        $lngFloat = $rawLng === '' ? 0.0 : (float) $rawLng;
+
+        $churchInfo = [
+            'sChurchName'      => SystemConfig::getValue('sChurchName'),
+            'sChurchAddress'   => SystemConfig::getValue('sChurchAddress'),
+            'sChurchCity'      => SystemConfig::getValue('sChurchCity'),
+            'sChurchState'     => SystemConfig::getValue('sChurchState'),
+            'sChurchZip'       => SystemConfig::getValue('sChurchZip'),
+            'sChurchCountry'   => SystemConfig::getValue('sChurchCountry') ?: 'US',
+            'sChurchPhone'     => SystemConfig::getValue('sChurchPhone'),
+            'sChurchEmail'     => SystemConfig::getValue('sChurchEmail'),
+            'iChurchLatitude'  => ($latFloat !== 0.0 || $lngFloat !== 0.0) ? (string) $latFloat : '',
+            'iChurchLongitude' => ($latFloat !== 0.0 || $lngFloat !== 0.0) ? (string) $lngFloat : '',
+            'sChurchWebSite'   => SystemConfig::getValue('sChurchWebSite'),
+            'sChurchTaxId'     => SystemConfig::getValue('sChurchTaxId'),
+        ];
+
+        $pageArgs = [
+            'sRootPath'          => SystemURLs::getRootPath(),
+            'sPageTitle'         => gettext('Church Information'),
+            'sPageSubtitle'      => gettext('Set your church name, address, and contact details'),
+            'aBreadcrumbs'       => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Church Information')],
+            ]),
+            'churchInfo'         => $churchInfo,
+            'countries'          => Countries::getNames(),
+            'socialNetworks'     => ChurchMetaData::getChurchSocialNetworkFields(),
+            'sGlobalMessage'     => $sGlobalMessage,
+            'sGlobalMessageClass' => $sGlobalMessageClass,
+        ];
+
+        return $renderer->render($response, 'church-info.php', $pageArgs);
+    });
+
+    $group->post('/church-info', function (Request $request, Response $response): Response {
+        // Body fields have already been sanitized by InputSanitizationMiddleware
+        $body = $request->getParsedBody();
+
+        $churchName    = trim($body['sChurchName'] ?? '');
+        $churchAddress = trim($body['sChurchAddress'] ?? '');
+        $churchCity    = trim($body['sChurchCity'] ?? '');
+        $churchState   = trim($body['sChurchState'] ?? '');
+        $churchZip     = trim($body['sChurchZip'] ?? '');
+        $churchCountry = trim($body['sChurchCountry'] ?? '');
+        $churchPhone   = trim($body['sChurchPhone'] ?? '');
+        $churchEmail   = trim($body['sChurchEmail'] ?? '');
+
+        // Lat/long are not in the sanitization allow-list — they're numeric.
+        // Validate via filter_var below before saving. Empty string is allowed
+        // and means "let me geocode from the address" (fallback path).
+        $rawLatInput = trim((string) ($body['iChurchLatitude'] ?? ''));
+        $rawLngInput = trim((string) ($body['iChurchLongitude'] ?? ''));
+
+        // Social media links — every network is optional, so we only keep the
+        // posted values here and validate the non-empty ones further down.
+        $socialNetworks = ChurchMetaData::getChurchSocialNetworkFields();
+        foreach ($socialNetworks as $index => $network) {
+            $socialNetworks[$index]['url'] = trim($body[$network['config']] ?? '');
+        }
+
+        // Validation: Required fields
+        $validationError = '';
+        if (empty($churchName)) {
+            $validationError = gettext('Church name is required.');
+        } elseif (empty($churchAddress)) {
+            $validationError = gettext('Street address is required.');
+        } elseif (empty($churchCity)) {
+            $validationError = gettext('City is required.');
+        } elseif (empty($churchState)) {
+            $validationError = gettext('State is required.');
+        } elseif (empty($churchZip)) {
+            $validationError = gettext('ZIP code is required.');
+        } elseif (empty($churchCountry)) {
+            $validationError = gettext('Country is required.');
+        } elseif (empty($churchPhone)) {
+            $validationError = gettext('Phone number is required.');
+        } elseif (empty($churchEmail)) {
+            $validationError = gettext('Email address is required.');
+        }
+
+        // Social link validation — blank is fine ("not set"); anything else
+        // must be an absolute https:// URL, since these render as outbound
+        // links on pages members see.
+        if ($validationError === '') {
+            foreach ($socialNetworks as $network) {
+                if (!ChurchMetaData::isValidSocialUrl($network['url'])) {
+                    $validationError = sprintf(
+                        gettext('%s must be a full https:// web address, for example https://example.org/yourchurch.'),
+                        $network['label']
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Coordinate validation — only if the user provided one or both fields.
+        // Both must be present together (you can't have lat without lng), and
+        // both must parse as floats in valid earth ranges.
+        $manualLat = null;
+        $manualLng = null;
+        if ($validationError === '' && ($rawLatInput !== '' || $rawLngInput !== '')) {
+            if ($rawLatInput === '' || $rawLngInput === '') {
+                $validationError = gettext('Both latitude and longitude must be provided together (or both left blank for automatic detection).');
+            } else {
+                $parsedLat = filter_var($rawLatInput, FILTER_VALIDATE_FLOAT);
+                $parsedLng = filter_var($rawLngInput, FILTER_VALIDATE_FLOAT);
+                if ($parsedLat === false || $parsedLat < -90.0 || $parsedLat > 90.0) {
+                    $validationError = gettext('Latitude must be a number between -90 and 90.');
+                } elseif ($parsedLng === false || $parsedLng < -180.0 || $parsedLng > 180.0) {
+                    $validationError = gettext('Longitude must be a number between -180 and 180.');
+                } else {
+                    $manualLat = $parsedLat;
+                    $manualLng = $parsedLng;
+                }
+            }
+        }
+
+        if (!empty($validationError)) {
+            // Re-render with validation error via the system-wide notify.
+            // Echo the user's lat/long input so they can correct it (rather
+            // than wiping their entry and showing the previously-saved value).
+            $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+            $churchInfo = [
+                'sChurchName'      => $churchName,
+                'sChurchAddress'   => $churchAddress,
+                'sChurchCity'      => $churchCity,
+                'sChurchState'     => $churchState,
+                'sChurchZip'       => $churchZip,
+                'sChurchCountry'   => $churchCountry,
+                'sChurchPhone'     => $churchPhone,
+                'sChurchEmail'     => $churchEmail,
+                'iChurchLatitude'  => $rawLatInput !== '' ? $rawLatInput : (string) (float) SystemConfig::getValue('iChurchLatitude'),
+                'iChurchLongitude' => $rawLngInput !== '' ? $rawLngInput : (string) (float) SystemConfig::getValue('iChurchLongitude'),
+                'sChurchWebSite'   => $body['sChurchWebSite'] ?? '',
+                'sChurchTaxId'     => $body['sChurchTaxId'] ?? '',
+            ];
+
+            $pageArgs = [
+                'sRootPath'          => SystemURLs::getRootPath(),
+                'sPageTitle'         => gettext('Church Information'),
+                'sPageSubtitle'      => gettext('Set your church name, address, and contact details'),
+                'aBreadcrumbs'       => PageHeader::breadcrumbs([
+                    [gettext('Admin'), '/admin/'],
+                    [gettext('Church Information')],
+                ]),
+                'churchInfo'         => $churchInfo,
+                'countries'          => Countries::getNames(),
+                'socialNetworks'     => $socialNetworks,
+                'sGlobalMessage'     => $validationError,
+                'sGlobalMessageClass' => 'danger',
+                'validationError'    => $validationError,
+            ];
+
+            return $renderer->render($response->withStatus(422), 'church-info.php', $pageArgs);
+        }
+
+        $address = $churchAddress;
+        $city    = $churchCity;
+        $state   = $churchState;
+        $zip     = $churchZip;
+        $country = $churchCountry;
+
+        // Coordinate resolution — manual entry always wins over auto-detection.
+        // 1. If admin entered both lat AND lng manually → use those, skip Nominatim
+        // 2. Otherwise → try to geocode from the address via GeoUtils (Nominatim)
+        // 3. If geocoding fails (returns 0,0 for a non-empty address) → surface a
+        //    warning flash so the admin knows to enter coordinates manually
+        $latitude  = '';
+        $longitude = '';
+        $geocodingFailed = false;
+
+        if ($manualLat !== null && $manualLng !== null) {
+            $latitude  = (string) $manualLat;
+            $longitude = (string) $manualLng;
+        } elseif ($address !== '') {
+            $coords = GeoUtils::getLatLong($address, $city, $state, $zip, $country);
+            if ($coords['Latitude'] !== 0.0 || $coords['Longitude'] !== 0.0) {
+                $latitude  = (string) $coords['Latitude'];
+                $longitude = (string) $coords['Longitude'];
+            } else {
+                // Geocoding silently returned no result — preserve any
+                // previously-saved coordinates (don't wipe them) and tell
+                // the admin to enter coordinates manually.
+                $previousLat = (float) SystemConfig::getValue('iChurchLatitude');
+                $previousLng = (float) SystemConfig::getValue('iChurchLongitude');
+                $latitude  = $previousLat !== 0.0 ? (string) $previousLat : '';
+                $longitude = $previousLng !== 0.0 ? (string) $previousLng : '';
+                $geocodingFailed = true;
+            }
+        }
+
+        SystemConfig::setValue('sChurchName', $churchName);
+        SystemConfig::setValue('sChurchAddress', $address);
+        SystemConfig::setValue('sChurchCity', $city);
+        SystemConfig::setValue('sChurchState', $state);
+        SystemConfig::setValue('sChurchZip', $zip);
+        SystemConfig::setValue('sChurchCountry', $country);
+        SystemConfig::setValue('sChurchPhone', $body['sChurchPhone'] ?? '');
+        SystemConfig::setValue('sChurchEmail', $body['sChurchEmail'] ?? '');
+        SystemConfig::setValue('iChurchLatitude', $latitude);
+        SystemConfig::setValue('iChurchLongitude', $longitude);
+        SystemConfig::setValue('sChurchWebSite', $body['sChurchWebSite'] ?? '');
+        SystemConfig::setValue('sChurchTaxId', $body['sChurchTaxId'] ?? '');
+        foreach ($socialNetworks as $network) {
+            SystemConfig::setValue($network['config'], $network['url']);
+        }
+
+        // Flash success via the system-wide notify. If geocoding silently
+        // failed (Nominatim returned no result for a non-empty address) we
+        // still saved the rest of the form, but warn the admin so they know
+        // to enter coordinates manually.
+        if ($geocodingFailed) {
+            $_SESSION['sGlobalMessage']      = gettext('Church information saved, but the address could not be auto-located. Please enter the latitude and longitude manually under Map Coordinates.');
+            $_SESSION['sGlobalMessageClass'] = 'warning';
+        } else {
+            $_SESSION['sGlobalMessage']      = gettext('Church information saved successfully');
+            $_SESSION['sGlobalMessageClass'] = 'success';
+        }
+
+        return $response
+            ->withHeader('Location', SystemURLs::getRootPath() . '/admin/system/church-info')
+            ->withStatus(303);
+    })->add(new InputSanitizationMiddleware([
+        'sChurchName'    => 'text',
+        'sChurchAddress' => 'text',
+        'sChurchCity'    => 'text',
+        'sChurchState'   => 'text',
+        'sChurchZip'     => 'text',
+        'sChurchCountry' => 'text',
+        'sChurchPhone'   => 'text',
+        'sChurchEmail'   => 'text',
+        'sChurchWebSite'  => 'text',
+        'sChurchTaxId'    => 'text',
+        'sChurchX'         => 'text',
+        'sChurchYouTube'   => 'text',
+        'sChurchFacebook'  => 'text',
+        'sChurchInstagram' => 'text',
+    ]));
+
+    // ── Localization & Formats ───────────────────────────────────────────────
+    // System-wide locale, date/time formats, and phone number formats. These
+    // are not church-identity data, so they live on their own page.
+    $group->get('/localization', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+        $sGlobalMessage      = '';
+        $sGlobalMessageClass = 'success';
+        if (isset($_SESSION['sGlobalMessage'])) {
+            $sGlobalMessage      = $_SESSION['sGlobalMessage'];
+            $sGlobalMessageClass = $_SESSION['sGlobalMessageClass'] ?? 'success';
+            unset($_SESSION['sGlobalMessage'], $_SESSION['sGlobalMessageClass']);
+        }
+
+        $localeSettings = [
+            'sLanguage'              => SystemConfig::getValue('sLanguage'),
+            'sTimeZone'              => SystemConfig::getValue('sTimeZone'),
+            'sDistanceUnit'          => SystemConfig::getValue('sDistanceUnit') ?: 'miles',
+            // Date & Time Formats — fall back to declared defaults when unset.
+            'sDateFormatLong'        => SystemConfig::getValue('sDateFormatLong')        ?: SystemConfig::getConfigItem('sDateFormatLong')->getDefault(),
+            'sDateFormatNoYear'      => SystemConfig::getValue('sDateFormatNoYear')      ?: SystemConfig::getConfigItem('sDateFormatNoYear')->getDefault(),
+            'sDateTimeFormat'        => SystemConfig::getValue('sDateTimeFormat')        ?: SystemConfig::getConfigItem('sDateTimeFormat')->getDefault(),
+            'sDateFilenameFormat'    => SystemConfig::getValue('sDateFilenameFormat')    ?: SystemConfig::getConfigItem('sDateFilenameFormat')->getDefault(),
+            'sDatePickerFormat'      => SystemConfig::getValue('sDatePickerFormat')      ?: SystemConfig::getConfigItem('sDatePickerFormat')->getDefault(),
+            // Currency & Finance Formats
+            'sCurrencySymbol'        => SystemConfig::getValue('sCurrencySymbol')        ?: SystemConfig::getConfigItem('sCurrencySymbol')->getDefault(),
+            'sCurrencyPosition'      => SystemConfig::getValue('sCurrencyPosition')      ?: SystemConfig::getConfigItem('sCurrencyPosition')->getDefault(),
+            'sThousandsSeparator'    => SystemConfig::getValue('sThousandsSeparator')    ?: SystemConfig::getConfigItem('sThousandsSeparator')->getDefault(),
+            'sDecimalSeparator'      => SystemConfig::getValue('sDecimalSeparator')      ?: SystemConfig::getConfigItem('sDecimalSeparator')->getDefault(),
+            // Phone Number Formats
+            'sPhoneFormat'           => SystemConfig::getValue('sPhoneFormat')           ?: SystemConfig::getConfigItem('sPhoneFormat')->getDefault(),
+            'sPhoneFormatWithExt'    => SystemConfig::getValue('sPhoneFormatWithExt')    ?: SystemConfig::getConfigItem('sPhoneFormatWithExt')->getDefault(),
+            'sPhoneFormatCell'       => SystemConfig::getValue('sPhoneFormatCell')       ?: SystemConfig::getConfigItem('sPhoneFormatCell')->getDefault(),
+        ];
+
+        // Per-locale stats for the Display Preview: translation completeness %
+        // (from locale/poeditor.json) + whether the GNU locale is installed on
+        // the host OS (so the admin knows date/number formatting will work).
+        // The system-locale check shells out via LocaleService; if exec() is
+        // disabled we degrade gracefully (systemAvailable = null = "unknown").
+        $localeStats        = [];
+        $systemCheckEnabled = true;
+        $availableNormalized = [];
+        try {
+            $availableSystem = LocaleService::getAvailableSystemLocales();
+            $availableNormalized = array_unique(array_map(
+                static fn ($l) => preg_replace('/(\.[^.]*)?(@.*)?$/', '', $l),
+                $availableSystem
+            ));
+        } catch (\Throwable $e) {
+            $systemCheckEnabled = false;
+        }
+
+        foreach (LocaleService::getSupportedLocales() as $displayName => $cfg) {
+            $code = $cfg['locale'] ?? '';
+            if ($code === '') {
+                continue;
+            }
+            $info         = new LocaleInfo($code, null);
+            $languageCode = $cfg['languageCode'] ?? '';
+
+            $systemAvailable = null;
+            if ($systemCheckEnabled) {
+                $systemAvailable = in_array($code, $availableNormalized, true)
+                    || in_array($languageCode, $availableNormalized, true)
+                    || in_array(str_replace('_', '-', $code), $availableNormalized, true);
+            }
+
+            // Translation % comes from locale/poeditor.json; guard so a missing
+            // file on a given install degrades to "not tracked" instead of 500.
+            $showPercentage = false;
+            $percentage     = 0;
+            try {
+                $showPercentage = $info->shouldShowTranslationPercentage();
+                $percentage     = $showPercentage ? $info->getTranslationPercentage() : 100;
+            } catch (\Throwable $e) {
+                $showPercentage = false;
+            }
+
+            $localeStats[$code] = [
+                'name'            => $displayName,
+                'nativeName'      => $info->getNativeName(),
+                'flag'            => $info->getCountryFlagCode(),
+                'percentage'      => $percentage,
+                'showPercentage'  => $showPercentage,
+                'systemAvailable' => $systemAvailable,
+            ];
+        }
+
+        $pageArgs = [
+            'sRootPath'          => SystemURLs::getRootPath(),
+            'sPageTitle'         => gettext('Localization & Formats'),
+            'sPageSubtitle'      => gettext('System language, time zone, date/time formats, and phone number formats'),
+            'aBreadcrumbs'       => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Localization & Formats')],
+            ]),
+            'localeSettings'     => $localeSettings,
+            'localeStats'        => $localeStats,
+            'systemCheckEnabled' => $systemCheckEnabled,
+            'timezones'          => timezone_identifiers_list(),
+            'sGlobalMessage'     => $sGlobalMessage,
+            'sGlobalMessageClass' => $sGlobalMessageClass,
+        ];
+
+        return $renderer->render($response, 'localization.php', $pageArgs);
+    });
+
+    $group->post('/localization', function (Request $request, Response $response): Response {
+        // Body fields have already been sanitized by InputSanitizationMiddleware
+        $body = $request->getParsedBody();
+
+        $supportedLocaleCodes = array_column(LocaleService::getSupportedLocales(), 'locale');
+        $lang = $body['sLanguage'] ?? 'en_US';
+        SystemConfig::setValue('sLanguage', in_array($lang, $supportedLocaleCodes, true) ? $lang : 'en_US');
+        $tz = trim((string)($body['sTimeZone'] ?? ''));
+        SystemConfig::setValue('sTimeZone', in_array($tz, timezone_identifiers_list(), true) ? $tz : date_default_timezone_get());
+        $distanceUnit = $body['sDistanceUnit'] ?? 'miles';
+        SystemConfig::setValue('sDistanceUnit', in_array($distanceUnit, ['miles', 'kilometers'], true) ? $distanceUnit : 'miles');
+
+        // Date & Time Formats — fall back to each key's declared default when
+        // empty/whitespace. An empty string passed to PHP's date() produces
+        // empty output app-wide.
+        foreach (['sDateFormatLong', 'sDateFormatNoYear', 'sDateTimeFormat', 'sDateFilenameFormat', 'sDatePickerFormat'] as $key) {
+            $val = trim((string) ($body[$key] ?? ''));
+            if ($key === 'sDatePickerFormat' && !DateTimeUtils::isCompleteDateFormat($val)) {
+                $val = '';
+            }
+            SystemConfig::setValue($key, $val !== '' ? $val : SystemConfig::getConfigItem($key)->getDefault());
+        }
+        // Phone Number Formats — same empty-value guard.
+        foreach (['sPhoneFormat', 'sPhoneFormatWithExt', 'sPhoneFormatCell'] as $key) {
+            $val = trim((string) ($body[$key] ?? ''));
+            SystemConfig::setValue($key, $val !== '' ? $val : SystemConfig::getConfigItem($key)->getDefault());
+        }
+        // Currency & Finance Formats — validate all four values before saving any,
+        // so a separator conflict never partially commits the currency group.
+        $currencyPosition = trim((string) ($body['sCurrencyPosition'] ?? ''));
+        $currencyPosition = in_array($currencyPosition, ['before', 'after'], true) ? $currencyPosition : 'before';
+
+        $currencySymbol = trim((string) ($body['sCurrencySymbol'] ?? ''));
+        if (mb_strlen($currencySymbol) > 8) {
+            $currencySymbol = mb_substr($currencySymbol, 0, 8);
+        }
+        $currencySymbol = $currencySymbol !== '' ? $currencySymbol : SystemConfig::getConfigItem('sCurrencySymbol')->getDefault();
+
+        // Use mb_substr without trim() — a regular space (U+0020) is a valid thousands
+        // separator in French/Swiss/Swedish locales. These two fields are deliberately
+        // NOT in the InputSanitizationMiddleware map: sanitizeText() trims, which would
+        // silently turn a submitted space into the fallback default.
+        $thousands = mb_substr((string) ($body['sThousandsSeparator'] ?? ''), 0, 1);
+        $decimal   = mb_substr((string) ($body['sDecimalSeparator'] ?? ''), 0, 1);
+        // Validate: thousands and decimal separators must differ to avoid ambiguous number_format() output.
+        $effectiveThousands = $thousands !== '' ? $thousands : SystemConfig::getConfigItem('sThousandsSeparator')->getDefault();
+        $effectiveDecimal   = $decimal !== '' ? $decimal : SystemConfig::getConfigItem('sDecimalSeparator')->getDefault();
+        if ($effectiveThousands === $effectiveDecimal) {
+            $_SESSION['sGlobalMessage']      = gettext('Thousands separator and decimal separator must be different characters.');
+            $_SESSION['sGlobalMessageClass'] = 'danger';
+            return $response
+                ->withHeader('Location', SystemURLs::getRootPath() . '/admin/system/localization')
+                ->withStatus(303);
+        }
+        // All validation passed — save the currency group.
+        SystemConfig::setValue('sCurrencyPosition', $currencyPosition);
+        SystemConfig::setValue('sCurrencySymbol', $currencySymbol);
+        SystemConfig::setValue('sThousandsSeparator', $effectiveThousands);
+        SystemConfig::setValue('sDecimalSeparator', $effectiveDecimal);
+
+        $_SESSION['sGlobalMessage']      = gettext('Localization settings saved successfully');
+        $_SESSION['sGlobalMessageClass'] = 'success';
+
+        return $response
+            ->withHeader('Location', SystemURLs::getRootPath() . '/admin/system/localization')
+            ->withStatus(303);
+    })->add(new InputSanitizationMiddleware([
+        'sLanguage'       => 'text',
+        'sTimeZone'       => 'text',
+        'sDistanceUnit'   => 'text',
+        'sDateFormatLong'      => 'text',
+        'sDateFormatNoYear'    => 'text',
+        'sDateTimeFormat'      => 'text',
+        'sDateFilenameFormat'  => 'text',
+        'sDatePickerFormat'    => 'text',
+        'sPhoneFormat'         => 'text',
+        'sPhoneFormatWithExt'  => 'text',
+        'sPhoneFormatCell'     => 'text',
+        'sCurrencySymbol'      => 'text',
+        'sCurrencyPosition'    => 'text',
+        // sThousandsSeparator / sDecimalSeparator intentionally omitted: sanitizeText()
+        // trims, which would strip a space separator. The handler caps them to one char.
+    ]));
+
+    // Feature Toggles page
+    $group->get('/feature-toggles', function (Request $request, Response $response): Response {
+        $renderer = new PhpRenderer(__DIR__ . '/../views/');
+
+        $pageArgs = [
+            'sRootPath' => SystemURLs::getRootPath(),
+            'sPageTitle' => gettext('Feature Toggles'),
+            'sPageSubtitle' => gettext('Enable or disable features for your organization'),
+            'aBreadcrumbs' => PageHeader::breadcrumbs([
+                [gettext('Admin'), '/admin/'],
+                [gettext('Feature Toggles')],
+            ]),
+        ];
+
+        return $renderer->render($response, 'feature-toggles.php', $pageArgs);
+    });
+
+    // User editor — create new user (GET shows form, POST processes it)
+    $group->get('/users/new', 'adminUserEditorNew');
+    $group->post('/users/new', 'adminUserEditorNew')->add(new CSRFMiddleware('user_editor'));
+
+    // User editor — edit existing user (GET shows form, POST processes it)
+    $group->get('/users/{personId:[0-9]+}/edit', 'adminUserEditorEdit');
+    $group->post('/users/{personId:[0-9]+}/edit', 'adminUserEditorEdit')->add(new CSRFMiddleware('user_editor'));
+
+});
+
+function adminChangeUserPassword(Request $request, Response $response, array $args): Response
+{
+    $renderer = new PhpRenderer(__DIR__ . '/../views/');
+    $userId = (int) $args['id'];
+    $curUser = AuthenticationManager::getCurrentUser();
+
+    $user = UserQuery::create()->findPk($userId);
+
+    if (empty($user)) {
+        return SlimUtils::renderRedirect($response, SystemURLs::getRootPath() . '/v2/user/not-found?id=' . $args['id']);
+    }
+
+    if ($user->equals($curUser)) {
+        // Don't allow the current user (if admin) to set their new password
+        // make the user go through the "self-service" password change procedure
+        return SlimUtils::renderRedirect($response, SystemURLs::getRootPath() . '/v2/user/current/changepassword');
+    }
+
+    $pageArgs = [
+        'sRootPath' => SystemURLs::getRootPath(),
+        'user' => $user,
+        'sPageTitle' => gettext('Change Password') . ': ' . InputUtils::escapeHTML($user->getFullName()),
+        'aBreadcrumbs' => PageHeader::breadcrumbs([
+            [gettext('Admin'), '/admin/'],
+            [gettext('System Users'), '/admin/system/users'],
+            [gettext('Change Password')],
+        ]),
+    ];
+
+    if ($request->getMethod() === 'POST') {
+        $loginRequestBody = (array) $request->getParsedBody();
+        $newPassword = (string) ($loginRequestBody['NewPassword1'] ?? '');
+
+        try {
+            if (trim($newPassword) === '') {
+                throw new PasswordChangeException('New', gettext('Enter a new password'));
+            }
+
+            if ($newPassword !== (string) ($loginRequestBody['NewPassword2'] ?? '')) {
+                throw new PasswordChangeException('New', gettext('You must enter the same password in both boxes'));
+            }
+
+            $user->adminSetUserPassword($newPassword);
+
+            $pageArgs['sPasswordChangeSuccess'] = true;
+
+            return $renderer->render($response, 'adminchangepassword.php', $pageArgs);
+        } catch (PasswordChangeException $pwChangeExc) {
+            $pageArgs['s' . $pwChangeExc->AffectedPassword . 'PasswordError'] = $pwChangeExc->getMessage();
+        }
+    }
+
+    return $renderer->render($response, 'adminchangepassword.php', $pageArgs);
+}
+
+/**
+ * User editor — add a new user account.
+ *
+ * GET  /admin/system/users/new            — shows form (person picker or pre-selected person)
+ *   ?personId=N                           — pre-selects person N and skips the picker
+ * POST /admin/system/users/new            — creates the user; re-renders on validation error
+ */
+function adminUserEditorNew(Request $request, Response $response): Response
+{
+    $renderer    = new PhpRenderer(__DIR__ . '/../views/');
+    $userService = new UserService();
+
+    // Common page args
+    $pageArgs = [
+        'sRootPath'          => SystemURLs::getRootPath(),
+        'sPageTitle'         => gettext('User Editor'),
+        'sPageSubtitle'      => gettext('Create a new user account'),
+        'aBreadcrumbs'       => PageHeader::breadcrumbs([
+            [gettext('Admin'), '/admin/'],
+            [gettext('Users'), '/admin/system/users'],
+            [gettext('New User')],
+        ]),
+        'sPageHeaderButtons' => PageHeader::buttons([
+            ['label' => gettext('User List'), 'url' => '/admin/system/users', 'icon' => 'fa-users'],
+        ]),
+        'isNew'        => true,
+        'configRows'   => [],
+        'bEmailEnabled'  => SystemConfig::isEmailEnabled(),
+        'eventsEnabled'  => User::isEventsEnabled(),
+    ];
+
+    if ($request->getMethod() === 'POST') {
+        $body       = (array) $request->getParsedBody();
+        $personId   = (int) ($body['PersonID'] ?? 0);
+        $userName   = InputUtils::sanitizeText((string) ($body['UserName'] ?? ''));
+        $perms      = $userService->normalizeAccessMode($body);
+
+        // Re-load person name for re-render on error
+        $person = $personId > 0 ? PersonQuery::create()->findPk($personId) : null;
+        $sUser  = $person ? ($person->getLastName() . ', ' . $person->getFirstName()) : '';
+
+        $pageArgs['editorPersonId']      = $personId;
+        $pageArgs['sUser']             = $sUser;
+        $pageArgs['sUserName']         = $userName;
+        $pageArgs['perms']             = $perms;
+        $pageArgs['showPersonSelect']  = false;
+        $pageArgs['people']            = [];
+        $pageArgs['formAction']        = SystemURLs::getRootPath() . '/admin/system/users/new';
+
+        if ($personId <= 0) {
+            $pageArgs['sErrorText']       = gettext('Please select a person to create a user account for.');
+            $pageArgs['showPersonSelect'] = true;
+            $pageArgs['people']           = $userService->getAssignablePeople();
+            $pageArgs['sUserName']        = '';
+            $pageArgs['perms']            = ['admin' => 0, 'editSelf' => 0, 'addRecords' => 0,
+                                             'editRecords' => 0, 'deleteRecords' => 0,
+                                             'manageGroups' => 0,
+                                             'finance' => 0, 'manageFundraisers' => 0,
+                                             'manageMinistries' => 0, 'manageMyMinistries' => 0, 'notes' => 0,
+                                             'addEvent' => 0];
+            return $renderer->render($response, 'user-editor.php', $pageArgs);
+        }
+
+        try {
+            $userService->createUser($personId, $perms, $userName);
+            return SlimUtils::renderRedirect($response, SystemURLs::getRootPath() . '/admin/system/users');
+        } catch (\Throwable $e) {
+            \ChurchCRM\Utils\LoggerUtils::getAppLogger()->error('createUser failed: ' . $e->getMessage(), [
+                'personId'  => $personId,
+                'userName'  => $userName,
+                'exception' => get_class($e),
+                'file'      => $e->getFile(),
+                'line'      => $e->getLine(),
+            ]);
+            $pageArgs['sErrorText'] = $e->getMessage();
+            return $renderer->render($response, 'user-editor.php', $pageArgs);
+        }
+    }
+
+    // GET — show the form
+    $personId = (int) ($request->getQueryParams()['personId'] ?? 0);
+
+    if ($personId > 0) {
+        // Pre-selected person (from People view "Make User")
+        $person = PersonQuery::create()->findPk($personId);
+        if ($person === null) {
+            return SlimUtils::renderRedirect($response, SystemURLs::getRootPath() . '/admin/system/users');
+        }
+        $sUser    = $person->getLastName() . ', ' . $person->getFirstName();
+        $email    = $person->getEmail();
+        $userName = !empty($email) ? $email : $person->getFirstName() . '.' . $person->getLastName();
+        $pageArgs['editorPersonId']        = $personId;
+        $pageArgs['sUser']            = $sUser;
+        $pageArgs['sUserName']        = $userName;
+        $pageArgs['showPersonSelect'] = false;
+        $pageArgs['people']           = [];
+    } else {
+        // No person pre-selected — show person picker
+        $pageArgs['editorPersonId']        = 0;
+        $pageArgs['sUser']            = '';
+        $pageArgs['sUserName']        = '';
+        $pageArgs['showPersonSelect'] = true;
+        $pageArgs['people']           = $userService->getAssignablePeople();
+    }
+
+    $pageArgs['perms'] = [
+        'admin' => 0, 'editSelf' => 0, 'addRecords' => 0,
+        'editRecords' => 0, 'deleteRecords' => 0,
+        'manageGroups' => 0,
+        'finance' => 0, 'manageFundraisers' => 0, 'manageMinistries' => 0, 'manageMyMinistries' => 0, 'notes' => 0,
+        'addEvent' => 0,
+    ];
+    $pageArgs['formAction'] = SystemURLs::getRootPath() . '/admin/system/users/new';
+    $pageArgs['sErrorText'] = '';
+
+    return $renderer->render($response, 'user-editor.php', $pageArgs);
+}
+
+/**
+ * User editor — edit an existing user account.
+ *
+ * GET  /admin/system/users/{personId}/edit  — shows the edit form
+ * POST /admin/system/users/{personId}/edit  — saves account + per-user config; re-renders on error
+ */
+function adminUserEditorEdit(Request $request, Response $response, array $args): Response
+{
+    $renderer    = new PhpRenderer(__DIR__ . '/../views/');
+    $userService = new UserService();
+    $personId    = (int) $args['personId'];
+
+    $user = UserQuery::create()->findPk($personId);
+    if ($user === null) {
+        return SlimUtils::renderRedirect($response, SystemURLs::getRootPath() . '/admin/system/users');
+    }
+
+    $person = $user->getPerson();
+    $sUser  = $person ? ($person->getLastName() . ', ' . $person->getFirstName()) : '';
+
+    // Common page args
+    $pageArgs = [
+        'sRootPath'          => SystemURLs::getRootPath(),
+        'sPageTitle'         => gettext('User Editor'),
+        'sPageSubtitle'      => gettext('Manage user account details and permissions'),
+        'aBreadcrumbs'       => PageHeader::breadcrumbs([
+            [gettext('Admin'), '/admin/'],
+            [gettext('Users'), '/admin/system/users'],
+            [gettext('Edit User')],
+        ]),
+        'sPageHeaderButtons' => PageHeader::buttons(array_filter([
+            ['label' => gettext('View User'), 'url' => '/v2/user/' . $personId, 'icon' => 'fa-eye'],
+            ['label' => gettext('User List'), 'url' => '/admin/system/users', 'icon' => 'fa-users'],
+        ])),
+        'isNew'            => false,
+        'editorPersonId'   => $personId,
+        'sUser'            => $sUser,
+        'showPersonSelect' => false,
+        'people'           => [],
+        'bEmailEnabled'    => SystemConfig::isEmailEnabled(),
+        'eventsEnabled'    => User::isEventsEnabled(),
+        'formAction'       => SystemURLs::getRootPath() . '/admin/system/users/' . $personId . '/edit',
+        'sErrorText'       => '',
+    ];
+
+    if ($request->getMethod() === 'POST') {
+        $body     = (array) $request->getParsedBody();
+        $userName = InputUtils::sanitizeText((string) ($body['UserName'] ?? ''));
+        $perms    = $userService->normalizeAccessMode($body);
+
+        $pageArgs['sUserName'] = $userName;
+        $pageArgs['perms']     = $perms;
+        // configRows is initialised to [] here so the template always has the
+        // key; getUserConfigRows() is called inside the try so that a DB error
+        // during the load is also caught and surfaced via sErrorText.
+        $pageArgs['configRows'] = [];
+
+        try {
+            $pageArgs['configRows'] = $userService->getUserConfigRows($personId);
+            $newValue      = (array) ($body['new_value'] ?? []);
+            $newPermission = (array) ($body['new_permission'] ?? []);
+            $types         = (array) ($body['type'] ?? []);
+            $userService->updateUserWithConfig($personId, $perms, $userName, $newValue, $newPermission, $types);
+            return SlimUtils::renderRedirect($response, SystemURLs::getRootPath() . '/admin/system/users');
+        } catch (\Throwable $e) {
+            $pageArgs['sErrorText'] = $e->getMessage();
+            return $renderer->render($response, 'user-editor.php', $pageArgs);
+        }
+    }
+
+    // GET — load current values
+    $pageArgs['sUserName']  = $user->getUserName();
+    $pageArgs['perms']      = [
+        'admin'        => $user->getAdmin(),
+        'editSelf'     => $user->getEditSelf(),
+        'addRecords'   => $user->getAddRecords(),
+        'editRecords'  => $user->getEditRecords(),
+        'deleteRecords' => $user->getDeleteRecords(),
+        'manageGroups'       => $user->getManageGroups(),
+        'finance'            => $user->getFinance(),
+        'manageFundraisers'  => $user->getManageFundraisers(),
+        'manageMinistries'   => $user->getManageMinistries(),
+        'manageMyMinistries' => $user->getManageMyMinistries(),
+        'notes'              => $user->getNotes(),
+        'addEvent'           => $userService->getAddEventPermission($personId),
+    ];
+    $pageArgs['configRows'] = $userService->getUserConfigRows($personId);
+
+    return $renderer->render($response, 'user-editor.php', $pageArgs);
+}

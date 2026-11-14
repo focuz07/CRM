@@ -1,0 +1,112 @@
+/// <reference types="cypress" />
+
+const SERVER_DETAILS = [
+    "Platform Information",
+    "Web Server",
+    "PHP Version",
+    "SQL Version",
+    "Installation ID",
+    "Person Custom Fields",
+    "Family Custom Fields",
+    "Prerequisite Status",
+];
+
+describe("API System Issues", () => {
+    it("Issues endpoint requires authentication", () => {
+        // Unauthenticated request should be rejected
+        cy.apiRequest({
+            method: "POST",
+            url: "/api/issues",
+            headers: { "content-type": "application/json" },
+            body: {
+                pageName: "test",
+                screenSize: { height: 1080, width: 1920 },
+                windowSize: { height: 900, width: 1440 },
+                pageSize: { height: 2000, width: 1440 },
+            },
+            failOnStatusCode: false,
+        }).then((resp) => {
+            // Should return 401 — requires authentication
+            expect(resp.status).to.eq(401);
+        });
+    });
+
+    it("Issues endpoint returns diagnostics for authenticated users", () => {
+        cy.makePrivateAdminAPICall(
+            "POST",
+            "/api/issues",
+            {
+                pageName: "TestPage",
+                screenSize: { height: 1080, width: 1920 },
+                windowSize: { height: 900, width: 1440 },
+                pageSize: { height: 2000, width: 1440 },
+            },
+            200,
+        ).then((resp) => {
+            expect(resp.body).to.have.property("issueBody");
+            expect(resp.body.issueBody).to.contain("TestPage");
+            expect(resp.body.issueBody).to.contain("ChurchCRM Version");
+            SERVER_DETAILS.forEach((label) => expect(resp.body.issueBody).to.contain(label));
+        });
+    });
+
+    it("Issues endpoint works for standard (non-admin) users", () => {
+        cy.makePrivateUserAPICall(
+            "POST",
+            "/api/issues",
+            {
+                pageName: "StandardUserPage",
+                screenSize: { height: 1080, width: 1920 },
+                windowSize: { height: 900, width: 1440 },
+                pageSize: { height: 2000, width: 1440 },
+            },
+            200,
+        ).then((resp) => {
+            expect(resp.body).to.have.property("issueBody");
+            expect(resp.body.issueBody).to.contain("StandardUserPage");
+            SERVER_DETAILS.forEach((label) => expect(resp.body.issueBody).to.not.contain(label));
+        });
+    });
+
+    it("Issues endpoint includes system/user locale, timezone, and custom field count", () => {
+        cy.makePrivateAdminAPICall(
+            "POST",
+            "/api/issues",
+            {
+                pageName: "LocaleDiagnosticsPage",
+                screenSize: { height: 1080, width: 1920 },
+                windowSize: { height: 900, width: 1440 },
+                pageSize: { height: 2000, width: 1440 },
+                browserLocale: "fr-FR",
+                browserTimezone: "Europe/Paris",
+            },
+            200,
+        ).then((resp) => {
+            expect(resp.body.issueBody).to.contain("System Locale");
+            expect(resp.body.issueBody).to.contain("User Locale");
+            expect(resp.body.issueBody).to.contain("Browser Locale |fr-FR");
+            expect(resp.body.issueBody).to.contain("Church Country");
+            expect(resp.body.issueBody).to.contain("System Timezone");
+            expect(resp.body.issueBody).to.contain("Browser Timezone |Europe/Paris");
+            expect(resp.body.issueBody).to.match(/Person Custom Fields \|\d+\r\n/);
+            expect(resp.body.issueBody).to.match(/Family Custom Fields \|\d+\r\n/);
+        });
+    });
+
+    it("Issues endpoint falls back to 'Unknown' when browser locale/timezone are omitted", () => {
+        cy.makePrivateAdminAPICall(
+            "POST",
+            "/api/issues",
+            {
+                pageName: "NoBrowserLocalePage",
+                screenSize: { height: 1080, width: 1920 },
+                windowSize: { height: 900, width: 1440 },
+                pageSize: { height: 2000, width: 1440 },
+            },
+            200,
+        ).then((resp) => {
+            expect(resp.body.issueBody).to.contain("Browser Locale |Unknown");
+            expect(resp.body.issueBody).to.contain("Browser Timezone |Unknown");
+        });
+    });
+});

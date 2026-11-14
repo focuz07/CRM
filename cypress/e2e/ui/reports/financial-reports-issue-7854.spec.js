@@ -1,0 +1,188 @@
+/// <reference types="cypress" />
+
+/**
+ * Test for issue #7854: Advanced Deposit Report showing UNDESIGNATED/UNASSIGNED
+ * 
+ * This test verifies that:
+ * 1. Advanced Deposit Report displays actual fund names (not "UNDESIGNATED")
+ * 2. Advanced Deposit Report displays actual family names (not "UNASSIGNED")
+ * 3. Report works correctly with large datasets
+ */
+
+describe("Issue #7854 - Financial Reports Fix", () => {
+    beforeEach(() => {
+        cy.setupAdminSession();
+    });
+
+    describe("Advanced Deposit Report - Fund and Family Names", () => {
+        it("should display actual fund names and family names (not UNDESIGNATED/UNASSIGNED)", () => {
+            // Navigate to Financial Reports
+            cy.visit("/FinancialReports.php");
+            cy.get(".page-title").contains("Financial Reports").should("be.visible");
+
+            // Select Advanced Deposit Report
+            cy.visit("/finance/reports/deposits");
+            cy.get("#depositAdvancedSettings > summary").click();
+            cy.contains("Deposit Reports").should("be.visible");
+
+            // Configure report for CSV output (easier to parse than PDF)
+            cy.get("input[name='output'][value='csv']").check({ force: true });
+
+            // Set broad date range to capture all test data
+            cy.get("input[name='DateStart']").clear({ force: true }).type("2018-01-01", { force: true });
+            cy.get("input[name='DateEnd']").clear({ force: true }).type(getTodayDate(), { force: true });
+
+            // Intercept the CSV download to inspect content
+            cy.intercept("POST", "**/finance/reports/deposits/download").as("csvDownload");
+
+            // Generate report
+            cy.get("#createReport").click();
+
+            // Wait for response and verify content
+            cy.wait("@csvDownload", { timeout: 30000 }).then((interception) => {
+                // Check if we got actual data (not a redirect to "No Data" page)
+                cy.url().then((url) => {
+                    if (!url.includes('ReturnMessage=NoRows')) {
+                        // Verify we got a CSV response
+                        expect(interception.response.statusCode).to.equal(200);
+                        expect(interception.response.headers["content-type"]).to.include("text/csv");
+
+                        const csvContent = interception.response.body;
+
+                        // CRITICAL CHECKS for issue #7854:
+                        // 1. CSV should NOT contain "UNDESIGNATED" for fund names
+                        // 2. CSV should NOT contain "UNASSIGNED" for family names
+                        
+                        // Split CSV into lines
+                        const lines = csvContent.split('\n');
+                        
+                        // First line should be headers
+                        expect(lines[0]).to.include('fam_Name'); // Should have family name column
+                        expect(lines[0]).to.include('fun_Name'); // Should have fund name column
+
+                        // Check data rows (skip header)
+                        const dataRows = lines.slice(1).filter(line => line.trim() !== '');
+                        
+                        if (dataRows.length > 0) {
+                            // Parse CSV to verify fund and family names
+                            const headers = lines[0].split(',').map(h => h.replace(/"/g, '').trim());
+                            const famNameIndex = headers.indexOf('fam_Name');
+                            const funNameIndex = headers.indexOf('fun_Name');
+
+                            expect(famNameIndex).to.be.greaterThan(-1, "fam_Name column should exist");
+                            expect(funNameIndex).to.be.greaterThan(-1, "fun_Name column should exist");
+
+                            let hasActualFundName = false;
+                            let hasActualFamilyName = false;
+
+                            dataRows.forEach((row, index) => {
+                                const columns = row.split(',').map(c => c.replace(/"/g, '').trim());
+                                
+                                const familyName = columns[famNameIndex];
+                                const fundName = columns[funNameIndex];
+
+                                // Family name should NOT be "UNASSIGNED" (unless truly unassigned)
+                                if (familyName && familyName !== 'UNASSIGNED' && familyName !== '') {
+                                    hasActualFamilyName = true;
+                                }
+
+                                // Fund name should NOT be "UNDESIGNATED" (unless truly undesignated)
+                                if (fundName && fundName !== 'UNDESIGNATED' && fundName !== '') {
+                                    hasActualFundName = true;
+                                }
+                            });
+
+                            // At least one row should have actual fund and family names
+                            expect(hasActualFundName, "At least one row should have an actual fund name").to.be.true;
+                            expect(hasActualFamilyName, "At least one row should have an actual family name").to.be.true;
+
+                            cy.log("✅ Advanced Deposit Report correctly displays fund and family names");
+                        }
+                    } else {
+                        // No data found - this is acceptable, just verify the message
+                        cy.contains('No Data Found').should('be.visible');
+                        cy.log("⚠️ No data found in date range - test passed but no data to verify");
+                    }
+                });
+            });
+        });
+
+        it("should handle date range filtering correctly", () => {
+            cy.visit("/finance/reports/deposits");
+            cy.get("#depositAdvancedSettings > summary").click();
+
+            // Test with current month only
+            const firstDayOfMonth = new Date();
+            firstDayOfMonth.setDate(1);
+            const today = new Date();
+
+            const startDate = formatDate(firstDayOfMonth);
+            const endDate = formatDate(today);
+
+            cy.get("input[name='DateStart']").clear({ force: true }).type(startDate, { force: true });
+            cy.get("input[name='DateEnd']").clear({ force: true }).type(endDate, { force: true });
+
+            cy.get("input[name='output'][value='csv']").check({ force: true });
+            cy.get("#createReport").click();
+
+            // Should either show data or "No Data Found" - both are valid
+            cy.url().then((url) => {
+                if (url.includes('ReturnMessage=NoRows')) {
+                    cy.contains('No Data Found').should('be.visible');
+                } else {
+                    // CSV should be generated
+                    cy.url().should('not.include', 'error');
+                }
+            });
+        });
+
+        it("should sort by different criteria without errors", () => {
+            cy.visit("/finance/reports/deposits");
+            cy.get("#depositAdvancedSettings > summary").click();
+
+            // Set date range
+            cy.get("input[name='DateStart']").clear({ force: true }).type("2024-01-01", { force: true });
+            cy.get("input[name='DateEnd']").clear({ force: true }).type(getTodayDate(), { force: true });
+
+            // Test different sort orders (radio buttons, not select)
+            const sortOptions = ['deposit', 'fund', 'family'];
+            
+            sortOptions.forEach((sortBy) => {
+                cy.get(`input[name='sort'][value='${sortBy}']`).check({ force: true });
+                cy.get("input[name='output'][value='csv']").check({ force: true });
+                
+                cy.intercept("POST", "**/finance/reports/deposits/download").as("sortedReport");
+                cy.get("#createReport").click();
+
+                cy.url().then((url) => {
+                    if (!url.includes('ReturnMessage=NoRows')) {
+                        cy.wait("@sortedReport").then((interception) => {
+                            expect(interception.response.statusCode).to.equal(200);
+                        });
+                    }
+                });
+
+                // Go back to report config
+                if (sortBy !== sortOptions[sortOptions.length - 1]) {
+                    cy.visit("/finance/reports/deposits");
+                    cy.get("#depositAdvancedSettings > summary").click();
+                    cy.get("input[name='DateStart']").clear({ force: true }).type("2024-01-01", { force: true });
+                    cy.get("input[name='DateEnd']").clear({ force: true }).type(getTodayDate(), { force: true });
+                }
+            });
+        });
+    });
+});
+
+// Helper functions
+function getTodayDate() {
+    const today = new Date();
+    return formatDate(today);
+}
+
+function formatDate(date) {
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const year = date.getFullYear();
+    return `${year}-${month}-${day}`;
+}

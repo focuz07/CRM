@@ -1,0 +1,624 @@
+// ***********************************************
+// This example commands.js shows you how to
+// create various custom commands and overwrite
+// existing commands.
+//
+// For more comprehensive examples of custom
+// commands please read more here:
+// https://on.cypress.io/custom-commands
+// ***********************************************
+
+// A remote notice (External/notifications.json) can land on the first page after sign-in and push the
+// layout down. Dismiss it the way a user does so it is saved per user and never rendered again.
+Cypress.Commands.add('dismissSystemNotifications', () => {
+    cy.window().its('CRM.userId').should('exist');
+    cy.get('body').then($body => {
+        const $buttons = $body.find('.crm-system-notification .js-dismiss-notification');
+        if ($buttons.length === 0) {
+            return;
+        }
+        cy.intercept('POST', '**/api/user/*/setting/notification.dismissed.*').as('dismissNotification');
+        cy.wrap($buttons).click({ multiple: true });
+        cy.wait(Array($buttons.length).fill('@dismissNotification'));
+        cy.get('.crm-system-notification').should('not.exist');
+    });
+});
+
+// Staff sign-in lives at /session/begin; a successful login is proved by the
+// user menu's Sign out link.
+Cypress.Commands.add('expectStaffSignedIn', (options = {}) => {
+    cy.get('a[href$="/session/end"]', options).should('exist');
+    cy.get('#UserBox, #PasswordBox').should('not.exist');
+});
+
+/**
+ * Internal helper: Sets up a cached login session using cy.session()
+ * Performs login and validates with CRM cookie presence
+ * @param {string} sessionName - Unique identifier for this session (e.g., 'admin-session')
+ * @param {string} username - The username to authenticate with
+ * @param {string} password - The password to authenticate with
+ * @param {{ forceLogin?: boolean }} options - Additional behavior flags
+ */
+Cypress.Commands.add('setupLoginSession', (sessionName, username, password, options = {}) => {
+    const { forceLogin = false, validate } = options;
+    const uniqueSuffix = forceLogin ? `-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` : '';
+    const effectiveSessionName = `${sessionName}${uniqueSuffix}`;
+
+    // Default validate: confirm a CRM session cookie is present.
+    // Callers can override this via options.validate for role-specific checks.
+    const defaultValidate = () => {
+        cy.getCookies().should('satisfy', (cookies) => {
+            return cookies.some(cookie => cookie.name.startsWith('CRM-'));
+        });
+    };
+
+    cy.session(
+        effectiveSessionName,
+        () => {
+            cy.visit('/session/begin');
+            cy.get('input[name=User]').type(username);
+            cy.get('input[name=Password]').type(password + '{enter}');
+            cy.expectStaffSignedIn();
+            cy.dismissSystemNotifications();
+        },
+        {
+            validate: validate ?? defaultValidate
+        }
+    );
+});
+
+/**
+ * Sets up a cached admin login session for Cypress UI tests.
+ * Reads credentials with cy.env() (cypress/configs/docker.config.ts
+ * for the standard CI/dev runner, cypress/configs/new-system.config.ts for
+ * the new-system job). See `.agents/skills/churchcrm/cypress-testing.md`
+ * for the full rationale.
+ * Usage in test files:
+ *   beforeEach(() => cy.setupAdminSession());
+ *
+ * Note: Uses cy.session() with explicit validation to cache login across test runs.
+ * If validation fails, the session is cleared and login is re-attempted.
+ */
+function sessionFromEnv(sessionName, usernameKey, passwordKey, options) {
+    return cy.readEnv(usernameKey).then((username) =>
+        cy.readEnv(passwordKey).then((password) => {
+            cy.setupLoginSession(sessionName, username, password, options);
+        }),
+    );
+}
+
+Cypress.Commands.add('setupAdminSession', (options = {}) => {
+    // Validate against a Finance-protected endpoint so that a stale or
+    // cross-contaminated session (e.g. from a non-Finance spec that ran
+    // earlier in the same Cypress worker) is detected and triggers a
+    // fresh login instead of proceeding with the wrong role.
+    return sessionFromEnv('admin-session', 'admin.username', 'admin.password', {
+        ...options,
+        validate: () => {
+            cy.request({ url: '/api/deposits', failOnStatusCode: false })
+                .its('status').should('eq', 200);
+        }
+    });
+});
+
+/**
+ * Sets up a cached standard user login session for Cypress UI tests.
+ * Reads credentials from the Cypress config env
+ * (cypress/configs/docker.config.ts for the standard CI/dev runner).
+ * Usage in test files:
+ *   beforeEach(() => cy.setupStandardSession());
+ *
+ * Note: Uses cy.session() with explicit validation to cache login across test runs.
+ * If validation fails, the session is cleared and login is re-attempted.
+ */
+Cypress.Commands.add('setupStandardSession', (options = {}) =>
+    sessionFromEnv('standard-session', 'standard.username', 'standard.password', options),
+);
+
+/**
+ * Sets up a cached session for a user WITHOUT finance permissions.
+ * Used to test that finance pages correctly deny access to non-finance users.
+ * Reads credentials from the Cypress config env
+ * (cypress/configs/docker.config.ts for the standard CI/dev runner).
+ * Usage in test files:
+ *   beforeEach(() => cy.setupNoFinanceSession());
+ */
+Cypress.Commands.add('setupNoFinanceSession', (options = {}) =>
+    sessionFromEnv('nofinance-session', 'nofinance.username', 'nofinance.password', options),
+);
+
+/**
+ * Sets up a cached session for a user WITH Finance + DeleteRecords but WITHOUT
+ * ManageFundraisers (per_ID=96: finance.nofundraiser). Used to test that
+ * FundRaiserDelete.php correctly denies on the ManageFundraisers gate even when
+ * the caller has passed the DeleteRecords gate.
+ */
+Cypress.Commands.add('setupNoManageFundraisersSession', (options = {}) =>
+    sessionFromEnv('nofundraiser-session', 'nofundraiser.username', 'nofundraiser.password', options),
+);
+
+/**
+ * Sets up a cached session for a Finance-only user (per_ID=904: grace.financeonly).
+ * This user has Finance=1 and is NOT an admin. Used to verify that Finance-role
+ * users (not just admins) can access fund CRUD, dashboard Financial Settings panel,
+ * and the Finance nav Admin submenu (Envelope Manager, Donation Funds).
+ */
+Cypress.Commands.add('setupFinanceOnlySession', (options = {}) =>
+    sessionFromEnv('finance-only-session', 'finance.only.username', 'finance.only.password', {
+        ...options,
+        validate: () => {
+            cy.request({ url: '/api/deposits', failOnStatusCode: false })
+                .its('status').should('eq', 200);
+        }
+    }),
+);
+
+/**
+ * Sets up a cached session for a ManageGroups-only user (per_ID=905: kyle.kioskonly).
+ * This user has ManageGroups=1 and is NOT an admin. Used to verify that ManageGroups-role
+ * users (not just admins) can access the Kiosk Manager page and API.
+ */
+Cypress.Commands.add('setupManageGroupsOnlySession', (options = {}) =>
+    sessionFromEnv('managegroups-only-session', 'managegroups.only.username', 'managegroups.only.password', options),
+);
+
+/**
+ * cy.loginWithCredentials(username, password, sessionName, expectSuccess = true)
+ * Login with custom credentials (for testing password changes, etc.)
+ * Creates a new session with the provided credentials
+ * If expectSuccess is false, skips CRM cookie validation (for testing bad credentials)
+ */
+Cypress.Commands.add('loginWithCredentials', (username, password, sessionName = 'custom-session', expectSuccess = true) => {
+    cy.session(sessionName, () => {
+        cy.visit('/session/begin');
+        cy.get('input[name=User]').type(username);
+        cy.get('input[name=Password]').type(password + '{enter}');
+    }, {
+        validate: () => {
+            if (expectSuccess) {
+                cy.getCookies().should('satisfy', (cookies) => {
+                    return cookies.some(cookie => cookie.name.startsWith('CRM-'));
+                });
+            }
+        }
+    });
+});
+
+Cypress.Commands.add("buildRandom", (prefixString) => {
+    const rand = Math.random().toString(36).substring(7);
+    return prefixString.concat(" - ", rand);
+});
+
+// Modern command for better element interaction
+Cypress.Commands.add("getByTestId", (testId) => {
+    return cy.get(`[data-cy="${testId}"], [data-testid="${testId}"]`);
+});
+
+/**
+ * Creates a person with a birthday through the person editor and yields the
+ * new person's numeric id.
+ *
+ * Two things this used to get wrong (#9788):
+ *  - It selected the birth month and day by the bare number ("5"), but
+ *    PersonEditor emits zero-padded option values ("01".."12" for the month,
+ *    "01".."31" for the day) whose labels are the month abbreviation ("May")
+ *    and the un-padded day ("5"). cy.select() matched neither value nor text.
+ *  - It clicked #PersonSaveButton, which the editor does not render; the save
+ *    control is <button type="submit" name="PersonSubmit">.
+ *
+ * Pairs with cy.deletePersonByName for create/delete round trips.
+ */
+Cypress.Commands.add('createPersonWithBirthday', (personData) => {
+    const padded = (value) => String(value).padStart(2, '0');
+
+    cy.visit('/PersonEditor.php');
+
+    cy.get('#FirstName').type(personData.name);
+    cy.get('#LastName').type(personData.lastName ?? 'TestUser');
+    cy.get('#Gender').select('1');
+
+    if (personData.month > 0) {
+        cy.get('#BirthMonth').select(padded(personData.month));
+    }
+    if (personData.day > 0) {
+        cy.get('#BirthDay').select(padded(personData.day));
+    }
+    if (personData.year) {
+        cy.get('#BirthYear').clear().type(String(personData.year));
+    }
+
+    cy.get('#Classification').select('1');
+    cy.get("button[name='PersonSubmit']").click();
+
+    // PersonSubmit redirects to Person::getViewURIForId(), /people/view/{id}.
+    cy.url().should('match', /people\/view\/\d+/);
+
+    return cy.url().then((url) => Number(/\/people\/view\/(\d+)/.exec(url)[1]));
+});
+
+/**
+ * Deletes the first person matching a global search on `name`.
+ *
+ * Two things this used to get wrong (#9780):
+ *  - It deleted through /api/persons/{id}, which is not a route. The /persons
+ *    group only serves collection endpoints (/latest, /updated, /birthday,
+ *    /search/{query}, ...); a single person is DELETE /api/person/{id}.
+ *  - It read the person id from `children[0].id`, which is a DOM slug such as
+ *    "person-name-1". The numeric id only appears in the child's `uri`
+ *    ("/people/view/22"), and the first result group is not necessarily the
+ *    Persons group — addresses, families and groups share the response.
+ *
+ * Both failures were silent: cy.apiRequest does not fail on status, so the
+ * 404 went unnoticed and the person stayed in the database.
+ */
+Cypress.Commands.add('deletePersonByName', (name) => {
+    cy.apiRequest({
+        method: 'GET',
+        url: `/api/search/${encodeURIComponent(name)}`,
+    }).then((response) => {
+        expect(response.status, `GET /api/search/${name}`).to.equal(200);
+
+        const personId = (response.body || [])
+            .flatMap((group) => group.children || [])
+            .map((child) => /\/people\/view\/(\d+)/.exec(child.uri || ''))
+            .filter((match) => match !== null)
+            .map((match) => Number(match[1]))[0];
+
+        expect(personId, `person id for "${name}"`).to.be.a('number');
+
+        cy.apiRequest({
+            method: 'DELETE',
+            url: `/api/person/${personId}`,
+        }).then((deleteResponse) => {
+            expect(
+                deleteResponse.status,
+                `DELETE /api/person/${personId} for "${name}"`,
+            ).to.equal(200);
+        });
+    });
+});
+
+Cypress.Commands.add('createPeopleViaCSV', (peopleData) => {
+    // Build CSV with headers that auto-map to ChurchCRM fields
+    const headers = 'LastName,FirstName,Address1,City,State,Zip,Email,BirthDate,HomePhone';
+    let csvContent = headers + '\n';
+
+    Object.values(peopleData).forEach(person => {
+        const birthDate = person.year ?
+            `${person.year}-${String(person.month).padStart(2, '0')}-${String(person.day).padStart(2, '0')}` :
+            (person.month > 0 && person.day > 0) ?
+                `0000-${String(person.month).padStart(2, '0')}-${String(person.day).padStart(2, '0')}` :
+                '';
+
+        const row = [
+            'TestUser',
+            person.name,
+            '123 Test St',
+            'TestCity',
+            'TX',
+            '77777',
+            `${person.name}@test.com`,
+            birthDate,
+            '555-123-4567'
+        ].join(',');
+        csvContent += row + '\n';
+    });
+
+    // Write file and import via new Slim 4 CSV import UI
+    cy.writeFile('cypress/downloads/test_birthday_people.csv', csvContent);
+
+    cy.visit('/admin/import/csv');
+    cy.get('#csvFile').selectFile('cypress/downloads/test_birthday_people.csv', { force: true });
+    cy.get('#csv-import-form').submit();
+
+    // Wait for mapping step (upload + auto-map)
+    cy.get('#mapping-card', { timeout: 10000 }).should('be.visible');
+
+    // Execute import (fields are auto-mapped from headers)
+    cy.get('#execute-import').click();
+
+    // Wait for summary card
+    cy.get('#summary-card', { timeout: 10000 }).should('be.visible');
+});
+
+// ============================================================
+// Tom Select Testing Commands
+// ============================================================
+
+/**
+ * Wait for TomSelect to initialize on an element
+ * TomSelect wraps the original select in a .ts-wrapper sibling
+ * @param {string} selector - CSS selector for the original select element
+ * @example cy.tomSelectReady('#Country')
+ */
+Cypress.Commands.add('tomSelectReady', (selector) => {
+    cy.get(selector, { timeout: 10000 }).should($el => {
+        const el = $el[0];
+        expect(el.tomselect, 'TomSelect should be initialized').to.exist;
+    });
+});
+
+/**
+ * Select an option in a TomSelect dropdown by visible text
+ * @param {string} selector - CSS selector for the original select element
+ * @param {string} text - The text of the option to select
+ * @example cy.tomSelectByText('#Country', 'United States')
+ */
+Cypress.Commands.add('tomSelectByText', (selector, text) => {
+    // Click the TomSelect control to open the dropdown
+    cy.get(selector).siblings('.ts-wrapper').find('.ts-control').click();
+
+    // Type in the search input
+    cy.get(selector).siblings('.ts-wrapper').find('.ts-control input')
+        .type(text);
+
+    // Wait for results and click the matching option
+    cy.get(selector).siblings('.ts-wrapper').find('.ts-dropdown .ts-dropdown-content .option', { timeout: 5000 })
+        .should('be.visible')
+        .contains(text)
+        .click({ force: true });
+});
+
+/**
+ * Select an option in a TomSelect dropdown by value (programmatically)
+ * @param {string} selector - CSS selector for the original select element
+ * @param {string} value - The value of the option to select
+ * @example cy.tomSelectByValue('#Country', 'us')
+ */
+Cypress.Commands.add('tomSelectByValue', (selector, value) => {
+    // Definitive fix for the TomSelect timing race:
+    // Put setValue() AND the getValue() verification inside a single .should()
+    // block. Cypress retries the ENTIRE callback on assertion failure, so if
+    // setValue() fires but the value doesn't register (e.g. change-event race
+    // or transient initialization window), both the setValue call and the
+    // assertion are re-executed on the next retry — until the value is confirmed
+    // held by TomSelect or the assertion timeout expires.
+    //
+    // Empty-string calls (clearing a selection) skip the getValue() check
+    // because '' is a valid clear-all operation with no option to verify.
+    cy.get(selector).should(($select) => {
+        const ts = $select[0].tomselect;
+        expect(ts, `TomSelect not yet initialized on ${selector}`).to.exist;
+        ts.setValue(value);
+        if (value !== '' && value !== null && value !== undefined) {
+            const selected = [].concat(ts.getValue());
+            expect(
+                selected,
+                `TomSelect setValue("${value}") did not take effect on ${selector} — retrying`,
+            ).to.include(String(value));
+        }
+    });
+});
+
+/**
+ * Type and search in a TomSelect with remote/AJAX data
+ * @param {string} selector - CSS selector for the original select element
+ * @param {string} searchText - Text to search for
+ * @param {string} resultText - Text of the result to click (optional, clicks first if not provided)
+ * @example cy.tomSelectSearch('.personSearch', 'John', 'John Doe')
+ */
+Cypress.Commands.add('tomSelectSearch', (selector, searchText, resultText = null) => {
+    // Click the TomSelect control to focus
+    cy.get(selector).siblings('.ts-wrapper').find('.ts-control').click();
+
+    // Type in the search input
+    cy.get(selector).siblings('.ts-wrapper').find('.ts-control input')
+        .type(searchText);
+
+    // Wait for results
+    cy.get(selector).siblings('.ts-wrapper').find('.ts-dropdown .ts-dropdown-content .option', { timeout: 10000 })
+        .should('be.visible');
+
+    // Click the specific result or the first one
+    if (resultText) {
+        cy.get(selector).siblings('.ts-wrapper').find('.ts-dropdown .ts-dropdown-content .option')
+            .contains(resultText)
+            .click({ force: true });
+    } else {
+        cy.get(selector).siblings('.ts-wrapper').find('.ts-dropdown .ts-dropdown-content .option')
+            .first()
+            .click({ force: true });
+    }
+});
+
+/**
+ * Verify TomSelect is initialized on an element
+ * @param {string} selector - CSS selector for the original select element
+ * @example cy.tomSelectIsInitialized('#Country')
+ */
+Cypress.Commands.add('tomSelectIsInitialized', (selector) => {
+    cy.get(selector).should($select => {
+        expect($select[0].tomselect, 'TomSelect instance').to.exist;
+    });
+    cy.get(selector).siblings('.ts-wrapper').should('exist');
+});
+
+/**
+ * Clear a TomSelect selection
+ * @param {string} selector - CSS selector for the original select element
+ * @example cy.tomSelectClear('#Country')
+ */
+Cypress.Commands.add('tomSelectClear', (selector) => {
+    cy.get(selector).then($select => {
+        const el = $select[0];
+        if (el.tomselect) {
+            el.tomselect.clear();
+        }
+    });
+});
+
+/**
+ * Get the currently selected text from a TomSelect
+ * @param {string} selector - CSS selector for the original select element
+ * @example cy.tomSelectGetSelected('#Country').should('contain', 'United States')
+ */
+Cypress.Commands.add('tomSelectGetSelected', (selector) => {
+    return cy.get(selector).siblings('.ts-wrapper').find('.ts-control .item');
+});
+
+// Legacy aliases — keep old command names working for gradual test migration
+Cypress.Commands.add('select2ByText', (selector, text) => {
+    cy.tomSelectByText(selector, text);
+});
+Cypress.Commands.add('select2ByValue', (selector, value) => {
+    cy.tomSelectByValue(selector, value);
+});
+Cypress.Commands.add('select2Search', (selector, searchText, resultText = null) => {
+    cy.tomSelectSearch(selector, searchText, resultText);
+});
+Cypress.Commands.add('select2Clear', (selector) => {
+    cy.tomSelectClear(selector);
+});
+Cypress.Commands.add('select2GetSelected', (selector) => {
+    // Must `return` so the alias yields the same subject as tomSelectGetSelected;
+    // without it Cypress yields undefined and .should() asserts on nothing.
+    return cy.tomSelectGetSelected(selector);
+});
+Cypress.Commands.add('select2HasTheme', (selector) => {
+    cy.tomSelectIsInitialized(selector);
+});
+
+/**
+ * Type text into a Quill editor (contenteditable div)
+ * Quill editors can't use cy.type() because they're not form inputs
+ * This command uses Quill's setContents API instead
+ * @param {string} editorId - The HTML ID of the Quill editor container (without #)
+ * @param {string} text - The text to insert
+ * @example cy.typeInQuill('NoteText', 'This is a test note')
+ */
+Cypress.Commands.add('typeInQuill', (editorId, text) => {
+    cy.window().then((win) => {
+        const quillEditor = win.quillEditors[editorId];
+        if (!quillEditor) {
+            throw new Error(`Quill editor not found: ${editorId}. Available editors: ${Object.keys(win.quillEditors).join(', ')}`);
+        }
+        quillEditor.setContents([{ insert: text }]);
+    });
+});
+
+/**
+ * Get text content from a Quill editor
+ * @param {string} editorId - The HTML ID of the Quill editor container (without #)
+ * @example cy.getQuillText('NoteText').should('contain', 'test note')
+ */
+Cypress.Commands.add('getQuillText', (editorId) => {
+    return cy.window().then((win) => {
+        const quillEditor = win.quillEditors[editorId];
+        if (!quillEditor) {
+            throw new Error(`Quill editor not found: ${editorId}`);
+        }
+        return quillEditor.getText();
+    });
+});
+
+/**
+ * Clear content from a Quill editor
+ * @param {string} editorId - The HTML ID of the Quill editor container (without #)
+ * @example cy.clearQuill('NoteText')
+ */
+Cypress.Commands.add('clearQuill', (editorId) => {
+    cy.window().then((win) => {
+        const quillEditor = win.quillEditors[editorId];
+        if (!quillEditor) {
+            throw new Error(`Quill editor not found: ${editorId}`);
+        }
+        quillEditor.setContents([]);
+    });
+});
+
+/**
+ * Set a Bootstrap Datepicker value by typing and blurring to trigger change event
+ * This mimics user interaction to trigger all proper datepicker events
+ * @param {string} selector - The CSS selector for the datepicker input
+ * @param {string} dateString - The date string in MM/DD/YYYY format
+ * @example cy.setDatePickerValue("#member-birthday-2", "08/07/1980");
+ */
+Cypress.Commands.add('setDatePickerValue', (selector, dateString) => {
+    // Type the date and blur to trigger datepicker's change event
+    cy.get(selector).clear().type(dateString);
+
+    // Click elsewhere to blur the field and trigger change event
+    cy.get('body').click();
+
+    // Assert the committed value rather than sleeping: .should() retries until the
+    // datepicker's change handler has settled, and fails loudly if it never does.
+    cy.get(selector).should('have.value', dateString);
+});
+
+/**
+ * Wait for ChurchCRM locales to be fully loaded
+ * This ensures i18next and all locale files are ready before proceeding
+ * @param {number} timeout - Maximum time to wait in milliseconds (default: 10000)
+ * @example cy.waitForLocales()
+ */
+Cypress.Commands.add('waitForLocales', (timeout = 10000) => {
+    cy.window({ timeout }).should((win) => {
+        expect(win.CRM).to.exist;
+        expect(win.CRM.localesLoaded).to.be.true;
+    });
+});
+
+/**
+ * Wait for a toast notification with specific text
+ * Ensures locales are loaded first (for i18next translations) and verifies notification content
+ * @param {string} expectedText - The text to find in the notification
+ * @param {object} options - Optional config { timeout: 5000 }
+ * @example cy.waitForNotification('Menu added successfully')
+ */
+Cypress.Commands.add('waitForNotification', (expectedText, options = {}) => {
+    const { timeout = 5000 } = options;
+    
+    // Wait for locales first so translations are available
+    cy.waitForLocales(timeout);
+    
+    // Wait for notification toast to appear and contain the expected text
+    cy.get('#crm-toasts .toast', { timeout })
+        .should('be.visible')
+        .should('contain', expectedText);
+});
+
+/**
+ * Sets the locale-admin user's ui.locale preference to localeValue then establishes
+ * an authenticated browser session for that user.  Uses the dedicated locale-admin
+ * API key so no other user's session is affected.
+ *
+ * Intended for use in locale smoke tests only.  The localeValue must be the
+ * locale field from src/locale/locales.json (e.g. 'ar_EG', 'zh_CN', 'de_DE').
+ *
+ * @param {string} localeValue - The locale field value from locales.json
+ * @example cy.setupLocaleAdminSession('ar_EG')
+ */
+Cypress.Commands.add('setupLocaleAdminSession', (localeValue) => {
+    return cy.rememberTestEnv([
+        'locale.admin.id',
+        'locale.admin.api.key',
+        'locale.admin.username',
+        'locale.admin.password',
+    ]).then(() => {
+        const userId = Cypress.testEnv('locale.admin.id');
+        const apiKey = Cypress.testEnv('locale.admin.api.key');
+        const username = Cypress.testEnv('locale.admin.username');
+        const password = Cypress.testEnv('locale.admin.password');
+
+        if (!userId || !apiKey || !username || !password) {
+            throw new Error(
+                'Locale-admin credentials not configured. ' +
+                'Ensure locale.admin.id, locale.admin.api.key, locale.admin.username, ' +
+                'and locale.admin.password are set in cypress/configs/locale.config.ts env.',
+            );
+        }
+
+        // Set the user's locale preference via API (withCredentials:false avoids
+        // interfering with the browser session cookie that cy.session manages).
+        cy.makePrivateAPICall(apiKey, 'POST', `/api/user/${userId}/setting/ui.locale`, { value: localeValue }, 200);
+
+        // Establish (or restore from cache) the browser session for locale-admin.
+    // Known limitation: the cy.session key is static ('locale-admin-session'),
+    // so if the locale were ever read at login time rather than per-request
+    // (e.g. persisted in the session cookie), the cache could serve a stale
+    // locale. ChurchCRM resolves locale per-request from the DB preference,
+    // so this is safe for now.
+        cy.setupLoginSession('locale-admin-session', username, password);
+    });
+});
+

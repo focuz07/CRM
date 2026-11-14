@@ -1,0 +1,243 @@
+const path = require('path');
+const fs = require('fs');
+const webpack = require('webpack');
+const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+// DataTables language files used to be copied by Grunt into locale/vendor.
+// The skin bundle no longer runs Grunt, and the table requests these by URL.
+const dtI18nSrc = path.resolve(__dirname, 'node_modules/datatables.net-plugins/i18n');
+const dtI18nDest = path.resolve(__dirname, 'src/locale/vendor/datatables');
+fs.mkdirSync(dtI18nDest, { recursive: true });
+for (const file of fs.readdirSync(dtI18nSrc)) {
+  if (file.endsWith('.json')) {
+    fs.copyFileSync(path.join(dtI18nSrc, file), path.join(dtI18nDest, file));
+  }
+}
+
+// Plugin to fix unquoted URLs in CSS (especially fonts)
+class FixCssUrlQuotesPlugin {
+  apply(compiler) {
+    compiler.hooks.afterEmit.tap('FixCssUrlQuotesPlugin', (compilation) => {
+      const outputPath = compiler.outputPath;
+      const missingFiles = [];
+
+      compilation.getAssets().forEach((asset) => {
+        if (asset.name.endsWith('.css')) {
+          const filePath = path.join(outputPath, asset.name);
+          try {
+            let content = fs.readFileSync(filePath, 'utf-8');
+
+            // Check for missing font/asset files referenced in url() declarations
+            const urlMatches = content.matchAll(/url\(["']?([^"')\s]+)["']?\)/g);
+            for (const match of urlMatches) {
+              const urlPath = match[1];
+              // Only check relative URLs (not data:, external, or absolute paths)
+              if (!urlPath.startsWith('data:') && !urlPath.startsWith('http') && !urlPath.startsWith('//') && !urlPath.startsWith('/')) {
+                // Strip query-string and fragment before testing for file existence
+                const cleanPath = urlPath.split('?')[0].split('#')[0];
+                const fullPath = path.join(outputPath, cleanPath);
+                try {
+                  fs.accessSync(fullPath, fs.constants.F_OK);
+                } catch (accessErr) {
+                  if (accessErr.code === 'ENOENT') {
+                    missingFiles.push({ file: asset.name, url: urlPath, fullPath });
+                  }
+                  // else: EPERM / EINVAL — file may exist but be unreadable; skip silently
+                }
+              }
+            }
+
+            // Add quotes around unquoted URLs; only write when something changed
+            // to avoid unnecessary I/O and mtime churn on unchanged CSS files.
+            // Note: the regex [^'")\ s] already excludes quote chars, so every captured
+            // url is unquoted — no dead-code guard needed.
+            const fixed = content.replace(
+              /url\(([^'")\s]+)\)/g,
+              (_match, url) => `url("${url}")`
+            );
+            if (fixed !== content) {
+              fs.writeFileSync(filePath, fixed, 'utf-8');
+            }
+          } catch (err) {
+            // Skip if file cannot be read (might have been deleted between emit and this hook)
+            console.warn(`Warning: Could not process CSS file ${asset.name}: ${err.message}`);
+          }
+        }
+      });
+
+      // Report missing files as errors
+      if (missingFiles.length > 0) {
+        const errorMsg = missingFiles
+          .map((f) => `  ❌ ${f.file}: url("${f.url}") → ${f.fullPath}`)
+          .join('\n');
+        console.error('\n⚠️  Missing font/asset files referenced in CSS:\n' + errorMsg + '\n');
+        compilation.errors.push(new Error(`${missingFiles.length} missing asset file(s) referenced in CSS`));
+      }
+    });
+  }
+}
+
+module.exports = {
+  mode: isProduction ? 'production' : 'development',
+  entry: {
+    'fundraiser-paddle-numbers': './webpack/fundraiser-paddle-numbers.js',
+    'finance-pledge-detail': './webpack/finance-pledge-detail.js',
+    'finance-pledge-editor': './webpack/finance-pledge-editor.js',
+    'admin-logs': './webpack/admin-logs.js',
+    'fundraiser-list': './webpack/fundraiser-list.js',
+    'fundraiser-confirm': './webpack/fundraiser-confirm.js',
+    'calendar-event-editor': './webpack/calendar-event-editor.js',
+    'two-factor-enrollment': './webpack/two-factor-enrollment.js',
+    churchcrm: './webpack/skin-main',
+    theme: './webpack/theme.js',
+    'sidebar-toggle': './webpack/sidebar-toggle.js',
+    'churchcrm-rtl': './webpack/skin-rtl',
+    'photo-uploader': './webpack/photo-uploader-entry',
+    'root-dashboard': './webpack/root-dashboard',
+    setup: './webpack/setup',
+    'upgrade-wizard': './webpack/upgrade-wizard',
+    'locale-loader': './webpack/locale-loader',
+    backup: './webpack/backup',
+    restore: './webpack/restore',
+    'csv-import': './webpack/csv-import',
+    'admin-dashboard': './webpack/admin-dashboard',
+    // Admin → Member Portal (#9864): theme picker, portal settings, statistics.
+    'admin-member-portal': './webpack/admin-member-portal.ts',
+    // Admin → Convert Volunteer Opportunities (#10606).
+    'admin-volunteer-conversion': './webpack/admin-volunteer-conversion.ts',
+    'get-started': './webpack/get-started',
+    'church-info': './webpack/church-info',
+    'report-settings': './webpack/report-settings',
+    'email-settings': './webpack/email-settings',
+    localization: './webpack/localization',
+    'system-settings-panel': './webpack/system-settings-panel',
+    'kiosk-registration-closed': './webpack/kiosk-registration-closed',
+    kiosk: './webpack/kiosk',
+    'kiosk-settings': './webpack/kiosk-settings',
+    'people-settings': './webpack/people-settings',
+    'admin-grade-names': './webpack/admin-grade-names',
+    'people-list': './webpack/people/person-list',
+    'people-family-list': './webpack/people/family-list',
+    'people-family-view': './webpack/people/family-view',
+    'people-person-view': './webpack/people/person-view',
+    'people-map-view': './webpack/people/map-view',
+    'people-map-neighbors': './webpack/people/map-neighbors',
+    'people-self-register': './webpack/people/self-register',
+    'people-labels-modal': './webpack/people/labels-modal',
+    'people-sign-in-email': './webpack/people/sign-in-email.ts',
+    'email-history-modal': './webpack/people/email-history-modal',
+    'email-delete-queue': './webpack/people/email-delete-queue',
+    'email-log-table': './webpack/people/email-log-table',
+    'error': './webpack/error',
+    'feature-toggles': './webpack/feature-toggles',
+    'finance-report-options': './webpack/finance-report-options',
+    'finance-year-end': './webpack/finance-year-end',
+    'groups-group-view': './webpack/groups/group-view',
+    'groups-group-properties-form': './webpack/groups/group-properties-form',
+    'groups-sundayschool-dashboard': './webpack/groups-sundayschool-dashboard',
+    'groups-sundayschool-class-view': './webpack/groups-sundayschool-class-view',
+    'repeat-event-editor': './webpack/repeat-event-editor',
+    'event-checkin': './webpack/event-checkin',
+    'event-calendars': './webpack/event-calendars',
+    'external-calendar': './webpack/external-calendar',
+    'event-types': './webpack/event-types',
+    'event-editor': './webpack/event-editor',
+    'event-types-list': './webpack/event-types-list',
+    'event-cart-to-event': './webpack/event-cart-to-event',
+    'ministries-dashboard': './webpack/ministries/dashboard',
+    'ministries-ministry': './webpack/ministries/ministry',
+    'ministries-team-view': './webpack/ministries/team-view',
+    'ministries-occurrence': './webpack/ministries/occurrence',
+    'ministries-settings': './webpack/ministries/settings',
+    // The core event view's Volunteers card, worded like every V2 screen (D34).
+    'ministries-event-staffing': './webpack/ministries/event-staffing',
+    'portal-volunteer-schedule': './webpack/portal/volunteer-schedule',
+    'portal-volunteer-opportunities': './webpack/portal/volunteer-opportunities',
+    'email-composer': './webpack/common/email-composer',
+    // Member Portal: its own CSS/JS bundle, never part of the RTL-flipped core
+    // bundle, so a church theme is not flipped twice (design §3.5).
+    portal: './webpack/portal/portal.ts',
+    // Page-specific portal bundles, loaded by the templates that need them
+    // (design §5.2 / #9865) rather than by every portal page.
+    'portal-profile': './webpack/portal/portal-profile.ts',
+    'portal-family': './webpack/portal/portal-family.ts',
+    // Member Portal calendar (#9866): FullCalendar for /portal/calendar. Its own
+    // entry so the tiny `portal` bundle every page loads stays tiny.
+    'portal-calendar': './webpack/portal/portal-calendar.ts',
+    'portal-directory': './webpack/portal/portal-directory.ts',
+    // My Teams (#9868): the team page's four tabs, drawn by the shared ministries
+    // components. The occurrence page reuses `ministries-occurrence` unchanged.
+    'portal-teams': './webpack/portal/teams.ts',
+    // Passkeys (member sign-in #10463): adding one, and signing in with one.
+    'portal-passkeys': './webpack/portal/portal-passkeys.ts',
+    'telemetry': './webpack/telemetry',
+    'debug': './webpack/debug',
+    'finance-dashboard': './webpack/finance-dashboard',
+    'finance-deposit-editor': './webpack/finance-deposit-editor',
+    'finance-deposit-search': './webpack/finance-deposit-search',
+  },
+  output: {
+    path: path.resolve('./src/skin/v2'),
+    filename: '[name].min.js',
+    publicPath: 'auto',
+  },
+  resolve: {
+    extensions: ['.ts', '.tsx', '.js'],
+  },
+  cache: {
+    type: 'filesystem',
+    buildDependencies: {
+      config: [__filename],
+    },
+  },
+  devtool: isProduction ? false : 'eval-cheap-module-source-map',
+  optimization: {
+    moduleIds: 'deterministic',
+    chunkIds: 'deterministic',
+  },
+  module: {
+    rules: [
+      {
+        test: /\.tsx?$/,
+        loader: 'ts-loader',
+      },
+      {
+        test: /\.(sa|sc|c)ss$/,
+        use: [
+          MiniCssExtractPlugin.loader,
+          {
+            loader: 'css-loader',
+            options: {
+              url: {
+                filter: (url) => {
+                  return !url.startsWith('/') && !url.startsWith('data:');
+                },
+              },
+            },
+          },
+          'sass-loader',
+        ],
+      },
+      {
+        test: /\.(woff2?|ttf|eot|svg|png|jpg|gif)$/,
+        type: 'asset/resource',
+        generator: {
+          filename: 'assets/[name].[contenthash][ext]',
+        },
+      },
+    ],
+  },
+  plugins: [
+    new MiniCssExtractPlugin({
+      filename: '[name].min.css',
+      ignoreOrder: false,
+    }),
+    new webpack.ProvidePlugin({
+      $: path.resolve(__dirname, 'webpack/jquery-shared.js'),
+      jQuery: path.resolve(__dirname, 'webpack/jquery-shared.js'),
+    }),
+    new FixCssUrlQuotesPlugin(),
+  ],
+};

@@ -1,0 +1,509 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\Cart;
+use ChurchCRM\dto\Photo;
+use ChurchCRM\Exceptions\PhotoSizeException;
+use ChurchCRM\model\ChurchCRM\ListOptionQuery;
+use ChurchCRM\model\ChurchCRM\Note;
+use ChurchCRM\model\ChurchCRM\Person;
+use ChurchCRM\Plugin\Hook\HookManager;
+use ChurchCRM\Plugin\Hooks;
+use ChurchCRM\Portal\Auth\EmailChangeRefusedException;
+use ChurchCRM\Portal\Auth\SignInEmailPolicy;
+use ChurchCRM\Service\PersonSignInService;
+use ChurchCRM\Service\SystemService;
+use ChurchCRM\Service\UserService;
+use ChurchCRM\Slim\Middleware\Request\Auth\DeleteRecordRoleAuthMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Auth\EditRecordsRoleAuthMiddleware;
+use ChurchCRM\Slim\Middleware\Api\PersonMiddleware;
+use ChurchCRM\Slim\Middleware\CSRFMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\DateTimeUtils;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Exception\HttpForbiddenException;
+use Slim\Exception\HttpNotFoundException;
+use Slim\Routing\RouteCollectorProxy;
+use Slim\HttpCache\Cache;
+
+// This group does not load the person via middleware (to speed up the page loads)
+// Photo endpoint - returns uploaded photo only (404 if no photo exists)
+// Avatar info endpoint - returns JSON with initials, gravatar info for client-side rendering
+/**
+ * @OA\Get(
+ *     path="/person/{personId}/photo",
+ *     operationId="getPersonPhoto",
+ *     summary="Get a person's uploaded photo",
+ *     description="Returns the binary photo image. Returns 404 if no photo has been uploaded (use avatar endpoint for fallback).",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+ *     @OA\Response(response=200, description="Photo image", @OA\MediaType(mediaType="image/jpeg", @OA\Schema(type="string", format="binary"))),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=404, description="No uploaded photo for this person")
+ * )
+ * @OA\Get(
+ *     path="/person/{personId}/avatar",
+ *     operationId="getPersonAvatar",
+ *     summary="Get a person's avatar info (initials, gravatar)",
+ *     description="Returns JSON with avatar metadata for client-side rendering. Always returns a result even if no photo is uploaded.",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+ *     @OA\Response(response=200, description="Avatar info",
+ *         @OA\JsonContent(type="object",
+ *             @OA\Property(property="hasPhoto", type="boolean"),
+ *             @OA\Property(property="initials", type="string", example="JS"),
+ *             @OA\Property(property="gravatarUrl", type="string", nullable=true),
+ *             @OA\Property(property="photoUrl", type="string", nullable=true),
+ *             @OA\Property(property="email", type="string", nullable=true),
+ *             @OA\Property(property="photoVersion", type="integer", example=1718000000, description="Unix mtime of the uploaded photo file; 0 when hasPhoto is false. Append as ?v=<photoVersion> to the /photo URL to bust the 2-hour private Cache-Control header after an upload.")
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized")
+ * )
+ * @OA\Post(
+ *     path="/person/{personId}/photo",
+ *     operationId="uploadPersonPhoto",
+ *     summary="Upload a person's photo (base64 encoded)",
+ *     description="Upload a base64-encoded image file for a person. Supported formats: PNG, JPEG, JPG, GIF, WEBP. Maximum size: 10MB.",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+ *     @OA\RequestBody(required=true, description="Base64 encoded image data",
+ *         @OA\JsonContent(
+ *             required={"imgBase64"},
+ *             @OA\Property(property="imgBase64", type="string", description="Base64-encoded image data with data URI prefix", example="data:image/jpeg;base64,/9j/4AAQSkZJRg...")
+ *         )
+ *     ),
+ *     @OA\Response(response=200, description="Photo uploaded successfully",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="success", type="boolean", example=true),
+ *             @OA\Property(property="hasPhoto", type="boolean", example=true)
+ *         )
+ *     ),
+ *     @OA\Response(response=400, description="Invalid image data or upload failed"),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="EditRecords role required"),
+ *     @OA\Response(response=404, description="Person not found"),
+ *     @OA\Response(response=413, description="PHP discarded the request body because it exceeded the server upload limit")
+ * )
+ * @OA\Delete(
+ *     path="/person/{personId}/photo",
+ *     operationId="deletePersonPhoto",
+ *     summary="Delete a person's uploaded photo",
+ *     description="Remove the uploaded photo for a person. This operation is idempotent and will return success even if no photo exists.",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+ *     @OA\Response(response=200, description="Photo deleted successfully",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="success", type="boolean", example=true)
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="DeleteRecords role required")
+ * )
+ */
+// Photo GET and Avatar GET endpoints - no PersonMiddleware needed
+$app->group('/person/{personId:[0-9]+}', function (RouteCollectorProxy $group): void {
+    // Photo endpoints - returns uploaded photo only (404 if no photo exists)
+    $group->get('/photo', function (Request $request, Response $response, array $args): Response {
+        $personId = (int)$args['personId'];
+        $photo = new Photo('Person', $personId);
+        
+        if (!$photo->hasUploadedPhoto()) {
+            return SlimUtils::renderErrorJSON($response, 'No uploaded photo exists for this person', [], 404);
+        }
+        
+        return SlimUtils::renderPhoto($response, $photo);
+    })->add(new Cache('private', Photo::CACHE_DURATION_SECONDS));
+    
+    // Avatar info endpoint - returns JSON with initials, gravatar info for client-side rendering
+    // Returns fallback data even for invalid person IDs (no PersonMiddleware needed)
+    $group->get('/avatar', function (Request $request, Response $response, array $args): Response {
+        $avatarInfo = Photo::getAvatarInfo('Person', (int)$args['personId']);
+        return SlimUtils::renderJSON($response, $avatarInfo);
+    });
+});
+
+// Main person operations - POST/DELETE/role operations with PersonMiddleware
+$app->group('/person/{personId:[0-9]+}', function (RouteCollectorProxy $group): void {
+    // Upload photo endpoint
+    $group->post('/photo', function (Request $request, Response $response, array $args): Response {
+        $person = $request->getAttribute('person');
+        $input = $request->getParsedBody();
+
+        if (empty($input) || !isset($input['imgBase64'])) {
+            // 413 only when PHP genuinely threw the body away for size; a body
+            // that arrived without imgBase64 is a malformed request whatever its
+            // Content-Length claims (issue #9771).
+            if (SlimUtils::isBodyDiscardedForSize($request)) {
+                return SlimUtils::renderErrorJSON(
+                    $response,
+                    sprintf(gettext('File size exceeds the server limit of %s'), SystemService::getMaxUploadFileSize(true)),
+                    [],
+                    413
+                );
+            }
+            return SlimUtils::renderErrorJSON($response, gettext('Missing image data in request'), [], 400);
+        }
+
+        try {
+            $person->setImageFromBase64($input['imgBase64']);
+            // Refresh photo status and return updated info
+            $person->getPhoto()->refresh();
+            return SlimUtils::renderJSON($response, [
+                'success' => true,
+                'hasPhoto' => $person->getPhoto()->hasUploadedPhoto()
+            ]);
+        } catch (PhotoSizeException $e) {
+            return SlimUtils::renderErrorJSON($response, $e->getMessage(), [], 413, $e, $request);
+        } catch (\Throwable $e) {
+            return SlimUtils::renderErrorJSON($response, gettext('Failed to upload person photo'), [], 400, $e, $request);
+        }
+    })->add(EditRecordsRoleAuthMiddleware::class);
+    
+    // Delete photo endpoint
+    $group->delete('/photo', function (Request $request, Response $response, array $args): Response {
+        $person = $request->getAttribute('person');
+        $deleted = $person->deletePhoto();
+        return SlimUtils::renderJSON($response, ['success' => $deleted]);
+    })->add(DeleteRecordRoleAuthMiddleware::class);
+    
+    /**
+     * @OA\Get(
+     *     path="/person/{personId}",
+     *     operationId="getPerson",
+     *     summary="Get a person's full record by ID",
+     *     description="Returns the complete person object including family info, addresses, and other related details. For a caller who may not edit the person, Flags is omitted and BirthYear is null when the person's age is hidden.",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+     *     @OA\Response(response=200, description="Person object",
+     *         @OA\JsonContent(ref="#/components/schemas/Person")
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=404, description="Person not found")
+     * )
+     * @OA\Delete(
+     *     path="/person/{personId}",
+     *     operationId="deletePerson",
+     *     summary="Delete a person record",
+     *     description="Permanently delete a person and all their associated records. A person who has a login can only be deleted by an administrator, never by themselves, and the last administrator cannot be deleted.",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+     *     @OA\Response(response=200, description="Person deleted successfully",
+     *         @OA\JsonContent(
+     *             @OA\Property(property="success", type="boolean", example=true)
+     *         )
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="DeleteRecords role required, or this person has a login that the current user may not delete"),
+     *     @OA\Response(response=404, description="Person not found")
+     * )
+     * @OA\Post(
+     *     path="/person/{personId}/addToCart",
+     *     operationId="addPersonToCart",
+     *     summary="Add a person to the cart",
+     *     description="Add a person to the current user's cart for batch operations.",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+     *     @OA\Response(response=200, description="Person added to cart",
+     *         @OA\JsonContent(
+     *             @OA\Property(property="success", type="boolean", example=true)
+     *         )
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=404, description="Person not found")
+     * )
+     */
+    // Get person by ID — read-baseline check via canReadPerson (all authenticated users)
+    $group->get('', function (Request $request, Response $response, array $args): Response {
+        $person = $request->getAttribute('person');
+        $currentUser = AuthenticationManager::getCurrentUser();
+        $personFamilyId = (int) $person->getFamId();
+        if ($personFamilyId > 0 && !$currentUser->canViewFamily($personFamilyId)) {
+            throw new HttpForbiddenException($request, gettext('You do not have permission to view this person'));
+        }
+
+        // Filter custom fields by field-level permissions (GHSA-p6xx-xx98-f323)
+        //
+        // NOTE: `person_custom` stores per-field values in dynamically-added columns
+        // that are not part of the generated Propel schema, so exportTo()/toArray()
+        // never actually surfaces real custom field data under `singlePersonCustom`
+        // (only the table's one real Propel column, `per_ID`). Discard whatever
+        // exportTo() produced for that key and replace it with the properly
+        // security-filtered custom field values.
+        $personJSON = $person->exportTo('JSON');
+        $personData = json_decode($personJSON, true);
+        $personData['singlePersonCustom'] = $person->getVisibleCustomFieldValues();
+        if (!$currentUser->canEditPerson((int) $person->getId(), $personFamilyId)) {
+            unset($personData['Flags']);
+            if ($person->hideAge()) {
+                $personData['BirthYear'] = null;
+            }
+        }
+
+        return SlimUtils::renderStringJSON($response, json_encode($personData));
+    });
+
+    // Delete person
+    $group->delete('', function (Request $request, Response $response, array $args): Response {
+        $person = $request->getAttribute('person');
+        $blockedReason = $person->getLoginDeletionBlockedReason();
+        if ($blockedReason !== null) {
+            throw new HttpForbiddenException($request, $blockedReason);
+        }
+        // PERSON_DELETED is dispatched from Person::postDelete() so that the
+        // family-member cascade in DELETE /family/{id}?deleteMembers=true
+        // fires it too. See #9768.
+        $person->delete();
+
+        return SlimUtils::renderSuccessJSON($response);
+    })->add(DeleteRecordRoleAuthMiddleware::class);
+
+
+    /**
+     * @OA\Post(
+     *     path="/person/{personId}/activate/{status}",
+     *     operationId="activatePerson",
+     *     summary="Activate or deactivate a person (EditRecords role required)",
+     *     description="Pass status=true to activate or status=false to deactivate the person. Cannot deactivate yourself.",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+     *     @OA\Parameter(name="status", in="path", required=true, description="true to activate, false to deactivate", @OA\Schema(type="string", enum={"true","false"})),
+     *     @OA\Response(response=200, description="Person activation status updated",
+     *         @OA\JsonContent(@OA\Property(property="success", type="boolean", example=true))
+     *     ),
+     *     @OA\Response(response=400, description="Invalid status value"),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="Cannot deactivate yourself, the only administrator who can sign in, or EditRecords role required"),
+     *     @OA\Response(response=404, description="Person not found")
+     * )
+     */
+    $group->post('/activate/{status}', function (Request $request, Response $response, array $args): Response {
+        /** @var \ChurchCRM\model\ChurchCRM\Person $person */
+        $person = $request->getAttribute('person');
+        $currentUser = AuthenticationManager::getCurrentUser();
+
+        // Guard: cannot deactivate yourself (parity with delete-self guard)
+        if ($currentUser->getId() === (int) $person->getId()) {
+            return SlimUtils::renderErrorJSON($response, gettext("Can't change your own active status"), [], 403);
+        }
+
+        // Normalize incoming status to boolean (true = activate, false = deactivate)
+        $newStatus = filter_var($args['status'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        if ($newStatus === null) {
+            return SlimUtils::renderErrorJSON($response, gettext('Invalid status'), [], 400);
+        }
+
+        $currentStatus = $person->isActive();
+
+        if ($currentStatus && $newStatus === false && (new UserService())->isLastSignInCapableAdmin((int) $person->getId())) {
+            return SlimUtils::renderErrorJSON($response, gettext("Can't deactivate the only administrator who can sign in"), [], 403);
+        }
+
+        // Update only if the value is different
+        if ($currentStatus !== $newStatus) {
+            $currentDate = DateTimeUtils::getToday();
+            if ($newStatus === false) {
+                // Deactivating: set DateDeactivated to now
+                $person->setDateDeactivated($currentDate);
+            } else {
+                // Activating: clear DateDeactivated
+                $person->setDateDeactivated(null);
+            }
+
+            // Create a note to record the status change
+            $note = new Note();
+            $note->setPerId($person->getId());
+            $note->setText($newStatus === false ? gettext('Marked the Person as Inactive') : gettext('Marked the Person as Active'));
+            $note->setType('edit');
+            $note->setEntered($currentUser->getId());
+            $note->save();
+
+            // Update last edited metadata (save without auto-note — the explicit note above is sufficient)
+            $person->setDateLastEdited($currentDate);
+            $person->setEditedBy($currentUser->getId());
+            $person->saveWithoutUpdateNote();
+        }
+
+        return SlimUtils::renderJSON($response, ['success' => true]);
+    })->add(EditRecordsRoleAuthMiddleware::class);
+
+    // Set person role
+    $group->post('/role/{roleId:[0-9]+}', 'setPersonRoleAPI')->add(new EditRecordsRoleAuthMiddleware());
+
+    /**
+     * @OA\Post(
+     *     path="/person/{personId}/approve-review",
+     *     summary="Approve a self-registered person who is not part of a self-registered family, clearing their needs-review flag",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer")),
+     *     @OA\Response(response=200, description="Person approved",
+     *         @OA\JsonContent(@OA\Property(property="success", type="boolean"))
+     *     ),
+     *     @OA\Response(response=400, description="Person belongs to a self-registered family (approve the family instead), or is not a pending self-registration")
+     * )
+     */
+    $group->post('/approve-review', function (Request $request, Response $response, array $args): Response {
+        $person = $request->getAttribute('person');
+
+        // Someone a member proposed for an existing family (Member Portal, #9865) is
+        // approved on their own; members of a self-registered family go with it.
+        if ($person->getFamily()?->getEnteredBy() === Person::SELF_REGISTER) {
+            return SlimUtils::renderErrorJSON(
+                $response,
+                gettext('This person belongs to a family — approve the family instead'),
+                [],
+                400
+            );
+        }
+
+        if ($person->getEnteredBy() !== Person::SELF_REGISTER || !$person->getNeedsReview()) {
+            return SlimUtils::renderErrorJSON(
+                $response,
+                gettext('This person is not a pending self-registration'),
+                [],
+                400
+            );
+        }
+
+        $person->setNeedsReview(false);
+        $person->save();
+
+        return SlimUtils::renderJSON($response, ['success' => true]);
+    })->add(new EditRecordsRoleAuthMiddleware());
+
+    /**
+     * @OA\Get(
+     *     path="/person/{personId}/sign-in",
+     *     operationId="getPersonSignInStatus",
+     *     summary="Whether a person may sign in to the Member Portal, and why not (EditRecords role required)",
+     *     description="What the person page's Portal sign-in card shows: the blocks for everyone, the member rule and the email rule, Disable sign-in, the last sign-in, and how many devices and passkeys the person has. The administrator's reason for Disable sign-in is returned to administrators only.",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+     *     @OA\Response(response=200, description="Sign-in status",
+     *         @OA\JsonContent(
+     *             @OA\Property(property="personId", type="integer", example=42),
+     *             @OA\Property(property="memberSignInEnabled", type="boolean"),
+     *             @OA\Property(property="maySignIn", type="boolean"),
+     *             @OA\Property(property="reason", type="string", nullable=true, example="under_minimum_age"),
+     *             @OA\Property(property="reasonLabel", type="string", nullable=true),
+     *             @OA\Property(property="signInDisabled", type="boolean"),
+     *             @OA\Property(property="disabledAt", type="string", nullable=true),
+     *             @OA\Property(property="disabledBy", type="object", nullable=true),
+     *             @OA\Property(property="disabledReason", type="string", nullable=true),
+     *             @OA\Property(property="lastSignIn", type="string", nullable=true),
+     *             @OA\Property(property="unconfirmedEmail", type="string", nullable=true, description="An address that receives mail but may not sign in until confirmed"),
+     *             @OA\Property(property="unconfirmedSource", type="string", nullable=true, example="family_email", description="family_email, staff, import or api"),
+     *             @OA\Property(property="unconfirmedSourceLabel", type="string", nullable=true),
+     *             @OA\Property(property="unconfirmedAt", type="string", nullable=true),
+     *             @OA\Property(property="canConfirmEmail", type="boolean", description="Whether the caller may confirm the unconfirmed email"),
+     *             @OA\Property(property="confirmEmailRefusal", type="string", nullable=true, description="Why the caller may not confirm it"),
+     *             @OA\Property(property="devices", type="integer"),
+     *             @OA\Property(property="passkeys", type="integer")
+     *         )
+     *     ),
+     *     @OA\Response(response=401, description="Unauthorized"),
+     *     @OA\Response(response=403, description="EditRecords role required"),
+     *     @OA\Response(response=404, description="Person not found")
+     * )
+     */
+    $group->get('/sign-in', function (Request $request, Response $response): Response {
+        $status = (new PersonSignInService())->statusFor(
+            $request->getAttribute('person'),
+            AuthenticationManager::getCurrentUser()->isAdmin()
+        );
+
+        return SlimUtils::renderJSON($response, $status);
+    })->add(new EditRecordsRoleAuthMiddleware());
+
+    /**
+     * @OA\Post(
+     *     path="/person/{personId}/sign-in/confirm-email",
+     *     operationId="confirmPersonSignInEmail",
+     *     summary="Confirm a person's unconfirmed email after checking who they are (EditRecords role required)",
+     *     description="An unconfirmed address receives mail but may not be used to sign in (member sign-in design §9). Staff with Edit Records may confirm an address moved from the family email; a replacement address after the person's first sign-in, and any address of a person with a staff account or given portal permissions, only an administrator. Writes an email_confirmed audit row.",
+     *     tags={"People"},
+     *     security={{"ApiKeyAuth":{}}},
+     *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+     *     @OA\RequestBody(required=true, @OA\JsonContent(required={"email"}, @OA\Property(property="email", type="string", description="The unconfirmed address being confirmed", example="pat@example.com"))),
+     *     @OA\Response(response=200, description="Confirmed", @OA\JsonContent(@OA\Property(property="success", type="boolean", example=true))),
+     *     @OA\Response(response=403, description="EditRecords role required, an invalid CSRF token, or an address only an administrator may confirm"),
+     *     @OA\Response(response=404, description="Person not found"),
+     *     @OA\Response(response=409, description="No unconfirmed email, or it is not the address sent")
+     * )
+     */
+    $group->post('/sign-in/confirm-email', function (Request $request, Response $response): Response {
+        $input = $request->getParsedBody();
+        $email = is_array($input) && is_string($input['email'] ?? null) ? $input['email'] : '';
+
+        try {
+            (new SignInEmailPolicy())->confirmByStaff($request->getAttribute('person'), $email, AuthenticationManager::getCurrentUser());
+        } catch (EmailChangeRefusedException $e) {
+            return SlimUtils::renderErrorJSON($response, $e->getMessage(), [], $e->getStatus(), null, $request);
+        }
+
+        return SlimUtils::renderSuccessJSON($response);
+    })->add(new CSRFMiddleware())->add(new EditRecordsRoleAuthMiddleware());
+
+    // Add person to cart
+    $group->post('/addToCart', function (Request $request, Response $response, array $args): Response {
+        Cart::addPerson($args['personId']);
+        return SlimUtils::renderSuccessJSON($response);
+    })->add(new EditRecordsRoleAuthMiddleware());
+})->add(new PersonMiddleware());
+
+/**
+ * @OA\Post(
+ *     path="/person/{personId}/role/{roleId}",
+ *     operationId="setPersonRole",
+ *     summary="Set a person's family role",
+ *     tags={"People"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(name="personId", in="path", required=true, @OA\Schema(type="integer", example=42)),
+ *     @OA\Parameter(name="roleId", in="path", required=true, description="Role ID from GET /persons/roles", @OA\Schema(type="integer", example=1)),
+ *     @OA\Response(response=200, description="Role updated",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="success", type="boolean", example=true),
+ *             @OA\Property(property="msg", type="string", example="The role is successfully assigned.")
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="EditRecords role required"),
+ *     @OA\Response(response=404, description="Person or role not found"),
+ *     @OA\Response(response=500, description="Failed to save role")
+ * )
+ */
+function setPersonRoleAPI(Request $request, Response $response, array $args): Response
+{
+    $person = $request->getAttribute('person');
+
+    $roleId = (int) $args['roleId'];
+    // Family roles belong to list 2 (the same list returned by /persons/roles).
+    // Option IDs are only unique within a list.
+    $role = ListOptionQuery::create()->filterById(2)->filterByOptionId($roleId)->findOne();
+
+    if (empty($role)) {
+        throw new HttpNotFoundException($request, gettext('The role could not be found.'));
+    }
+
+    if ((int) $person->getFmrId() === $roleId) {
+        return SlimUtils::renderJSON($response, ['success' => true, 'msg' => gettext('The role is already assigned.')]);
+    }
+
+    $person->setFmrId($role->getOptionId());
+    if ($person->save()) {
+        return SlimUtils::renderJSON($response, ['success' => true, 'msg' => gettext('The role is successfully assigned.')]);
+    } else {
+        return SlimUtils::renderErrorJSON($response, gettext('The role could not be assigned.'), [], 500);
+    }
+}

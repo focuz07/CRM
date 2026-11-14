@@ -1,0 +1,448 @@
+{
+  "funds": [
+    {
+      "name": "Pledges",
+      "description": "Pledge income for the operating budget",
+      "active": true,
+      "order": 1
+    },
+    {
+      "name": "Building Fund",
+      "description": "Capital campaign to renovate the fellowship hall and expand parking",
+      "active": true,
+      "order": 2
+    },
+    {
+      "name": "Missions & Outreach",
+      "description": "Support for local food pantry, global mission partners, and community service",
+      "active": true,
+      "order": 3
+    },
+    {
+      "name": "Youth Ministry",
+      "description": "Programs, summer camps, and discipleship resources for children and teens",
+      "active": true,
+      "order": 4
+    }
+  ],
+  "fundraisers": [
+    {
+      "title": "Spring Silent Auction",
+      "description": "Dinner and a silent auction for the building fund. Bids close Saturday night.",
+      "type": "Silent Auction",
+      "status": "Closed",
+      "goal": "8000.00",
+      "fund": "Building Fund",
+      "year": "prev",
+      "month": 4,
+      "day": 18,
+      "end_month": 4,
+      "end_day": 19,
+      "entered_year": "prev",
+      "entered_month": 3,
+      "entered_day": 1,
+      "paddles": [
+        { "number": 101, "email": "nancy.hernandez@demo.churchcrm.io" },
+        { "number": 102, "email": "carol.williams@demo.churchcrm.io" },
+        { "number": 104, "email": "jason.johnson85@demo.churchcrm.io" }
+      ],
+      "items": [
+        {
+          "code": "A1",
+          "title": "Weekend at the church cabin",
+          "description": "Two nights at the cabin the church keeps for retreats.",
+          "donor": "jason.johnson85@demo.churchcrm.io",
+          "buyer": "nancy.hernandez@demo.churchcrm.io",
+          "estimate": "400.00",
+          "minimum": "150.00",
+          "sell": "275.00"
+        },
+        {
+          "code": "A2",
+          "title": "Handmade quilt",
+          "description": "A queen quilt stitched by the quilting circle.",
+          "donor": "carol.williams@demo.churchcrm.io",
+          "buyer": "mary.hernandez@demo.churchcrm.io",
+          "estimate": "250.00",
+          "minimum": "75.00",
+          "sell": "180.00",
+          "material": "80.00"
+        },
+        {
+          "code": "B1",
+          "title": "Sunday casserole",
+          "description": "A family casserole, delivered the Sunday after the auction.",
+          "donor": "nancy.hernandez@demo.churchcrm.io",
+          "buyer": "mary.hernandez@demo.churchcrm.io",
+          "estimate": "30.00",
+          "minimum": "15.00",
+          "sell": "25.00",
+          "material": "12.00"
+        }
+      ]
+    },
+    {
+      "title": "Harvest Quilt Raffle",
+      "description": "A handmade quilt, drawn at the Thanksgiving potluck. Ticket sales support local outreach.",
+      "type": "Raffle",
+      "status": "Active",
+      "goal": "1200.00",
+      "fund": "Missions & Outreach",
+      "date_offset_days": 21,
+      "end_offset_days": 21,
+      "entered_offset_days": -20,
+      "paddles": [{ "number": 12, "email": "nancy.hernandez@demo.churchcrm.io" }],
+      "items": [
+        {
+          "code": "R1",
+          "title": "Harvest quilt",
+          "description": "The quilt drawn at the Thanksgiving potluck.",
+          "donor": "carol.williams@demo.churchcrm.io",
+          "estimate": "300.00",
+          "material": "80.00"
+        }
+      ]
+    },
+    {
+      "title": "Fall Festival Gala",
+      "description": "A dinner and dance that raises scholarship money for the youth ministry.",
+      "type": "Gala",
+      "status": "Planning",
+      "goal": "15000.00",
+      "fund": "Youth Ministry",
+      "date_offset_days": 45,
+      "entered_offset_days": -14,
+      "paddles": [{ "number": 18, "email": "jason.johnson85@demo.churchcrm.io" }],
+      "items": [
+        {
+          "code": "G1",
+          "title": "Welcome gift basket",
+          "description": "Coffee, jam, and a church cookbook.",
+          "donor": "jason.johnson85@demo.churchcrm.io",
+          "estimate": "50.00",
+          "minimum": "25.00",
+          "material": "20.00"
+        }
+      ]
+    },
+    {
+      "title": "Christmas Bazaar",
+      "description": "Crafts, a bake table, and a small raffle during the first weekend of Advent.",
+      "type": "Mixed",
+      "status": "Active",
+      "goal": "4000.00",
+      "fund": "Building Fund",
+      "date_offset_days": 60,
+      "end_offset_days": 61,
+      "entered_offset_days": -10,
+      "paddles": [
+        { "number": 7, "email": "nancy.hernandez@demo.churchcrm.io" },
+        { "number": 8, "email": "carol.williams@demo.churchcrm.io" }
+      ],
+      "items": [
+        {
+          "code": "C1",
+          "title": "Handmade ornaments",
+          "description": "Boxed glass ornaments from the youth craft sale.",
+          "donor": "carol.williams@demo.churchcrm.io",
+          "multibuy": true,
+          "estimate": "12.00",
+          "minimum": "5.00",
+          "sell": "8.00",
+          "material": "3.00",
+          "purchases": [{ "email": "nancy.hernandez@demo.churchcrm.io", "count": 4 }]
+        },
+        {
+          "code": "C2",
+          "title": "Cocoa mix",
+          "description": "A jar of homemade cocoa mix.",
+          "donor": "carol.williams@demo.churchcrm.io",
+          "buyer": "nancy.hernandez@demo.churchcrm.io",
+          "estimate": "15.00",
+          "minimum": "8.00",
+          "sell": "12.00",
+          "material": "4.00"
+        }
+      ]
+    }
+  ],
+  "giving_families": [
+    {
+      "email": "family.hernandez2@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "2400.00" }, { "fund": "Building Fund", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "200.00" }, { "fund": "Building Fund", "amount": "100.00" }]
+    },
+    {
+      "email": "family.jackson15@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "2400.00" }, { "fund": "Building Fund", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "200.00" }, { "fund": "Building Fund", "amount": "100.00" }]
+    },
+    {
+      "email": "family.anderson59@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "1500.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "125.00" }]
+    },
+    {
+      "email": "family.johnson3@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "1800.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "150.00" }]
+    },
+    {
+      "email": "family.king42@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "1800.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "150.00" }]
+    },
+    {
+      "email": "family.campbell36@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "1800.00" }, { "fund": "Building Fund", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "150.00" }, { "fund": "Building Fund", "amount": "50.00" }]
+    },
+    {
+      "email": "family.lewis10@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "1800.00" }, { "fund": "Building Fund", "annual": "900.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "150.00" }, { "fund": "Building Fund", "amount": "75.00" }]
+    },
+    {
+      "email": "family.carter24@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "1800.00" }, { "fund": "Missions & Outreach", "annual": "900.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "150.00" }, { "fund": "Missions & Outreach", "amount": "75.00" }]
+    },
+    {
+      "email": "family.brown25@demo.churchcrm.io",
+      "frequency": "monthly",
+      "skip_months": [5, 9, 11],
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "50.00" }]
+    },
+    {
+      "email": "family.williams20@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1500.00" }, { "fund": "Building Fund", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "125.00" }, { "fund": "Building Fund", "amount": "50.00" }]
+    },
+    {
+      "email": "family.jones43@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1500.00" }, { "fund": "Building Fund", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "125.00" }, { "fund": "Building Fund", "amount": "50.00" }]
+    },
+    {
+      "email": "family.thompson8@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1500.00" }, { "fund": "Youth Ministry", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "125.00" }, { "fund": "Youth Ministry", "amount": "50.00" }]
+    },
+    {
+      "email": "family.evans40@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1500.00" }, { "fund": "Missions & Outreach", "annual": "900.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "125.00" }, { "fund": "Missions & Outreach", "amount": "75.00" }]
+    },
+    {
+      "email": "family.baker7@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "100.00" }]
+    },
+    {
+      "email": "family.harris31@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }, { "fund": "Youth Ministry", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "100.00" }, { "fund": "Youth Ministry", "amount": "50.00" }]
+    },
+    {
+      "email": "family.johnson18@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }, { "fund": "Youth Ministry", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "100.00" }, { "fund": "Youth Ministry", "amount": "50.00" }]
+    },
+    {
+      "email": "family.nguyen28@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }, { "fund": "Building Fund", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "100.00" }, { "fund": "Building Fund", "amount": "50.00" }]
+    },
+    {
+      "email": "family.robinson23@demo.churchcrm.io",
+      "frequency": "monthly",
+      "skip_months": [3, 8],
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "100.00" }]
+    },
+    {
+      "email": "family.scott5@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "900.00" }, { "fund": "Building Fund", "annual": "2100.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "75.00" }, { "fund": "Building Fund", "amount": "175.00" }]
+    },
+    {
+      "email": "family.rodriguez17@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "900.00" }, { "fund": "Missions & Outreach", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "75.00" }, { "fund": "Missions & Outreach", "amount": "50.00" }]
+    },
+    {
+      "email": "family.williams4@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "600.00" }, { "fund": "Missions & Outreach", "annual": "1500.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "50.00" }, { "fund": "Missions & Outreach", "amount": "125.00" }]
+    },
+    {
+      "email": "family.young53@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "600.00" }, { "fund": "Missions & Outreach", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "50.00" }, { "fund": "Missions & Outreach", "amount": "100.00" }]
+    },
+    {
+      "email": "family.green52@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "50.00" }]
+    },
+    {
+      "email": "family.brown49@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "50.00" }]
+    },
+    {
+      "email": "family.hernandez60@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "50.00" }]
+    },
+    {
+      "email": "family.thompson48@demo.churchcrm.io",
+      "frequency": "monthly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "600.00" }, { "fund": "Youth Ministry", "annual": "360.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "50.00" }, { "fund": "Youth Ministry", "amount": "30.00" }]
+    },
+    {
+      "email": "family.clark14@demo.churchcrm.io",
+      "frequency": "quarterly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "300.00" }]
+    },
+    {
+      "email": "family.lee16@demo.churchcrm.io",
+      "frequency": "quarterly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "300.00" }]
+    },
+    {
+      "email": "family.lopez22@demo.churchcrm.io",
+      "frequency": "quarterly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "300.00" }]
+    },
+    {
+      "email": "family.parker21@demo.churchcrm.io",
+      "frequency": "quarterly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "800.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "200.00" }]
+    },
+    {
+      "email": "family.robinson19@demo.churchcrm.io",
+      "frequency": "quarterly",
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Pledges", "annual": "1200.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "300.00" }]
+    },
+    {
+      "email": "family.adams12@demo.churchcrm.io",
+      "frequency": "annual",
+      "payment_month": 12,
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 1,
+      "pledges": [{ "fund": "Pledges", "annual": "500.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "500.00" }]
+    },
+    {
+      "email": "family.nelson9@demo.churchcrm.io",
+      "frequency": "annual",
+      "payment_month": 12,
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 2,
+      "pledges": [{ "fund": "Pledges", "annual": "600.00" }],
+      "payments": [{ "fund": "Pledges", "amount": "600.00" }]
+    },
+    {
+      "email": "family.thomas13@demo.churchcrm.io",
+      "frequency": "annual",
+      "payment_month": 12,
+      "pledge_years": ["prev", "curr"],
+      "collection_week": 3,
+      "pledges": [{ "fund": "Missions & Outreach", "annual": "500.00" }],
+      "payments": [{ "fund": "Missions & Outreach", "amount": "500.00" }]
+    }
+  ]
+}

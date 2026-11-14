@@ -1,0 +1,197 @@
+function initializeGroupList() {
+  window.CRM.groupsInCart = 0;
+
+  // Fetch groups currently in cart
+  $.ajax({
+    method: "GET",
+    url: `${window.CRM.root}/api/groups/groupsInCart`,
+    dataType: "json",
+  })
+    .done((data) => {
+      window.CRM.groupsInCart = data.groupsInCart;
+    })
+    .fail((xhr, status, error) => {
+      console.error("Failed to fetch groups in cart:", error);
+      window.CRM.notify(i18next.t("Failed to load cart status."), {
+        type: "danger",
+        delay: 5000,
+      });
+    });
+
+  $("#addNewGroup").click((e) => {
+    const groupName = $("#groupName").val().trim();
+
+    if (!groupName) {
+      $("#groupName").addClass("is-invalid").focus();
+      return;
+    }
+    $("#groupName").removeClass("is-invalid");
+
+    const groupTypeVal = parseInt($("#groupType").val(), 10);
+    const newGroup = {
+      groupName,
+      ...(groupTypeVal > 0 ? { groupType: groupTypeVal } : {}),
+    };
+
+    $.ajax({
+      method: "POST",
+      url: `${window.CRM.root}/api/groups/`,
+      data: JSON.stringify(newGroup),
+      contentType: "application/json; charset=utf-8",
+      dataType: "json",
+    })
+      .done((data) => {
+        // Redirect to the GroupEditor page for the newly created group
+        window.location.href = `${window.CRM.root}/groups/editor/${data.Id}`;
+      })
+      .fail((xhr, status, error) => {
+        console.error("Failed to create group:", error);
+        window.CRM.notifyAPIError(xhr, i18next.t("Failed to create group. Please try again."));
+      });
+  });
+
+  const dataTableConfig = {
+    autoWidth: false,
+    ajax: {
+      url: `${window.CRM.root}/api/groups/`,
+      type: "GET",
+      dataSrc: "",
+      error: (xhr, error, thrown) => {
+        console.error("Failed to load groups:", thrown);
+        window.CRM.notify(i18next.t("Failed to load groups. Please refresh the page."), {
+          type: "danger",
+          delay: 5000,
+        });
+      },
+    },
+    columns: [
+      {
+        width: "auto",
+        title: i18next.t("Group Name"),
+        data: "Name",
+        render: (data, type, full, meta) => {
+          const nameLink = document.createElement("a");
+          nameLink.href = full.viewUri;
+          nameLink.textContent = data;
+          return nameLink.outerHTML;
+        },
+      },
+      {
+        width: "auto",
+        title: i18next.t("Group Type"),
+        data: "groupType",
+        defaultContent: "",
+        searchable: true,
+        render: (data) => {
+          if (!data) return i18next.t("Unassigned");
+          return $("<div>").text(data).html();
+        },
+      },
+      {
+        width: "auto",
+        title: i18next.t("Roles"),
+        data: "roles",
+        defaultContent: "",
+        orderable: false,
+        searchable: false,
+        render: (data) => {
+          if (!data || !data.length) return '<span class="text-muted">\u2014</span>';
+          return data
+            .map(
+              (role) =>
+                '<span class="badge bg-secondary-lt text-secondary me-1">' +
+                $("<div>").text(i18next.t(role)).html() +
+                "</span>",
+            )
+            .join("");
+        },
+      },
+      {
+        width: "auto",
+        title: i18next.t("Members"),
+        data: "memberCount",
+        searchable: false,
+        defaultContent: "0",
+      },
+      {
+        width: "1",
+        title: i18next.t("Actions"),
+        data: null,
+        orderable: false,
+        searchable: false,
+        className: "text-end w-1 no-export",
+        render: (data, type, full, meta) => {
+          const inCart = $.inArray(full.Id, window.CRM.groupsInCart) > -1;
+          const hasMembers = full.memberCount > 0;
+          const cartBtn = hasMembers
+            ? inCart
+              ? `<button class="dropdown-item text-danger RemoveFromCart" data-cart-id="${full.Id}" data-cart-type="group" data-label-add="${i18next.t("Add All to Cart")}" data-label-remove="${i18next.t("Remove All from Cart")}"><i class="fa-solid fa-cart-arrow-down me-2"></i><span class="cart-label">${i18next.t("Remove All from Cart")}</span></button>`
+              : `<button class="dropdown-item AddToCart" data-cart-id="${full.Id}" data-cart-type="group" data-label-add="${i18next.t("Add All to Cart")}" data-label-remove="${i18next.t("Remove All from Cart")}"><i class="fa-solid fa-cart-plus me-2"></i><span class="cart-label">${i18next.t("Add All to Cart")}</span></button>`
+            : "";
+          const escapedName = window.CRM.escapeAttribute(full.Name || "");
+          // Volunteer v2 (D19): a group owned by a ministry is renamed and deleted from
+          // that ministry, and the API answers 409 here. The items stay in the menu,
+          // disabled and with a title saying why, rather than disappearing — a
+          // coordinator looking for Edit should find out where it went, not wonder
+          // whether the row is broken.
+          const managedByMinistry = Boolean(full.ministryId);
+          const managedTitle = window.CRM.escapeAttribute(
+            i18next.t("Managed from the {{ministry}} ministry", { ministry: full.ministryName || "" }),
+          );
+          const editItem = managedByMinistry
+            ? `<span class="dropdown-item disabled" aria-disabled="true" title="${managedTitle}"><i class="fa-solid fa-pencil me-2"></i>${i18next.t("Edit")}</span>`
+            : `<a class="dropdown-item" href="${window.CRM.root}/groups/editor/${full.Id}"><i class="fa-solid fa-pencil me-2"></i>${i18next.t("Edit")}</a>`;
+          const deleteItem = managedByMinistry
+            ? `<button type="button" class="dropdown-item text-danger" disabled aria-disabled="true" title="${managedTitle}"><i class="fa-solid fa-trash me-2"></i>${i18next.t("Delete")}</button>`
+            : `<button type="button" class="dropdown-item text-danger delete-group" data-group-id="${full.Id}" data-group-name="${escapedName}"><i class="fa-solid fa-trash me-2"></i>${i18next.t("Delete")}</button>`;
+          return (
+            '<div class="dropdown">' +
+            '<button class="btn btn-sm btn-ghost-secondary" type="button" data-bs-toggle="dropdown" data-bs-display="static" aria-expanded="false">' +
+            '<i class="fa-solid fa-ellipsis-vertical"></i>' +
+            "</button>" +
+            '<div class="dropdown-menu dropdown-menu-end">' +
+            `<a class="dropdown-item" href="${full.viewUri}"><i class="fa-solid fa-eye me-2"></i>${i18next.t("View")}</a>` +
+            editItem +
+            (hasMembers ? '<div class="dropdown-divider"></div>' + cartBtn : "") +
+            '<div class="dropdown-divider"></div>' +
+            deleteItem +
+            "</div></div>"
+          );
+        },
+      },
+    ],
+  };
+
+  $.extend(dataTableConfig, window.CRM.plugin.dataTable);
+
+  const groupsTable = $("#groupsTable").DataTable(dataTableConfig);
+
+  $(document).on("click", ".delete-group", function () {
+    const groupId = $(this).data("group-id");
+    const groupName = $(this).data("group-name");
+    window.CRM.confirmAction(
+      "",
+      i18next.t("Are you sure you want to delete") + " <strong>" + window.CRM.escapeHtml(groupName) + "</strong>?",
+      () => {
+        $.ajax({
+          method: "DELETE",
+          url: `${window.CRM.root}/api/groups/${groupId}`,
+        })
+          .done(() => {
+            window.CRM.notify(i18next.t("Group deleted successfully."), { type: "success", delay: 3000 });
+            groupsTable.ajax.reload();
+          })
+          .fail((xhr) => {
+            console.error("Failed to delete group:", xhr);
+            window.CRM.notifyAPIError(xhr, i18next.t("Failed to delete group. Please try again."));
+          });
+      },
+      { confirmLabel: i18next.t("Delete"), cancelLabel: i18next.t("Cancel") },
+    );
+  });
+}
+
+// Wait for locales to load before initializing
+$(document).ready(() => {
+  window.CRM.onLocalesReady(initializeGroupList);
+});

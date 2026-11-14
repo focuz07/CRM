@@ -1,0 +1,329 @@
+<?php
+
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\model\ChurchCRM\Family;
+use ChurchCRM\model\ChurchCRM\Person;
+use ChurchCRM\Portal\Auth\EmailChangeChannel;
+use ChurchCRM\Portal\Auth\SignInEmailPolicy;
+use ChurchCRM\Slim\Middleware\Api\FamilyEmailDeprecationMiddleware;
+use ChurchCRM\Slim\Middleware\Request\Setting\PublicRegistrationAuthMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\Utils\EmailAddress;
+use ChurchCRM\Utils\LoggerUtils;
+use ChurchCRM\Utils\ORMUtils;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+
+$app->group('/public/register', function (RouteCollectorProxy $group): void {
+    $group->post('/family', 'registerFamilyAPI')->add(new FamilyEmailDeprecationMiddleware('public/register-family-api'));
+    $group->post('/family/', 'registerFamilyAPI')->add(new FamilyEmailDeprecationMiddleware('public/register-family-api'));
+    $group->post('/person', 'registerPersonAPI');
+    $group->post('/person/', 'registerPersonAPI');
+})->add(PublicRegistrationAuthMiddleware::class);
+
+/**
+ * @OA\Post(
+ *     path="/public/register/family",
+ *     operationId="registerFamilyAPI",
+ *     summary="Register a new family",
+ *     description="Creates a new family and its members via public self-registration. Requires public registration to be enabled in system settings.",
+ *     tags={"Registration"},
+ *     @OA\RequestBody(
+ *         required=true,
+ *         @OA\JsonContent(
+ *             required={"Name","Address1","City","State","Country","Zip","people"},
+ *             @OA\Property(property="Name", type="string", example="Smith"),
+ *             @OA\Property(property="Address1", type="string", example="123 Main St"),
+ *             @OA\Property(property="Address2", type="string", nullable=true, example="Apt 4B"),
+ *             @OA\Property(property="City", type="string", example="Seattle"),
+ *             @OA\Property(property="State", type="string", example="WA"),
+ *             @OA\Property(property="Country", type="string", example="US"),
+ *             @OA\Property(property="Zip", type="string", example="98101"),
+ *             @OA\Property(property="HomePhone", type="string", nullable=true, example="206-555-0100"),
+ *             @OA\Property(property="Email", type="string", format="email", nullable=true, example="smith@example.com", description="Saved as the first person's email when that person gives none. Families have no email of their own."),
+ *             @OA\Property(
+ *                 property="people",
+ *                 type="array",
+ *                 minItems=1,
+ *                 @OA\Items(
+ *                     required={"role","gender","firstName","lastName"},
+ *                     @OA\Property(property="role", type="string", example="1", description="Family role ID (1=Head of Household). See GET /public/data for lookups."),
+ *                     @OA\Property(property="gender", type="string", enum={"1","2"}, description="1=Male, 2=Female"),
+ *                     @OA\Property(property="firstName", type="string", example="John"),
+ *                     @OA\Property(property="lastName", type="string", example="Smith"),
+ *                     @OA\Property(property="email", type="string", format="email", nullable=true),
+ *                     @OA\Property(property="birthday", type="string", nullable=true, example="10/02/1985", description="Format: MM/DD/YYYY"),
+ *                     @OA\Property(property="hideAge", type="boolean", default=false),
+ *                     @OA\Property(property="cellPhone", type="string", nullable=true),
+ *                     @OA\Property(property="homePhone", type="string", nullable=true),
+ *                     @OA\Property(property="workPhone", type="string", nullable=true)
+ *                 )
+ *             )
+ *         )
+ *     ),
+ *     @OA\Response(
+ *         response=200,
+ *         description="Family registered successfully",
+ *         @OA\JsonContent(description="The newly created family object", type="object",
+ *             @OA\Property(property="Id", type="integer", example=42),
+ *             @OA\Property(property="Name", type="string", example="Smith"),
+ *             @OA\Property(property="Address1", type="string"),
+ *             @OA\Property(property="City", type="string"),
+ *             @OA\Property(property="State", type="string"),
+ *             @OA\Property(property="Zip", type="string"),
+ *             @OA\Property(property="Email", type="string", readOnly=true, deprecated=true, description="Deprecated in 7.8.3: the head of household's email, else the spouse's. Removed with the family email column.")
+ *         )
+ *     ),
+ *     @OA\Response(response=400, description="Validation error",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="error", type="string", example="Validation Error"),
+ *             @OA\Property(property="failures", type="array", @OA\Items(type="string"))
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Person validation error or registration disabled")
+ * )
+ */
+function registerFamilyAPI(Request $request, Response $response, array $args): Response
+{
+    $familyMetadata = [];
+
+    foreach ($request->getParsedBody() as $key => $value) {
+        if (is_string($value)) {
+            $familyMetadata[$key] = InputUtils::sanitizeAndEscapeText($value);
+        } elseif (is_array($value) && $key === 'people') {
+            // Sanitize nested people array
+            $familyMetadata[$key] = array_map(function ($person) {
+                $sanitized = [];
+                foreach ($person as $pKey => $pValue) {
+                    if (is_string($pValue)) {
+                        $sanitized[$pKey] = InputUtils::sanitizeAndEscapeText($pValue);
+                    } else {
+                        $sanitized[$pKey] = $pValue;
+                    }
+                }
+                return $sanitized;
+            }, $value);
+        } else {
+            $familyMetadata[$key] = $value;
+        }
+    };
+
+    if (empty($familyMetadata['Name'])) {
+        return SlimUtils::renderJSON($response, ['error' => gettext('Family name is required')], 400);
+    }
+    if (!empty($familyMetadata['Email']) && !EmailAddress::isValid($familyMetadata['Email'])) {
+        return SlimUtils::renderJSON($response, ['error' => EmailAddress::validationMessage()], 400);
+    }
+
+    $family = new Family();
+    $family->setName($familyMetadata['Name']);
+    $family->setAddress1($familyMetadata['Address1'] ?? '');
+    $family->setAddress2($familyMetadata['Address2'] ?? '');
+    $family->setCity($familyMetadata['City'] ?? '');
+    $family->setState($familyMetadata['State'] ?? '');
+    $family->setCountry($familyMetadata['Country'] ?? '');
+    $family->setZip($familyMetadata['Zip'] ?? '');
+    $family->setHomePhone($familyMetadata['HomePhone'] ?? '');
+    $family->setEnteredBy(Person::SELF_REGISTER);
+    $family->setDateEntered(new DateTime());
+    $family->setNeedsReview(true);
+
+    if (!$family->validate()) {
+        return SlimUtils::renderJSON(
+            $response,
+            [
+                'error' => gettext('Validation Error'),
+                'failures' => ORMUtils::getValidationErrors($family->getValidationFailures())
+            ],
+            400
+        );
+    }
+
+    $familyMembers = [];
+
+    if (!isset($familyMetadata['people']) || !is_array($familyMetadata['people']) || count($familyMetadata['people']) === 0) {
+        return SlimUtils::renderJSON($response, ['error' => gettext('At least one family member is required')], 400);
+    }
+
+    foreach ($familyMetadata['people'] as $personMetaData) {
+        $person = new Person();
+        $person->setEnteredBy(Person::SELF_REGISTER);
+        $person->setDateEntered(new DateTime());
+        $person->setNeedsReview(true);
+        $person->setFirstName($personMetaData['firstName']);
+        $person->setLastName($personMetaData['lastName']);
+        $person->setGender($personMetaData['gender']);
+        $person->setFmrId($personMetaData['role']);
+        $person->setEmail($personMetaData['email'] ?? '');
+        $person->setCellPhone($personMetaData['cellPhone'] ?? '');
+        $person->setHomePhone($personMetaData['homePhone'] ?? '');
+        $person->setWorkPhone($personMetaData['workPhone'] ?? '');
+        $person->setFlags(($personMetaData['hideAge'] ?? false) ? 1 : 0);
+
+        $birthday = $personMetaData['birthday'] ?? '';
+
+        if (!empty($birthday)) {
+            $birthdayDate = DateTime::createFromFormat('m/d/Y', $birthday);
+            if ($birthdayDate !== false) {
+                $person->setBirthDay($birthdayDate->format('d'));
+                $person->setBirthMonth($birthdayDate->format('m'));
+                $person->setBirthYear($birthdayDate->format('Y'));
+            }
+        }
+
+        if (!$person->validate()) {
+            LoggerUtils::getAppLogger()->error('Public Reg Error with the following data: ' . json_encode($personMetaData));
+
+            return SlimUtils::renderJSON($response, ['error' => gettext('Validation Error'),
+                'failures' => ORMUtils::getValidationErrors($person->getValidationFailures())], 401);
+        }
+
+        $familyMembers[] = $person;
+    }
+
+    if (!empty($familyMetadata['Email'])) {
+        // Family-wide mail goes to a head of household or spouse, so the family address belongs on one.
+        $adultRoleIds = array_merge(
+            explode(',', SystemConfig::getValue('sDirRoleHead')),
+            explode(',', SystemConfig::getValue('sDirRoleSpouse'))
+        );
+        $adults = array_filter($familyMembers, fn (Person $member): bool => in_array((string) $member->getFmrId(), $adultRoleIds, true));
+        foreach ($adults !== [] ? $adults : $familyMembers as $member) {
+            if (trim((string) $member->getEmail()) === '') {
+                $member->setEmail($familyMetadata['Email']);
+                break;
+            }
+        }
+    }
+
+    $family->save();
+
+    $emailPolicy = new SignInEmailPolicy();
+    foreach ($familyMembers as $person) {
+        $person->setFamily($family);
+        $family->addPerson($person);
+        $person->save();
+        $emailPolicy->recordChange($person, null, EmailChangeChannel::REGISTRATION, null);
+    }
+
+    $family->save();
+
+    return SlimUtils::renderJSON($response, $family->toArray());
+}
+
+/**
+ * @OA\Post(
+ *     path="/public/register/person",
+ *     operationId="registerPersonAPI",
+ *     summary="Register a new individual person",
+ *     description="Creates a standalone person record via public self-registration. Requires public registration to be enabled in system settings.",
+ *     tags={"Registration"},
+ *     @OA\RequestBody(
+ *         required=true,
+ *         @OA\JsonContent(
+ *             required={"firstName","lastName","gender"},
+ *             @OA\Property(property="firstName", type="string", example="Jane"),
+ *             @OA\Property(property="lastName", type="string", example="Doe"),
+ *             @OA\Property(property="gender", type="string", enum={"1","2"}, description="1=Male, 2=Female"),
+ *             @OA\Property(property="email", type="string", format="email", nullable=true),
+ *             @OA\Property(property="cellPhone", type="string", nullable=true),
+ *             @OA\Property(property="homePhone", type="string", nullable=true),
+ *             @OA\Property(property="workPhone", type="string", nullable=true),
+ *             @OA\Property(property="address1", type="string", nullable=true),
+ *             @OA\Property(property="address2", type="string", nullable=true),
+ *             @OA\Property(property="city", type="string", nullable=true),
+ *             @OA\Property(property="state", type="string", nullable=true),
+ *             @OA\Property(property="zip", type="string", nullable=true)
+ *         )
+ *     ),
+ *     @OA\Response(
+ *         response=200,
+ *         description="Person registered successfully",
+ *         @OA\JsonContent(description="The newly created person object (Propel JSON export)", type="object",
+ *             @OA\Property(property="Id", type="integer", example=99),
+ *             @OA\Property(property="FirstName", type="string", example="Jane"),
+ *             @OA\Property(property="LastName", type="string", example="Doe")
+ *         )
+ *     ),
+ *     @OA\Response(response=400, description="Validation error",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="error", type="string", example="Validation Error"),
+ *             @OA\Property(property="failures", type="array", @OA\Items(type="string"))
+ *         )
+ *     )
+ * )
+ */
+function registerPersonAPI(Request $request, Response $response, array $args): Response
+{
+    // Sanitize input data before creating person
+    $personData = [];
+    foreach ($request->getParsedBody() as $key => $value) {
+        if (is_string($value)) {
+            $personData[$key] = InputUtils::sanitizeAndEscapeText($value);
+        } else {
+            $personData[$key] = $value;
+        }
+    }
+
+    $person = new Person();
+    
+    // Set sanitized fields manually instead of using fromJSON
+    if (isset($personData['firstName'])) {
+        $person->setFirstName($personData['firstName']);
+    }
+    if (isset($personData['lastName'])) {
+        $person->setLastName($personData['lastName']);
+    }
+    if (isset($personData['email'])) {
+        $person->setEmail($personData['email']);
+    }
+    if (isset($personData['cellPhone'])) {
+        $person->setCellPhone($personData['cellPhone']);
+    }
+    if (isset($personData['homePhone'])) {
+        $person->setHomePhone($personData['homePhone']);
+    }
+    if (isset($personData['workPhone'])) {
+        $person->setWorkPhone($personData['workPhone']);
+    }
+    if (isset($personData['gender'])) {
+        $person->setGender($personData['gender']);
+    }
+    if (isset($personData['address1'])) {
+        $person->setAddress1($personData['address1']);
+    }
+    if (isset($personData['address2'])) {
+        $person->setAddress2($personData['address2']);
+    }
+    if (isset($personData['city'])) {
+        $person->setCity($personData['city']);
+    }
+    if (isset($personData['state'])) {
+        $person->setState($personData['state']);
+    }
+    if (isset($personData['zip'])) {
+        $person->setZip($personData['zip']);
+    }
+    
+    $person->setEnteredBy(Person::SELF_REGISTER);
+    $person->setDateEntered(new DateTime());
+    $person->setNeedsReview(true);
+
+    if (!$person->validate()) {
+        return SlimUtils::renderJSON(
+            $response,
+            [
+                'error' => gettext('Validation Error'),
+                'failures' => ORMUtils::getValidationErrors($person->getValidationFailures())
+            ],
+            400
+        );
+    }
+
+    $person->save();
+    (new SignInEmailPolicy())->recordChange($person, null, EmailChangeChannel::REGISTRATION, null);
+
+    return SlimUtils::renderStringJSON($response, $person->exportTo('JSON'));
+}

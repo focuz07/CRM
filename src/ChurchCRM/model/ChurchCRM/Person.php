@@ -1,0 +1,1261 @@
+<?php
+
+namespace ChurchCRM\model\ChurchCRM;
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\data\Countries;
+use ChurchCRM\dto\Photo;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Emails\notifications\NewPersonOrFamilyEmail;
+use ChurchCRM\Exceptions\PersonDeletionBlockedException;
+use ChurchCRM\model\ChurchCRM\Base\Person as BasePerson;
+use ChurchCRM\model\ChurchCRM\Map\PersonTableMap;
+use ChurchCRM\PhotoInterface;
+use ChurchCRM\Plugin\Hook\HookManager;
+use ChurchCRM\Plugin\Hooks;
+use ChurchCRM\Service\CustomFieldService;
+use ChurchCRM\Service\GradeService;
+use ChurchCRM\Service\GroupService;
+use ChurchCRM\Utils\CustomFieldUtils;
+use ChurchCRM\Utils\EmailAddress;
+use ChurchCRM\Utils\GeoUtils;
+use ChurchCRM\Utils\LoggerUtils;
+use ChurchCRM\Utils\MiscUtils;
+use DateTime;
+use InvalidArgumentException;
+use Propel\Runtime\ActiveQuery\Criteria;
+use Propel\Runtime\Connection\ConnectionInterface;
+use Propel\Runtime\Map\TableMap;
+use Symfony\Component\Validator\Constraints\Callback;
+use Symfony\Component\Validator\Context\ExecutionContextInterface;
+use Symfony\Component\Validator\Mapping\ClassMetadata;
+
+/**
+ * Skeleton subclass for representing a row from the 'person_per' table.
+ *
+ * You should add additional methods to this class to meet the
+ * application requirements.  This class will only be generated as
+ * long as it does not already exist in the output directory.
+ */
+class Person extends BasePerson implements PhotoInterface
+{
+    use GeocodedAddress;
+
+    public const SELF_REGISTER = -1;
+    public const SELF_VERIFY = -2;
+    public const SCHEDULED_TASK = -3;
+    public const UPGRADE = -4;
+
+    /** @var array<int, array<int, ListOption>> */
+    private static array $listOptionsByListId = [];
+
+    private ?Photo $photo = null;
+    private bool $skipPostUpdateNote = false;
+
+    /**
+     * Snapshot of the persisted row, taken in preUpdate()/preDelete() and
+     * handed to the PERSON_UPDATED / PERSON_DELETED listeners afterwards.
+     *
+     * Null means "nothing listening" — the snapshot is skipped when no plugin
+     * has registered for the hook, so installs with no plugins pay nothing.
+     *
+     * @var array<string, mixed>|null
+     */
+    private ?array $hookDataSnapshot = null;
+
+    public function getFullName(): string
+    {
+        return $this->getFormattedName(SystemConfig::getIntValue('iPersonNameStyle'));
+    }
+
+    public function isMale(): bool
+    {
+        return $this->getGender() == 1;
+    }
+
+    public function isFemale(): bool
+    {
+        return $this->getGender() == 2;
+    }
+
+    public function getGenderName(): string
+    {
+        switch (strtolower($this->getGender())) {
+            case 1:
+                return gettext('Male');
+            case 2:
+                return gettext('Female');
+            default:
+                return gettext('Unassigned');
+        }
+    }
+
+    public function hideAge(): bool
+    {
+        return $this->getFlags() === 1 || empty($this->getBirthYear());
+    }
+
+    public function isDeceased(): bool
+    {
+        return !empty($this->getDateDeceased());
+    }
+
+    /**
+     * Why this person may not sign in at all, staff or portal (member sign-in
+     * design §4, blocks for everyone): one of the User::SIGN_IN_BLOCKED_*
+     * values, or null. Member sign-in adds its own blocks (`PortalSignInRules`).
+     */
+    public function getSignInBlockedReason(): ?string
+    {
+        $state = PersonSigninQuery::create()->findPk($this->getId());
+
+        return self::signInBlockedReasonFor(
+            $this->getDateDeceased(),
+            $this->getDateDeactivated(),
+            $state instanceof PersonSignin && $state->getSignInDisabled(),
+        );
+    }
+
+    public static function signInBlockedReasonFor(mixed $dateDeceased, mixed $dateDeactivated, bool $signInDisabled = false): ?string
+    {
+        if (!empty($dateDeceased)) {
+            return User::SIGN_IN_BLOCKED_DECEASED;
+        }
+        if (!empty($dateDeactivated)) {
+            return User::SIGN_IN_BLOCKED_INACTIVE;
+        }
+        if ($signInDisabled) {
+            return User::SIGN_IN_BLOCKED_DISABLED;
+        }
+
+        return null;
+    }
+
+    public function getBirthDate(): ?\DateTimeImmutable
+    {
+        if (
+            !empty($this->getBirthDay()) &
+            !empty($this->getBirthMonth())
+        ) {
+            $birthYear = $this->getBirthYear();
+            if (empty($birthYear)) {
+                $birthYear = 0;
+            }
+
+            // '!' keeps the current time of day out, so an age measured from
+            // midnight 'today' counts the birthday itself.
+            return \DateTimeImmutable::createFromFormat('!Y-m-d', $birthYear . '-' . $this->getBirthMonth() . '-' . $this->getBirthDay());
+        }
+
+        return null;
+    }
+
+    /**
+     * Same month and day rule as the Today's Birthdays counter: a 29 February
+     * birthday only matches in a leap year.
+     */
+    public function isBirthdayToday(?\DateTimeInterface $today = null): bool
+    {
+        if (empty($this->getBirthMonth()) || empty($this->getBirthDay())) {
+            return false;
+        }
+        $today ??= new \DateTimeImmutable('today');
+
+        return (int) $this->getBirthMonth() === (int) $today->format('n')
+            && (int) $this->getBirthDay() === (int) $today->format('j');
+    }
+
+    public function getFormattedBirthDate()
+    {
+        $birthDate = $this->getBirthDate();
+        if (!$birthDate) {
+            return false;
+        }
+        if ($this->hideAge()) {
+            return $birthDate->format(SystemConfig::getValue('sDateFormatNoYear'));
+        } else {
+            return $birthDate->format(SystemConfig::getValue('sDateFormatLong'));
+        }
+    }
+
+    public static function getViewURIForId(int $id): string
+    {
+        return SystemURLs::getRootPath() . '/people/view/' . $id;
+    }
+
+    public function getViewURI(): string
+    {
+        return self::getViewURIForId($this->getId());
+    }
+
+    public function getFamilyRole()
+    {
+        $roleId = $this->getFmrId();
+        if ($roleId === 0) {
+            return null;
+        }
+
+        return self::listOption(2, (int) $roleId);
+    }
+
+    public function getFamilyRoleName(): string
+    {
+        $role = $this->getFamilyRole();
+
+        return $role !== null ? $role->getOptionName() : 'Unassigned';
+    }
+
+    public function getClassification()
+    {
+        $clsId = $this->getClsId();
+        if (empty($clsId)) {
+            return null;
+        }
+
+        return self::listOption(1, (int) $clsId);
+    }
+
+    /**
+     * Classifications and family roles are the same short lists for every person.
+     * Load each list once per request instead of once per row.
+     */
+    private static function listOption(int $listId, int $optionId): ?ListOption
+    {
+        if (!isset(self::$listOptionsByListId[$listId])) {
+            self::$listOptionsByListId[$listId] = [];
+            foreach (ListOptionQuery::create()->filterById($listId)->find() as $option) {
+                self::$listOptionsByListId[$listId][(int) $option->getOptionId()] = $option;
+            }
+        }
+
+        return self::$listOptionsByListId[$listId][$optionId] ?? null;
+    }
+
+    public function getGradeName(): ?string
+    {
+        return GradeService::nameOf($this->getGradeId());
+    }
+
+    public function getClassificationName()
+    {
+        $classificationName = 'Unassigned';
+        $classification = $this->getClassification();
+        if ($classification !== null) {
+            $classificationName = $classification->getOptionName();
+        }
+
+        return $classificationName;
+    }
+
+    public function postInsert(?ConnectionInterface $con = null): void
+    {
+        $this->createTimeLineNote('create');
+
+        // Unaffiliated persons only — Family::postInsert() sends one email per family.
+        if (empty($this->getFamId())) {
+            NewPersonOrFamilyEmail::sendIfConfigured($this);
+        }
+
+        HookManager::doAction(Hooks::PERSON_CREATED, $this);
+    }
+
+    /**
+     * Capture the pre-update state so PERSON_UPDATED can report what changed.
+     *
+     * select() is used rather than a normal find so the read bypasses object
+     * hydration and the instance pool — findPk() would just hand back $this,
+     * which already holds the new values. Runs on the save connection, inside
+     * the same transaction, before doSave() writes the new row.
+     */
+    public function preUpdate(?ConnectionInterface $con = null): bool
+    {
+        $this->hookDataSnapshot = null;
+
+        if (HookManager::hasAction(Hooks::PERSON_UPDATED)) {
+            $row = PersonQuery::create()
+                ->filterById((int) $this->getId())
+                ->select('*')
+                ->findOne($con);
+
+            $this->hookDataSnapshot = is_array($row) ? self::toPhpNameKeys($row) : [];
+        }
+
+        return parent::preUpdate($con);
+    }
+
+    /**
+     * Re-key a select('*') row from "Fully\Qualified\Model.PhpName" to just
+     * "PhpName", so PERSON_UPDATED's $oldData matches the shape of
+     * PERSON_DELETED's $personData (which comes from toArray(TYPE_PHPNAME)).
+     *
+     * @param array<string, mixed> $row
+     *
+     * @return array<string, mixed>
+     */
+    private static function toPhpNameKeys(array $row): array
+    {
+        $keyed = [];
+        foreach ($row as $column => $value) {
+            $lastDot = strrpos((string) $column, '.');
+            $keyed[$lastDot === false ? $column : substr((string) $column, $lastDot + 1)] = $value;
+        }
+
+        return $keyed;
+    }
+
+    public function postUpdate(?ConnectionInterface $con = null): void
+    {
+        if (!empty($this->getDateLastEdited()) && !$this->skipPostUpdateNote) {
+            $this->createTimeLineNote('edit');
+        }
+
+        HookManager::doAction(Hooks::PERSON_UPDATED, $this, $this->hookDataSnapshot ?? []);
+        $this->hookDataSnapshot = null;
+    }
+
+    private function createTimeLineNote(string $type): void
+    {
+        $note = new Note();
+        $note->setPerId($this->getId());
+        $note->setType($type);
+        $note->setDateEntered(new DateTime());
+
+        switch ($type) {
+            case 'create':
+                $note->setText(gettext('Created'));
+                $note->setEnteredBy($this->getEnteredBy());
+                $note->setDateEntered($this->getDateEntered());
+                break;
+            case 'edit':
+                $note->setText(gettext('Updated'));
+                $note->setEnteredBy($this->getEditedBy());
+                $note->setDateEntered($this->getDateLastEdited());
+                break;
+        }
+
+        $note->save();
+    }
+
+    public function isUser(): bool
+    {
+        $user = UserQuery::create()->findPk($this->getId());
+
+        return $user !== null;
+    }
+
+    /**
+     * Get full address string of a person.
+     *
+     * If the address is not defined on the person record, return family address if one exists.
+     */
+    public function getAddress(): string
+    {
+        if (!empty($this->getAddress1())) {
+            $address = [];
+            $tmp = $this->getAddress1();
+            if (!empty($this->getAddress2())) {
+                $tmp = $tmp . ' ' . $this->getAddress2();
+            }
+
+            $address[] = $tmp;
+            if (!empty($this->getCity())) {
+                $address[] = $this->getCity() . ',';
+            }
+            if (!empty($this->getState())) {
+                $address[] = $this->getState();
+            }
+            if (!empty($this->getZip())) {
+                $address[] = $this->getZip();
+            }
+            if (!empty($this->getCountry())) {
+                $address[] = Countries::toName($this->getCountry());
+            }
+
+            return implode(' ', $address);
+        } elseif ($this->getFamily()) {
+            return $this->getFamily()->getAddress();
+        }
+
+        return '';
+    }
+
+    /**
+     * Get name of a person family.
+     */
+    public function getFamilyName(): string
+    {
+        if ($this->getFamily()) {
+            return $this->getFamily()
+              ->getName();
+        }
+        //if it reaches here, no family name found. return empty family name
+        return '';
+    }
+
+    /**
+     * Get name of a person family.
+     */
+    public function getFamilyCountry(): string
+    {
+        if ($this->getFamily()) {
+            return $this->getFamily()
+              ->getCountry();
+        }
+        //if it reaches here, no country found. return empty country
+        return '';
+    }
+
+    /**
+     * Get Phone of a person family.
+     * 0 = Home
+     * 1 = Work
+     * 2 = Cell.
+     */
+    public function getFamilyPhone(int $type): string
+    {
+        switch ($type) {
+            case 0:
+                if ($this->getFamily()) {
+                    return $this->getFamily()
+                    ->getHomePhone();
+                }
+                break;
+            case 1:
+                if ($this->getFamily()) {
+                    return $this->getFamily()
+                    ->getWorkPhone();
+                }
+                break;
+            case 2:
+                if ($this->getFamily()) {
+                    return $this->getFamily()
+                    ->getCellPhone();
+                }
+                break;
+        }
+        //if it reaches here, no phone found. return empty phone
+        return '';
+    }
+
+    public function hasOwnAddress(): bool
+    {
+        return trim((string) $this->getAddress1()) !== '';
+    }
+
+    /**
+     * Stored coordinates of the address the map pins for this person: their own when they have one
+     * and it was found, else their family's, else 0/0. Never geocodes; coordinates are stored on
+     * save and by Geocode all.
+     */
+    public function getLatLng(): array
+    {
+        if ($this->hasOwnAddress() && $this->hasLatitudeAndLongitude()) {
+            return ['Latitude' => $this->getLatitude(), 'Longitude' => $this->getLongitude()];
+        }
+
+        $family = $this->getFamily();
+        if ($family && $family->hasLatitudeAndLongitude()) {
+            return ['Latitude' => $family->getLatitude(), 'Longitude' => $family->getLongitude()];
+        }
+
+        return ['Latitude' => 0, 'Longitude' => 0];
+    }
+
+    /** The address the map pin of {@see self::getLatLng()} stands for. */
+    public function getMapAddress(): string
+    {
+        if ($this->hasOwnAddress() && $this->hasLatitudeAndLongitude()) {
+            return $this->getAddress();
+        }
+
+        return $this->getFamily()?->getAddress() ?? '';
+    }
+
+    public function getMapDirectionsUrl(): string
+    {
+        if ($this->hasOwnAddress() && $this->hasLatitudeAndLongitude()) {
+            return $this->getDirectionsUrl();
+        }
+
+        return $this->getFamily()?->getDirectionsUrl() ?? '';
+    }
+
+    public function preSave(?ConnectionInterface $con = null): bool
+    {
+        if ($this->invalidEmailFields() !== []) {
+            throw new InvalidArgumentException(EmailAddress::validationMessage(), 400);
+        }
+
+        $this->forgetGeocodeOnAddressChange(
+            [PersonTableMap::COL_PER_ADDRESS1, PersonTableMap::COL_PER_ADDRESS2, PersonTableMap::COL_PER_CITY, PersonTableMap::COL_PER_STATE, PersonTableMap::COL_PER_ZIP, PersonTableMap::COL_PER_COUNTRY],
+            [PersonTableMap::COL_PER_LATITUDE, PersonTableMap::COL_PER_LONGITUDE, PersonTableMap::COL_PER_GEOCODETRIEDAT],
+        );
+
+        return parent::preSave($con);
+    }
+
+    public static function loadValidatorMetadata(ClassMetadata $metadata): void
+    {
+        $metadata->addConstraint(new Callback('validateEmailAddresses'));
+    }
+
+    public function validateEmailAddresses(ExecutionContextInterface $context): void
+    {
+        foreach ($this->invalidEmailFields() as $field) {
+            $context->buildViolation(EmailAddress::validationMessage())->atPath($field)->addViolation();
+        }
+    }
+
+    /** @return string[] */
+    private function invalidEmailFields(): array
+    {
+        $invalid = [];
+        foreach ([PersonTableMap::COL_PER_EMAIL => 'Email', PersonTableMap::COL_PER_WORKEMAIL => 'WorkEmail'] as $column => $field) {
+            $email = (string) $this->{'get' . $field}();
+            // Unchanged legacy addresses must not prevent staff correcting other details.
+            if ($this->isColumnModified($column) && trim($email) !== '' && !EmailAddress::isValid($email)) {
+                $invalid[] = $field;
+            }
+        }
+
+        return $invalid;
+    }
+
+    /**
+     * Returns a Google Maps directions deep-link for this person's address.
+     *
+     * - Person has own address (Address1 set): use address string only — no family info.
+     * - Person has no own address, family has stored lat/lng: use coordinates (accurate, no API call).
+     * - Person has no own address, family has address only: use family address string.
+     * - No address anywhere: return empty string.
+     *
+     */
+    public function getDirectionsUrl(): string
+    {
+        if (!empty($this->getAddress1())) {
+            if ($this->hasLatitudeAndLongitude()) {
+                return GeoUtils::buildDirectionsUrl('', (float) $this->getLatitude(), (float) $this->getLongitude());
+            }
+
+            return GeoUtils::buildDirectionsUrl($this->getAddress());
+        }
+
+        $family = $this->getFamily();
+        if ($family === null) {
+            return '';
+        }
+
+        if ($family->hasLatitudeAndLongitude()) {
+            return GeoUtils::buildDirectionsUrl('', (float) $family->getLatitude(), (float) $family->getLongitude());
+        }
+
+        return GeoUtils::buildDirectionsUrl($family->getAddress());
+    }
+
+    /**
+     * Apple Maps companion to {@see self::getDirectionsUrl()}. Mirrors the
+     * same address/lat/lng precedence rules so the two links resolve to the
+     * same destination.
+     */
+    public function getAppleMapsDirectionsUrl(): string
+    {
+        if (!empty($this->getAddress1())) {
+            return GeoUtils::buildAppleMapsDirectionsUrl($this->getAddress());
+        }
+
+        $family = $this->getFamily();
+        if ($family === null) {
+            return '';
+        }
+
+        if ($family->hasLatitudeAndLongitude()) {
+            return GeoUtils::buildAppleMapsDirectionsUrl('', (float) $family->getLatitude(), (float) $family->getLongitude());
+        }
+
+        return GeoUtils::buildAppleMapsDirectionsUrl($family->getAddress());
+    }
+
+    public function deletePhoto(): bool
+    {
+        if (AuthenticationManager::getCurrentUser()->isDeleteRecordsEnabled()) {
+            if ($this->getPhoto()->delete()) {
+                $note = new Note();
+                $note->setText(gettext('Profile Image Deleted'));
+                $note->setType('photo');
+                $note->setEntered(AuthenticationManager::getCurrentUser()->getId());
+                $note->setPerId($this->getId());
+                $note->save();
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function getPhoto(): Photo
+    {
+        if (!$this->photo) {
+            $this->photo = new Photo('Person', $this->getId());
+        }
+
+        return $this->photo;
+    }
+
+    /**
+     * Save the record without generating the automatic 'Updated' timeline note.
+     * Use when the caller creates a more specific note (e.g. status change) to
+     * avoid a duplicate generic entry. Mirrors the private pattern used by
+     * setImageFromBase64().
+     */
+    public function saveWithoutUpdateNote(?ConnectionInterface $con = null): void
+    {
+        $this->skipPostUpdateNote = true;
+        try {
+            $this->save($con);
+        } finally {
+            $this->skipPostUpdateNote = false;
+        }
+    }
+
+    /**
+     * @param int|null $editorId who uploaded it; the signed-in user when null. A member
+     *                           session has no user, so the portal passes the member's person id.
+     */
+    public function setImageFromBase64($base64, ?int $editorId = null): void
+    {
+        $editorId ??= AuthenticationManager::getCurrentUser()->getId();
+        $note = new Note();
+        $note->setText(gettext('Profile Image uploaded'));
+        $note->setType('photo');
+        $note->setEntered($editorId);
+        $this->getPhoto()->setImageFromBase64($base64);
+        $note->setPerId($this->getId());
+        $note->save();
+
+        $this->setDateLastEdited(new \DateTime());
+        $this->setEditedBy($editorId);
+        $this->skipPostUpdateNote = true;
+        try {
+            $this->save();
+        } finally {
+            $this->skipPostUpdateNote = false;
+        }
+    }
+
+    /**
+     * Returns a string of a person's full name, formatted as specified by $Style
+     * $Style = 0  :  "Title FirstName MiddleName LastName, Suffix"
+     * $Style = 1  :  "Title FirstName MiddleInitial. LastName, Suffix"
+     * $Style = 2  :  "LastName, Title FirstName MiddleName, Suffix"
+     * $Style = 3  :  "LastName, Title FirstName MiddleInitial., Suffix"
+     * $Style = 4  :  "FirstName MiddleName LastName"
+     * $Style = 5  :  "Title FirstName LastName"
+     * $Style = 6  :  "LastName, Title FirstName"
+     * $Style = 7  :  "LastName FirstName"
+     * $Style = 8  :  "LastName, FirstName Middlename".
+     */
+    public function getFormattedName(int $Style): string
+    {
+        $nameString = '';
+        switch ($Style) {
+            case 0:
+                if ($this->getTitle()) {
+                    $nameString .= $this->getTitle() . ' ';
+                }
+                $nameString .= $this->getFirstName();
+                if ($this->getMiddleName()) {
+                    $nameString .= ' ' . $this->getMiddleName();
+                }
+                if ($this->getLastName()) {
+                    $nameString .= ' ' . $this->getLastName();
+                }
+                if ($this->getSuffix()) {
+                    $nameString .= ', ' . $this->getSuffix();
+                }
+                break;
+
+            case 1:
+                if ($this->getTitle()) {
+                    $nameString .= $this->getTitle() . ' ';
+                }
+                $nameString .= $this->getFirstName();
+                if ($this->getMiddleName()) {
+                    $nameString .= ' ' . strtoupper(mb_substr($this->getMiddleName(), 0, 1, 'UTF-8')) . '.';
+                }
+                if ($this->getLastName()) {
+                    $nameString .= ' ' . $this->getLastName();
+                }
+                if ($this->getSuffix()) {
+                    $nameString .= ', ' . $this->getSuffix();
+                }
+                break;
+
+            case 2:
+                if ($this->getLastName()) {
+                    $nameString .= $this->getLastName() . ', ';
+                }
+                if ($this->getTitle()) {
+                    $nameString .= $this->getTitle() . ' ';
+                }
+                $nameString .= $this->getFirstName();
+                if ($this->getMiddleName()) {
+                    $nameString .= ' ' . $this->getMiddleName();
+                }
+                if ($this->getSuffix()) {
+                    $nameString .= ', ' . $this->getSuffix();
+                }
+                break;
+
+            case 3:
+                if ($this->getLastName()) {
+                    $nameString .= $this->getLastName() . ', ';
+                }
+                if ($this->getTitle()) {
+                    $nameString .= $this->getTitle() . ' ';
+                }
+                $nameString .= $this->getFirstName();
+                if ($this->getMiddleName()) {
+                    $nameString .= ' ' . strtoupper(mb_substr($this->getMiddleName(), 0, 1, 'UTF-8')) . '.';
+                }
+                if ($this->getSuffix()) {
+                    $nameString .= ', ' . $this->getSuffix();
+                }
+                break;
+
+            case 4:
+                $nameString .= $this->getFirstName();
+                if ($this->getMiddleName()) {
+                    $nameString .= ' ' . $this->getMiddleName();
+                }
+                if ($this->getLastName()) {
+                    $nameString .= ' ' . $this->getLastName();
+                }
+                break;
+
+            case 5:
+                if ($this->getTitle()) {
+                    $nameString .= $this->getTitle() . ' ';
+                }
+                $nameString .= $this->getFirstName();
+                if ($this->getLastName()) {
+                    $nameString .= ' ' . $this->getLastName();
+                }
+                break;
+
+            case 6:
+                if ($this->getLastName()) {
+                    $nameString .= $this->getLastName() . ', ';
+                }
+                if ($this->getTitle()) {
+                    $nameString .= $this->getTitle() . ' ';
+                }
+                $nameString .= $this->getFirstName();
+                break;
+
+            case 7:
+                if ($this->getLastName()) {
+                    $nameString .= $this->getLastName() . ' ';
+                }
+                if ($this->getFirstName()) {
+                    $nameString .= $this->getFirstName();
+                } else {
+                    $nameString = trim($nameString);
+                }
+                break;
+
+            case 8:
+                if ($this->getLastName()) {
+                    $nameString .= $this->getLastName();
+                }
+                if ($this->getFirstName()) {
+                    if (!$nameString) { // no first name
+                        $nameString = $this->getFirstName();
+                    } else {
+                        $nameString .= ', ' . $this->getFirstName();
+                    }
+                }
+                if ($this->getMiddleName()) {
+                    $nameString .= ' ' . $this->getMiddleName();
+                }
+                break;
+            default:
+                $nameString = trim($this->getFullName());
+        }
+
+        return $nameString;
+    }
+
+    /**
+     * Why the signed-in user may not delete this person, or null when they may.
+     *
+     * Deleting a person also deletes their login, so this guards the login:
+     * only an administrator may remove a person who has one, nobody may remove
+     * themselves, and the last administrator can never be removed.
+     */
+    public function getLoginDeletionBlockedReason(): ?string
+    {
+        $targetUser = UserQuery::create()->findPk($this->getId());
+        if ($targetUser === null || !AuthenticationManager::isUserAuthenticated()) {
+            return null;
+        }
+
+        $currentUser = AuthenticationManager::getCurrentUser();
+        if ($currentUser->getId() === (int) $this->getId()) {
+            return gettext("Can't delete yourself");
+        }
+
+        if (!$currentUser->isAdmin()) {
+            return gettext('Only an administrator can delete a person who has a login.');
+        }
+
+        if ($targetUser->isAdmin()) {
+            $otherAdmins = UserQuery::create()
+                ->filterByAdmin(true)
+                ->filterByPersonId($this->getId(), Criteria::NOT_EQUAL)
+                ->count();
+            if ($otherAdmins === 0) {
+                return gettext('The last administrator cannot be deleted.');
+            }
+        }
+
+        return null;
+    }
+
+    public function preDelete(?ConnectionInterface $con = null): bool
+    {
+        $blockedReason = $this->getLoginDeletionBlockedReason();
+        if ($blockedReason !== null) {
+            throw new PersonDeletionBlockedException($blockedReason);
+        }
+
+        // Snapshot before the cleanup below removes the rows toArray() reads
+        // (the photo behind HasPhoto), so PERSON_DELETED listeners see the
+        // person as they actually were.
+        $this->hookDataSnapshot = HookManager::hasAction(Hooks::PERSON_DELETED)
+            ? $this->toArray()
+            : null;
+
+        // Remove the uploaded image from disk. Call Photo::delete() directly
+        // rather than $this->deletePhoto(), which gates on the current user's
+        // delete-records permission and writes a Note that NoteQuery below
+        // would immediately delete. See GH issue #1697.
+        $this->getPhoto()->delete();
+
+        $obj = Person2group2roleP2g2rQuery::create()->filterByPerson($this)->find($con);
+        if ($obj->count() > 0) {
+            $groupService = new GroupService();
+            foreach ($obj as $group2roleP2g2r) {
+                $groupService->removeUserFromGroup($group2roleP2g2r->getGroupId(), $group2roleP2g2r->getPersonId());
+            }
+        }
+
+        $perCustom = PersonCustomQuery::create()->findPk($this->getId(), $con);
+        if ($perCustom !== null) {
+            $perCustom->delete($con);
+        }
+
+        $user = UserQuery::create()->findPk($this->getId(), $con);
+        if ($user !== null) {
+            $user->delete($con);
+        }
+
+        PersonVolunteerOpportunityQuery::create()->filterByPersonId($this->getId())->delete($con);
+
+        PropertyQuery::create()
+            ->filterByProClass('p')
+            ->useRecordPropertyQuery()
+            ->filterByRecordId($this->getId())
+            ->delete($con);
+
+        NoteQuery::create()->filterByPerson($this)->delete($con);
+
+        return parent::preDelete($con);
+    }
+
+    /**
+     * Fire PERSON_DELETED for every path that removes a person.
+     *
+     * This lives on the model rather than in the API route because people are
+     * deleted from more than one place — DELETE /api/person/{id} and the
+     * member cascade in DELETE /api/family/{id}?deleteMembers=true, which
+     * never reached the route-level dispatch at all. Propel calls postDelete()
+     * exactly once per delete(), so every path fires the hook exactly once and
+     * no future caller can forget to.
+     */
+    public function postDelete(?ConnectionInterface $con = null): void
+    {
+        HookManager::doAction(Hooks::PERSON_DELETED, (int) $this->getId(), $this->hookDataSnapshot ?? []);
+        $this->hookDataSnapshot = null;
+    }
+
+    public function getProperties()
+    {
+        return PropertyQuery::create()
+          ->filterByProClass('p')
+          ->useRecordPropertyQuery()
+          ->filterByRecordId($this->getId())
+          ->find();
+    }
+
+    //  return array of person properties
+    // created for the person-list.php datatable
+    /**
+     * @return string[]
+     */
+    public function getPropertiesString(): array
+    {
+        $personProperties = PropertyQuery::create()
+          ->filterByProClass('p')
+          ->leftJoinRecordProperty()
+          ->where('r2p_record_ID=' . $this->getId())
+          ->find();
+
+        $PropertiesList = [];
+        foreach ($personProperties as $element) {
+            $PropertiesList[] = $element->getProName();
+        }
+
+        return $PropertiesList;
+    }
+
+    /**
+     * Combined replacement for getCustomFields + getCustomFieldExportValues.
+     *
+     * Runs a single PersonCustomQuery per person instead of two, eliminating
+     * the duplicate N+1 round-trip that would otherwise occur when person-list.php
+     * needs both the filter-name list (for the hidden 'Custom' column JSON) and the
+     * per-field formatted export values.
+     *
+     * @param mixed  $allPersonCustomFields  All PersonCustomMaster records (Propel collection)
+     * @param array  $customMapping          {fieldId => ['Name'=>string,'Elements'=>[...]]}
+     * @param array  $CustomList             Counter map mutated in place (same as getCustomFields)
+     * @param mixed  $name_func              Callable producing 'FieldName:OptionName' composite key
+     * @param PersonCustomMaster[] $exportCustomDefs  Ordered, security-filtered defs for export cols
+     *
+     * @return array{filterNames: string[], exportValues: array<string,string>}
+     */
+    public function getCustomFieldsAll(
+        $allPersonCustomFields,
+        array $customMapping,
+        array &$CustomList,
+        $name_func,
+        array $exportCustomDefs
+    ): array {
+        $customFieldService = new CustomFieldService();
+        $rawQry = PersonCustomQuery::create();
+        foreach ($allPersonCustomFields as $customfield) {
+            if ($customFieldService->canView($customfield->getFieldSecurity())) {
+                $rawQry->addAsColumn(
+                    str_replace(['.', '(', ')'], '', $customfield->getId()),
+                    $customfield->getId()
+                );
+            }
+        }
+        $thisPersonCustomFields = $rawQry->findOneByPerId($this->getId());
+
+        // Build filter name list (replicates getCustomFields logic)
+        $filterNames = [];
+        if ($thisPersonCustomFields) {
+            foreach ($thisPersonCustomFields->getVirtualColumns() as $column => $value) {
+                if (!empty($value)) {
+                    $temp = $customMapping[$column]['Name'];
+                    $filterNames[] = $temp;
+                    $CustomList[$temp] += 1;
+                    if (array_key_exists($value, $customMapping[$column]['Elements'])) {
+                        $temp = $name_func($customMapping[$column]['Name'], $customMapping[$column]['Elements'][$value]);
+                        $filterNames[] = $temp;
+                        $CustomList[$temp] += 1;
+                    }
+                }
+            }
+        }
+
+        // Build per-field export values (replicates getCustomFieldExportValues logic)
+        $exportValues = [];
+        if ($thisPersonCustomFields) {
+            $vcols = $thisPersonCustomFields->getVirtualColumns();
+            foreach ($exportCustomDefs as $def) {
+                $alias = str_replace(['.', '(', ')'], '', $def->getId());
+                $raw   = $vcols[$alias] ?? null;
+                $exportValues[$def->getId()] = ($raw === null || $raw === '')
+                    ? ''
+                    : CustomFieldUtils::display($def->getTypeId(), (string) $raw, $def->getSpecial());
+            }
+        } else {
+            foreach ($exportCustomDefs as $def) {
+                $exportValues[$def->getId()] = '';
+            }
+        }
+
+        return ['filterNames' => $filterNames, 'exportValues' => $exportValues];
+    }
+
+    // return array of person groups
+    // created for the person-list.php datatable
+    /**
+     * @return string[]
+     */
+    public function getGroups(): array
+    {
+        $GroupList = GroupQuery::create()
+        ->leftJoinPerson2group2roleP2g2r()
+        ->where('p2g2r_per_ID=' . $this->getId())
+        ->find();
+
+        $group = [];
+        foreach ($GroupList as $element) {
+            $group[] = $element->getName();
+        }
+
+        return $group;
+    }
+
+    public function getNumericCellPhone(): string
+    {
+        return preg_replace('/\D/', '', $this->getCellPhone());
+    }
+
+    /**
+     * Returns the best available phone number for this person.
+     * Prefers cell phone; falls back to this person's home phone.
+     */
+    public function getBestPhone(): string
+    {
+        return $this->getCellPhone() ?: $this->getHomePhone() ?? '';
+    }
+
+    public function postSave(?ConnectionInterface $con = null): void
+    {
+        $this->getPhoto()->refresh();
+
+        parent::postSave($con);
+    }
+
+    public function getAge(?string $date = null): ?string
+    {
+        if ($this->getBirthYear() === null) {
+            return null;
+        }
+
+        $birthDate = $this->getBirthDate();
+
+        if (!$birthDate instanceof \DateTimeImmutable || $this->hideAge()) {
+            return false;
+        }
+        $now = $date === null ? new \DateTimeImmutable('today') : \DateTimeImmutable::createFromFormat('!Y-m-d', $date);
+
+        if (!$now instanceof \DateTimeImmutable) {
+            return false;
+        }
+
+        $age = MiscUtils::ageOn($birthDate, $now);
+        if ($age === null) {
+            return false;
+        }
+
+        if ($age->y < 1) {
+            $monthStr = ngettext('%d month old', '%d months old', $age->m);
+            try {
+                return sprintf($monthStr, $age->m);
+            } catch (\Throwable $e) {
+                error_log('Age formatting failed for locale string "' . $monthStr . '": ' . $e->getMessage());
+                return $age->m . ' ' . trim(preg_replace('/%\d*\$?[sdifuoxX]\s*/u', '', $monthStr) ?? $monthStr);
+            }
+        }
+
+        $yearStr = ngettext('%d year old', '%d years old', $age->y);
+        try {
+            return sprintf($yearStr, $age->y);
+        } catch (\Throwable $e) {
+            error_log('Age formatting failed for locale string "' . $yearStr . '": ' . $e->getMessage());
+            return $age->y . ' ' . trim(preg_replace('/%\d*\$?[sdifuoxX]\s*/u', '', $yearStr) ?? $yearStr);
+        }
+    }
+
+    /** Whole years, 0 under a year, or null for a hidden age, an unknown birth date or a birth date in the future. */
+    public function getNumericAge(): ?int
+    {
+        $birthDate = $this->getBirthDate();
+        if (!$birthDate instanceof \DateTimeImmutable || $this->hideAge()) {
+            return null;
+        }
+
+        return MiscUtils::ageOn($birthDate, new \DateTimeImmutable('today'))?->y;
+    }
+
+    public function getFullNameWithAge(): string
+    {
+        return $this->getFullName() . ' ' . $this->getAge();
+    }
+
+    public function toArray(string $keyType = TableMap::TYPE_PHPNAME, bool $includeLazyLoadColumns = true, array $alreadyDumpedObjects = [], bool $includeForeignObjects = false): array
+    {
+        $array = parent::toArray($keyType, $includeLazyLoadColumns, $alreadyDumpedObjects, $includeForeignObjects);
+        $array['Address'] = $this->getAddress();
+        $array['FullName'] = $this->getFullName();
+        $array['HasPhoto'] = $this->getPhoto()->hasUploadedPhoto();
+
+        return $array;
+    }
+
+    /**
+     * Returns true when the person has not been deactivated.
+     * An empty/null per_DateDeactivated means the person is active.
+     */
+    public function isActive(): bool
+    {
+        return empty($this->getDateDeactivated());
+    }
+
+    /**
+     * Return the person's status as text ('Active' or 'Inactive').
+     */
+    public function getStatusText(): string
+    {
+        return $this->isActive() ? gettext('Active') : gettext('Inactive');
+    }
+
+    /**
+     * Returns a string of a person's full name initial, formatted as specified by $Style
+     * $Style = 0  :  "One character from FirstName and one character from LastName"
+     * $Style = 1  :  "Two characters from FirstName"
+     */
+    public function getInitial(int $Style): string
+    {
+        $initialString = '';
+        switch ($Style) {
+            case 0:
+                $initialString .= mb_strtoupper(mb_substr($this->getFirstName(), 0, 1));
+                $initialString .= mb_strtoupper(mb_substr($this->getLastName(), 0, 1));
+                break;
+            case 1:
+                $fullNameArr = $this->getFirstName();
+                $initialString .= mb_strtoupper(mb_substr($fullNameArr, 0, 2));
+        }
+
+        return $initialString;
+    }
+
+    /**
+     * Resolve address fields with family fallback (issue #7937).
+     *
+     * When a person doesn't have personal address/contact data, falls back to their family's data.
+     * Ensures complete address coverage for single-member households and people without personal address entries.
+     * Returns empty string if neither person nor family has the value.
+     *
+     * @return string Resolved address field with family fallback
+     */
+    public function getResolvedAddress1(): string
+    {
+        if (!empty(parent::getAddress1())) {
+            return parent::getAddress1();
+        }
+        $family = $this->getFamily();
+        return $family?->getAddress1() ?? '';
+    }
+
+    public function getResolvedAddress2(): string
+    {
+        if (!empty(parent::getAddress2())) {
+            return parent::getAddress2();
+        }
+        $family = $this->getFamily();
+        return $family?->getAddress2() ?? '';
+    }
+
+    public function getResolvedCity(): string
+    {
+        if (!empty(parent::getCity())) {
+            return parent::getCity();
+        }
+        $family = $this->getFamily();
+        return $family?->getCity() ?? '';
+    }
+
+    public function getResolvedState(): string
+    {
+        if (!empty(parent::getState())) {
+            return parent::getState();
+        }
+        $family = $this->getFamily();
+        return $family?->getState() ?? '';
+    }
+
+    public function getResolvedZip(): string
+    {
+        if (!empty(parent::getZip())) {
+            return parent::getZip();
+        }
+        $family = $this->getFamily();
+        return $family?->getZip() ?? '';
+    }
+
+    public function getResolvedCountry(): string
+    {
+        if (!empty(parent::getCountry())) {
+            return parent::getCountry();
+        }
+        $family = $this->getFamily();
+        return $family?->getCountry() ?? '';
+    }
+
+    public function getResolvedHomePhone(): string
+    {
+        if (!empty(parent::getHomePhone())) {
+            return parent::getHomePhone();
+        }
+        $family = $this->getFamily();
+        return $family?->getHomePhone() ?? '';
+    }
+
+    public function getVisibleCustomFieldDefinitions(): array
+    {
+        return (new CustomFieldService())->getVisiblePersonFields();
+    }
+
+    /**
+     * Returns this person's custom field values, filtered to only the fields the
+     * current user is permitted to view (GHSA-p6xx-xx98-f323).
+     *
+     * `person_custom` stores each custom field as a dynamically-added column keyed
+     * by the field's short code (PersonCustomMaster::getId()); it is not part of the
+     * generated Propel schema, so these values are never present in
+     * Person::exportTo()/toArray() output (that only surfaces the table's real
+     * Propel column, `per_ID`, under the one-to-one `singlePersonCustom` key).
+     * Callers that need per-field custom data — e.g. the JSON API — must use this
+     * method instead of relying on `singlePersonCustom` from exportTo().
+     *
+     * @return array<int, array{id: string, name: string, value: string}>
+     */
+    public function getVisibleCustomFieldValues(): array
+    {
+        $visibleFields = $this->getVisibleCustomFieldDefinitions();
+        if (empty($visibleFields)) {
+            return [];
+        }
+
+        $rawQry = PersonCustomQuery::create();
+        foreach ($visibleFields as $field) {
+            $rawQry->addAsColumn(str_replace(['.', '(', ')'], '', $field->getId()), $field->getId());
+        }
+        $personCustomData = $rawQry->findOneByPerId($this->getId());
+
+        $result = [];
+        if ($personCustomData) {
+            foreach ($visibleFields as $field) {
+                $value = trim((string) $personCustomData->getVirtualColumn(str_replace(['.', '(', ')'], '', $field->getId())));
+                if ($value !== '') {
+                    $result[] = [
+                        'id'    => $field->getId(),
+                        'name'  => $field->getName(),
+                        'value' => $value,
+                    ];
+                }
+            }
+        }
+
+        return $result;
+    }
+}

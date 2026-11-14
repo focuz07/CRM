@@ -1,0 +1,293 @@
+<?php
+
+namespace ChurchCRM\model\ChurchCRM;
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\model\ChurchCRM\Base\Event as BaseEvent;
+use ChurchCRM\model\ChurchCRM\CalendarEventQuery;
+use ChurchCRM\model\ChurchCRM\EventAttendQuery;
+use ChurchCRM\model\ChurchCRM\EventAudienceQuery;
+use ChurchCRM\model\ChurchCRM\EventCountsQuery;
+use ChurchCRM\model\ChurchCRM\EventQuery;
+use ChurchCRM\model\ChurchCRM\KioskAssignmentQuery;
+use ChurchCRM\Plugin\Hook\HookManager;
+use ChurchCRM\Plugin\Hooks;
+use ChurchCRM\Volunteer\Service\VolunteerScheduleService;
+use Propel\Runtime\ActiveQuery\Criteria;
+use Propel\Runtime\Connection\ConnectionInterface;
+use Propel\Runtime\Map\TableMap;
+
+/**
+ * Skeleton subclass for representing a row from the 'events_event' table.
+ *
+ *
+ *
+ * You should add additional methods to this class to meet the
+ * application requirements.  This class will only be generated as
+ * long as it does not already exist in the output directory.
+ */
+class Event extends BaseEvent
+{
+    private bool $editable = true;
+
+    /**
+     * Snapshot of the persisted row, taken in preUpdate()/preDelete() and
+     * handed to the EVENT_UPDATED / EVENT_DELETED listeners afterwards.
+     *
+     * Null means "nothing listening" — the snapshot query is skipped when no
+     * plugin has registered for the hook, so installs with no plugins pay
+     * nothing for this.
+     *
+     * @var array<string, mixed>|null
+     */
+    private ?array $hookDataSnapshot = null;
+
+    /**
+     * Capture the pre-update state so EVENT_UPDATED can report what changed.
+     *
+     * select() is used rather than a normal find so the read bypasses object
+     * hydration and the instance pool — findPk() would just hand back $this,
+     * which already holds the new values. Runs on the save connection, inside
+     * the same transaction, before doSave() writes the new row.
+     */
+    public function preUpdate(?ConnectionInterface $con = null): bool
+    {
+        $this->hookDataSnapshot = null;
+
+        if (HookManager::hasAction(Hooks::EVENT_UPDATED)) {
+            $row = EventQuery::create()
+                ->filterById((int) $this->getId())
+                ->select('*')
+                ->findOne($con);
+
+            $this->hookDataSnapshot = is_array($row) ? self::toPhpNameKeys($row) : [];
+        }
+
+        return parent::preUpdate($con);
+    }
+
+    /**
+     * Re-key a select('*') row from "Fully\Qualified\Model.PhpName" to just
+     * "PhpName", so EVENT_UPDATED's $oldData matches the shape of
+     * EVENT_DELETED's $eventData (which comes from toArray(TYPE_PHPNAME)).
+     *
+     * @param array<string, mixed> $row
+     *
+     * @return array<string, mixed>
+     */
+    private static function toPhpNameKeys(array $row): array
+    {
+        $keyed = [];
+        foreach ($row as $column => $value) {
+            $lastDot = strrpos((string) $column, '.');
+            $keyed[$lastDot === false ? $column : substr((string) $column, $lastDot + 1)] = $value;
+        }
+
+        return $keyed;
+    }
+
+    /**
+     * Fire EVENT_UPDATED for every path that edits an event.
+     *
+     * This lives on the model rather than in the API routes because events are
+     * updated from a lot of places — updateEvent(), setEventTime(),
+     * setEventStatus() and closeStuckEvents() in the events API, the
+     * /event/dashboard MVC action, and the kiosk flows. Propel calls
+     * postUpdate() exactly once per save() of an existing row, so dispatching
+     * here means every path fires the hook exactly once and no future caller
+     * can forget to. For the same reason the Volunteer v2 occurrences anchored
+     * to this event are moved to its new day here, in the save's transaction,
+     * rather than from a hook listener: core registers no listeners of its own.
+     */
+    public function postUpdate(?ConnectionInterface $con = null): void
+    {
+        (new VolunteerScheduleService())->followEventDates((int) $this->getId(), $con);
+
+        HookManager::doAction(Hooks::EVENT_UPDATED, $this, $this->hookDataSnapshot ?? []);
+        $this->hookDataSnapshot = null;
+    }
+
+    /**
+     * Cascade-delete child rows that reference this event before the row
+     * itself is removed.
+     *
+     * Event child tables (all FK'd to events_event.event_id) are semantically
+     * owned by the event and have no independent meaning once the event is
+     * gone. Propel does not auto-cascade these FKs, so if we do not clean them
+     * up explicitly they become orphaned rows that break integrity reports
+     * and surface as "phantom" check-ins, audience links, etc.
+     *
+     * Handled here:
+     *  - calendar_event         (which calendars the event appears on)
+     *  - event_audience         (group audience links — cross-ref table)
+     *  - eventattend_event_attend (attendance records)
+     *  - kioskassignment_kasm    (kiosk → event pins)
+     *  - eventcounts_evtcnt      (attendance summary — no FK at DB level)
+     *
+     * DELIBERATELY NOT handled here: Volunteer v2's `volunteer_occurrence_vocc` (#9713,
+     * design §2.9/E12). A volunteer occurrence is NOT owned by the event — several
+     * occurrences from different ministries may point at the same service (UC3), and the
+     * assignments, responses and swaps hanging off one are the church's record of who
+     * actually served. Deleting the calendar entry must not erase that history.
+     *
+     * `fk_vocc_event` is declared `ON DELETE SET NULL`, so the database nulls
+     * `vocc_event_id` on its own and the occurrence survives on `vocc_OccurrenceDate`
+     * (which is populated for linked rows precisely to be that anchor). There is nothing
+     * for this method to do, and adding a `VolunteerOccurrenceQuery::...->delete()` line
+     * to the list above would destroy exactly the data the SET NULL exists to keep.
+     *
+     * `events_event.event_ministry_id` points the other way — at a ministry, not at a
+     * child row — and is likewise not this method's business.
+     *
+     * See #8670.
+     */
+    public function preDelete(?ConnectionInterface $con = null): bool
+    {
+        $eventId = (int) $this->getId();
+
+        // Snapshot before the cascade below removes the child rows that
+        // toArray() reads (PinnedCalendars), so EVENT_DELETED listeners see
+        // the event as it actually was.
+        $this->hookDataSnapshot = HookManager::hasAction(Hooks::EVENT_DELETED)
+            ? $this->toArray()
+            : null;
+
+        CalendarEventQuery::create()->filterByEventId($eventId)->delete($con);
+        EventAudienceQuery::create()->filterByEventId($eventId)->delete($con);
+        EventAttendQuery::create()->filterByEventId($eventId)->delete($con);
+        EventCountsQuery::create()->filterByEvtcntEventid($eventId)->delete($con);
+        KioskAssignmentQuery::create()->filterByEventId($eventId)->delete($con);
+
+        return parent::preDelete($con);
+    }
+
+    /**
+     * Fire EVENT_DELETED for every path that removes an event.
+     *
+     * Same reasoning as postUpdate(): events are deleted from the events API
+     * (DELETE /events/{id}) and from the /event/dashboard MVC action, and
+     * Propel calls postDelete() exactly once per delete(), after the row is
+     * gone but while the object still holds its column values.
+     */
+    public function postDelete(?ConnectionInterface $con = null): void
+    {
+        HookManager::doAction(Hooks::EVENT_DELETED, (int) $this->getId(), $this->hookDataSnapshot ?? []);
+        $this->hookDataSnapshot = null;
+    }
+
+    public function toArray(string $keyType = TableMap::TYPE_PHPNAME, bool $includeLazyLoadColumns = true, array $alreadyDumpedObjects = [], bool $includeForeignObjects = false): array
+    {
+        $array = parent::toArray($keyType, $includeLazyLoadColumns, $alreadyDumpedObjects, $includeForeignObjects);
+        $array['PinnedCalendars'] = array_map('intval', Base\CalendarEventQuery::create()
+            ->filterByEventId($this->getId())
+            ->select(Map\CalendarEventTableMap::COL_CALENDAR_ID)
+            ->find()->toArray());
+
+        return $array;
+    }
+
+    public function isEditable(): bool
+    {
+        return $this->editable;
+    }
+
+    public function setEditable(bool $editable): void
+    {
+        $this->editable = $editable;
+    }
+
+    public function checkInPerson(int $PersonId, ?int $CheckedInById = null, ?ConnectionInterface $con = null): array
+    {
+        $AttendanceRecord = EventAttendQuery::create()
+            ->filterByEvent($this)
+            ->filterByPersonId($PersonId)
+            ->findOneOrCreate($con);
+
+        $AttendanceRecord->setEvent($this)
+        ->setPersonId($PersonId)
+        ->setCheckinDate(date('Y-m-d H:i:s'))
+        ->setCheckoutDate(null)
+        ->setCheckoutId(null)
+        ->setCheckinId($CheckedInById);
+
+        $AttendanceRecord->save($con);
+        HookManager::doAction(Hooks::EVENT_CHECKIN, $AttendanceRecord, $this, $PersonId);
+
+        $this->addTimelineNote(
+            $PersonId,
+            sprintf(gettext('Checked in to event: %s'), $this->getTitle()),
+            $CheckedInById,
+            'event',
+            $con
+        );
+
+        return ['status' => 'success'];
+    }
+
+    public function checkOutPerson(int $PersonId, ?int $CheckedOutById = null): array
+    {
+        $AttendanceRecord = EventAttendQuery::create()
+            ->filterByEvent($this)
+            ->filterByPersonId($PersonId)
+            ->filterByCheckinDate(null, Criteria::NOT_EQUAL)
+            ->findOne();
+
+        if ($AttendanceRecord === null) {
+            return ['status' => 'not_checked_in'];
+        }
+
+        $AttendanceRecord->setEvent($this)
+        ->setPersonId($PersonId)
+        ->setCheckoutDate(date('Y-m-d H:i:s'))
+        ->setCheckoutId($CheckedOutById);
+
+        $AttendanceRecord->save();
+        HookManager::doAction(Hooks::EVENT_CHECKOUT, $AttendanceRecord, $this, $PersonId);
+
+        $this->addTimelineNote(
+            $PersonId,
+            sprintf(gettext('Checked out from event: %s'), $this->getTitle()),
+            $CheckedOutById
+        );
+
+        return ['status' => 'success'];
+    }
+
+    /**
+     * Add a timeline note for event check-in/out on a person's timeline.
+     *
+     * Kiosk device routes call Event::checkInPerson()/checkOutPerson() with no
+     * authenticated user (the kiosk has its own cookie, not a User session).
+     * Falling through to AuthenticationManager::getCurrentUser() in that case
+     * throws and breaks the kiosk flow. If no actor id is supplied AND no user
+     * is logged in, fall back to the recorded person themself so the note
+     * still gets created without a fatal error.
+     */
+    private function addTimelineNote(int $personId, string $text, ?int $actionById, string $type = 'event', ?ConnectionInterface $con = null): void
+    {
+        if ($actionById === null) {
+            if (AuthenticationManager::isUserAuthenticated()) {
+                $actionById = AuthenticationManager::getCurrentUser()->getId();
+            } else {
+                // Kiosk device path — no User session. Attribute the note to
+                // the person themself so the timeline still records it.
+                $actionById = $personId;
+            }
+        }
+
+        $note = new Note();
+        $note->setPerId($personId);
+        $note->setFamId(0);
+        $note->setText($text);
+        $note->setType($type);
+        $note->setPrivate(0);
+        $note->setEntered($actionById);
+        $note->save($con);
+    }
+
+    public function getViewURI(): string
+    {
+        return SystemURLs::getRootPath() . '/event/view/' . $this->getID();
+    }
+}

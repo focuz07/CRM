@@ -1,0 +1,321 @@
+<?php
+
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\model\ChurchCRM\Person;
+use ChurchCRM\Utils\InputUtils;
+
+$sRootPath = $sRootPath ?? SystemURLs::getRootPath();
+$eventId = (int) $event->getId();
+
+require SystemURLs::getDocumentRoot() . '/Include/Header.php';
+
+$dateFormat = SystemConfig::getValue('sDateTimeFormat');
+$startStr = $event->getStart() ? date_format($event->getStart(), $dateFormat) : '';
+$endStr = $event->getEnd() ? date_format($event->getEnd(), $dateFormat) : '';
+$descText = trim(strip_tags((string) $event->getDesc()));
+$bodyText = trim(strip_tags((string) $event->getText()));
+$inactive = (int) $event->getInActive() === 1;
+?>
+
+<div class="row">
+  <div class="col-lg-8">
+    <!-- Event details card -->
+    <div class="card mb-3">
+      <div class="card-status-top <?= $inactive ? 'bg-secondary' : 'bg-green' ?>"></div>
+      <div class="card-header">
+        <h3 class="card-title"><?= InputUtils::escapeHTML($event->getTitle()) ?></h3>
+        <span class="ms-auto">
+          <?php if ($inactive): ?>
+            <span class="badge bg-secondary-lt"><?= gettext('Inactive') ?></span>
+          <?php else: ?>
+            <span class="badge bg-green-lt text-green"><?= gettext('Active') ?></span>
+          <?php endif; ?>
+        </span>
+      </div>
+      <div class="card-body">
+        <dl class="row mb-0">
+          <dt class="col-sm-3"><?= gettext('Type') ?></dt>
+          <dd class="col-sm-9">
+            <?php if ($event->getEventType()): ?>
+              <span class="badge bg-azure-lt"><?= InputUtils::escapeHTML($event->getEventType()->getName()) ?></span>
+            <?php else: ?>
+              <span class="text-body-secondary">—</span>
+            <?php endif; ?>
+          </dd>
+
+          <dt class="col-sm-3"><?= gettext('Starts') ?></dt>
+          <dd class="col-sm-9"><?= InputUtils::escapeHTML($startStr) ?></dd>
+
+          <dt class="col-sm-3"><?= gettext('Ends') ?></dt>
+          <dd class="col-sm-9"><?= InputUtils::escapeHTML($endStr) ?></dd>
+
+          <?php if ($descText !== ''): ?>
+            <dt class="col-sm-3"><?= gettext('Description') ?></dt>
+            <dd class="col-sm-9"><?= InputUtils::escapeHTML($descText) ?></dd>
+          <?php endif; ?>
+
+          <?php if ($bodyText !== ''): ?>
+            <dt class="col-sm-3"><?= gettext('Notes') ?></dt>
+            <dd class="col-sm-9"><?= InputUtils::escapeHTML($bodyText) ?></dd>
+          <?php endif; ?>
+
+          <?php if (!empty($linkedGroups)): ?>
+            <dt class="col-sm-3"><?= gettext('Linked Groups') ?></dt>
+            <dd class="col-sm-9">
+              <?php foreach ($linkedGroups as $g): ?>
+                <a href="<?= InputUtils::escapeAttribute($g['url']) ?>" class="badge bg-blue-lt text-blue me-1">
+                  <?= InputUtils::escapeHTML($g['name']) ?>
+                </a>
+              <?php endforeach; ?>
+            </dd>
+          <?php endif; ?>
+        </dl>
+      </div>
+      <div class="card-footer d-flex flex-column flex-md-row align-items-md-center justify-content-between gap-2">
+        <a href="<?= $sRootPath ?>/event/dashboard" class="btn btn-outline-secondary">
+          <i class="fa-solid fa-chevron-left me-1"></i><?= gettext('Back to Events') ?>
+        </a>
+        <div class="d-flex flex-wrap gap-2">
+          <?php if (!$inactive && !$eventEnded): ?>
+            <a href="<?= $sRootPath ?>/event/checkin/<?= $eventId ?>" class="btn btn-outline-primary">
+              <i class="fa-solid fa-clipboard-check me-1"></i><?= gettext('Check-in') ?>
+            </a>
+          <?php endif; ?>
+          <?php if ($canEditEvents): ?>
+            <?php if ($inactive): ?>
+              <button type="button" class="btn btn-outline-success activate-event" data-event_id="<?= $eventId ?>">
+                <i class="fa-solid fa-circle-check me-1"></i><?= gettext('Activate') ?>
+              </button>
+            <?php else: ?>
+              <button type="button" class="btn btn-outline-secondary deactivate-event" data-event_id="<?= $eventId ?>">
+                <i class="fa-solid fa-circle-xmark me-1"></i><?= gettext('Deactivate') ?>
+              </button>
+            <?php endif; ?>
+            <a href="<?= $sRootPath ?>/event/editor/<?= $eventId ?>" class="btn btn-primary">
+              <i class="fa-solid fa-pencil me-1"></i><?= gettext('Edit') ?>
+            </a>
+          <?php endif; ?>
+        </div>
+      </div>
+    </div>
+
+    <!-- Attendance roster -->
+    <div class="card <?= $eventEnded && !empty($linkedGroups) ? 'mb-3' : '' ?>">
+      <div class="card-header">
+        <h3 class="card-title">
+          <?= gettext('Attendance') ?>
+          <span class="badge bg-primary text-white ms-2"><?= count($attendees) ?></span>
+        </h3>
+        <?php if ($eventEnded && !empty($linkedGroups)): ?>
+          <div class="card-options">
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="window.print()">
+              <i class="fa-solid fa-print me-1"></i><?= gettext('Print') ?>
+            </button>
+          </div>
+        <?php endif; ?>
+      </div>
+      <?php if (empty($attendees)): ?>
+        <div class="card-body text-center text-body-secondary py-4">
+          <i class="fa-solid fa-users-slash fs-3 d-block mb-2"></i>
+          <?= gettext('No one has been checked in to this event yet.') ?>
+        </div>
+      <?php else: ?>
+        <div class="table-responsive">
+          <table class="table table-vcenter table-hover mb-0">
+            <thead>
+              <tr>
+                <th><?= gettext('Name') ?></th>
+                <th><?= gettext('Checked In') ?></th>
+                <th><?= gettext('By') ?></th>
+                <th><?= gettext('Checked Out') ?></th>
+                <th><?= gettext('By') ?></th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php foreach ($attendees as $att): ?>
+                <tr>
+                  <td>
+                    <a href="<?= Person::getViewURIForId($att['personId']) ?>">
+                      <?= InputUtils::escapeHTML($att['fullName']) ?>
+                    </a>
+                  </td>
+                  <td><?= $att['checkinDate'] ? InputUtils::escapeHTML($att['checkinDate']) : '<span class="text-body-secondary">—</span>' ?></td>
+                  <td><?= $att['checkinBy'] !== '' ? InputUtils::escapeHTML($att['checkinBy']) : '<span class="text-body-secondary">—</span>' ?></td>
+                  <td><?= $att['checkoutDate'] ? InputUtils::escapeHTML($att['checkoutDate']) : '<span class="text-body-secondary">—</span>' ?></td>
+                  <td><?= $att['checkoutBy'] !== '' ? InputUtils::escapeHTML($att['checkoutBy']) : '<span class="text-body-secondary">—</span>' ?></td>
+                </tr>
+              <?php endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+      <?php endif; ?>
+    </div>
+
+    <!-- Did Not Attend — shown only after event ends, only when groups are linked -->
+    <?php if ($eventEnded && !empty($linkedGroups)): ?>
+      <div class="card" id="event-non-attendees-card">
+        <div class="card-header">
+          <h3 class="card-title">
+            <?= gettext('Did Not Attend') ?>
+            <?php if (empty($nonAttendees)): ?>
+              <span class="badge bg-green-lt text-green ms-2">0</span>
+            <?php else: ?>
+              <span class="badge bg-warning text-dark ms-2"><?= count($nonAttendees) ?></span>
+            <?php endif; ?>
+          </h3>
+          <?php if (!empty($nonAttendees)): ?>
+            <div class="card-options gap-1">
+              <?php if ($canEmail && $nonAttendeeRecipients !== []): ?>
+                <button type="button" id="event-email-non-attendees" class="btn btn-sm btn-outline-primary"
+                        data-email-composer
+                        data-email-recipients="<?= InputUtils::escapeAttribute(json_encode($nonAttendeeRecipients)) ?>"
+                        data-email-title="<?= InputUtils::escapeAttribute(sprintf(gettext('Email non-attendees: %s'), $event->getTitle())) ?>">
+                  <i class="fa-solid fa-envelope me-1"></i><?= gettext('Email All') ?>
+                </button>
+              <?php endif; ?>
+            </div>
+          <?php endif; ?>
+        </div>
+        <?php if (empty($nonAttendees)): ?>
+          <div class="card-body text-center text-body-secondary py-4">
+            <i class="fa-solid fa-circle-check fs-3 d-block mb-2 text-green"></i>
+            <?= gettext('Everyone from linked groups checked in!') ?>
+          </div>
+        <?php else: ?>
+          <div class="table-responsive">
+            <table class="table table-vcenter table-hover mb-0">
+              <thead>
+                <tr>
+                  <th><?= gettext('Name') ?></th>
+                  <th><?= gettext('Email') ?></th>
+                  <th><?= gettext('Phone') ?></th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php foreach ($nonAttendees as $na): ?>
+                  <tr>
+                    <td>
+                      <a href="<?= Person::getViewURIForId($na['personId']) ?>">
+                        <?= InputUtils::escapeHTML($na['fullName']) ?>
+                      </a>
+                    </td>
+                    <td>
+                      <?php if (!empty($na['email'])): ?>
+                        <a href="mailto:<?= InputUtils::escapeHTML($na['email']) ?>">
+                          <?= InputUtils::escapeHTML($na['email']) ?>
+                        </a>
+                        <?php if ($canEmail): ?>
+                        <button type="button" class="btn btn-sm btn-ghost-primary py-0 px-1"
+                                data-email-composer
+                                data-email-person-id="<?= (int) $na['personId'] ?>"
+                                data-email-address="<?= InputUtils::escapeAttribute($na['email']) ?>"
+                                data-email-name="<?= InputUtils::escapeAttribute($na['fullName']) ?>"
+                                data-email-title="<?= InputUtils::escapeAttribute(sprintf(gettext('Email %s'), $na['fullName'])) ?>"
+                                title="<?= gettext('Send email from ChurchCRM') ?>"><i class="fa-solid fa-paper-plane"></i></button>
+                        <?php endif; ?>
+                      <?php else: ?>
+                        <span class="text-body-secondary">—</span>
+                      <?php endif; ?>
+                    </td>
+                    <td>
+                      <?php
+                        $phone = !empty($na['cellPhone']) ? $na['cellPhone'] : ($na['homePhone'] ?? '');
+                      ?>
+                      <?= $phone !== '' ? InputUtils::escapeHTML($phone) : '<span class="text-body-secondary">—</span>' ?>
+                    </td>
+                  </tr>
+                <?php endforeach; ?>
+              </tbody>
+            </table>
+          </div>
+        <?php endif; ?>
+      </div>
+    <?php endif; ?>
+  </div>
+
+  <div class="col-lg-4">
+    <!--
+      Volunteer v2 staffing (#9713, design §3.5). Read-only: who is needed and how many are
+      short, per occurrence linked to this event. The route decided whether it may be shown
+      at all (rollout flag AND scope) and hands over an empty array otherwise, so there is no
+      permission logic here. Editing happens on the occurrence page.
+    -->
+    <?php if (!empty($volunteerOccurrences)): ?>
+      <div class="card mb-3" id="event-volunteers-card">
+        <div class="card-header">
+          <h3 class="card-title">
+            <i class="fa-solid fa-hands-helping me-2"></i><?= gettext('Volunteers') ?>
+          </h3>
+        </div>
+        <div class="list-group list-group-flush">
+          <?php foreach ($volunteerOccurrences as $vo): ?>
+            <div class="list-group-item volunteer-staffing-row" data-volunteer-staffing="<?= InputUtils::escapeAttribute(json_encode($vo['staffing'])) ?>">
+              <div class="d-flex justify-content-between align-items-start gap-2">
+                <div>
+                  <div class="fw-bold"><?= InputUtils::escapeHTML($vo['ministryName']) ?></div>
+                  <?php if ($vo['scheduleName'] !== ''): ?>
+                    <div class="text-body-secondary small"><?= InputUtils::escapeHTML($vo['scheduleName']) ?></div>
+                  <?php endif; ?>
+                  <?php if ($vo['requirementCount'] > 0): ?>
+                    <div class="small mt-1 volunteer-staffing-detail"></div>
+                  <?php endif; ?>
+                </div>
+                <div class="text-end">
+                  <?php if ($vo['requirementCount'] === 0): ?>
+                    <!--
+                      Nobody has said what this occurrence needs. "Fully staffed" here was
+                      the bug: an empty plan has no gaps, so a count-only test calls it
+                      green and the coordinator never learns there is nothing to fill.
+                    -->
+                    <span class="badge bg-secondary-lt text-secondary"><?= gettext('No staffing needs set') ?></span>
+                  <?php else: ?>
+                    <!-- Worded by the ministries-event-staffing bundle, as on every V2 screen (D34). -->
+                    <span class="badge volunteer-staffing-badge"></span>
+                  <?php endif; ?>
+                  <div class="mt-2 small">
+                    <a href="<?= $sRootPath ?>/ministries/occurrences/<?= (int) $vo['occurrenceId'] ?>">
+                      <i class="fa-solid fa-list-check me-1"></i><?= gettext('Manage staffing') ?>
+                    </a>
+                  </div>
+                </div>
+              </div>
+            </div>
+          <?php endforeach; ?>
+        </div>
+      </div>
+    <?php endif; ?>
+
+    <!-- Attendance counts -->
+    <?php if (!empty($counts)): ?>
+      <div class="card mb-3">
+        <div class="card-header">
+          <h3 class="card-title"><?= gettext('Attendance Counts') ?></h3>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-sm table-vcenter mb-0">
+            <tbody>
+              <?php foreach ($counts as $c): ?>
+                <tr>
+                  <td><?= InputUtils::escapeHTML($c['name']) ?></td>
+                  <td class="text-end fw-bold"><?= $c['count'] ?></td>
+                </tr>
+              <?php endforeach; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    <?php endif; ?>
+  </div>
+</div>
+
+<?php if (!empty($volunteerOccurrences)): ?>
+<script src="<?= SystemURLs::assetVersioned('/skin/v2/ministries-event-staffing.min.js') ?>" defer nonce="<?= SystemURLs::getCSPNonce() ?>"></script>
+<?php endif; ?>
+
+<?php if ($canEmail && $eventEnded && $nonAttendeeRecipients !== []): ?>
+<script src="<?= SystemURLs::assetVersioned('/skin/v2/email-composer.min.js') ?>" defer nonce="<?= SystemURLs::getCSPNonce() ?>"></script>
+<?php endif; ?>
+
+<?php
+require SystemURLs::getDocumentRoot() . '/Include/Footer.php';

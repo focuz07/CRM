@@ -1,0 +1,202 @@
+/// <reference types="cypress" />
+
+/**
+ * API tests for the POST /events/repeat endpoint.
+ * Tests bulk creation of recurring events from a template.
+ */
+describe("API Repeat Events", () => {
+    // No browser login — these are pure API tests using x-api-key auth
+    // (cy.makePrivateAdminAPICall sets the header for us).
+
+    // Every event this spec creates, so after() can remove them again (#9769).
+    // Without this the spec left 22 events in the database on every run.
+    const createdEventIds = [];
+
+    after(() => {
+        cy.cleanupEvents(createdEventIds);
+    });
+
+    describe("POST /api/events/repeat", () => {
+        // Use eventTypeId 1 (the seeded "Church Service" type) the same way
+        // the other passing event API specs do, instead of fetching it.
+        const eventTypeId = 1;
+
+        it("Creates weekly repeat events and returns count and IDs", () => {
+            const today = new Date();
+            const TWENTY_EIGHT_DAYS_MS = 28 * 24 * 60 * 60 * 1000;
+            const startDate = today.toISOString().slice(0, 10);
+            const endDate = new Date(today.getTime() + TWENTY_EIGHT_DAYS_MS)
+                .toISOString()
+                .slice(0, 10);
+
+            cy.makePrivateAdminAPICall(
+                "POST",
+                "/api/events/repeat",
+                {
+                    Title: "API Weekly Test " + Date.now(),
+                    Type: eventTypeId,
+                    StartTime: "09:00",
+                    EndTime: "10:00",
+                    RecurType: "weekly",
+                    RecurDOW: "Sunday",
+                    RangeStart: startDate,
+                    RangeEnd: endDate,
+                    PinnedCalendars: [],
+                },
+                200,
+            ).then((response) => {
+                expect(response.body.success).to.be.true;
+                expect(response.body.count).to.be.a("number");
+                expect(response.body.count).to.be.at.least(0);
+                expect(response.body.eventIds).to.be.an("array");
+                expect(response.body.eventIds.length).to.equal(response.body.count);
+                createdEventIds.push(...response.body.eventIds);
+            });
+        });
+
+        it("Pins every occurrence of a long weekly series to the calendar (#10828)", () => {
+            const DAY_MS = 24 * 60 * 60 * 1000;
+            const start = new Date(Date.UTC(2045, 0, 1) + (Date.now() % 1000) * DAY_MS);
+            const startDate = start.toISOString().slice(0, 10);
+            const endDate = new Date(start.getTime() + 60 * 7 * DAY_MS)
+                .toISOString()
+                .slice(0, 10);
+
+            cy.makePrivateAdminAPICall(
+                "POST",
+                "/api/events/repeat",
+                {
+                    Title: "API Pinned Series " + Date.now(),
+                    Type: eventTypeId,
+                    StartTime: "09:00",
+                    EndTime: "10:00",
+                    RecurType: "weekly",
+                    RecurDOW: "Sunday",
+                    RangeStart: startDate,
+                    RangeEnd: endDate,
+                    PinnedCalendars: [1],
+                },
+                200,
+            ).then((response) => {
+                const ids = response.body.eventIds;
+                createdEventIds.push(...ids);
+                expect(ids.length).to.be.at.least(59);
+
+                [ids[0], ids[ids.length - 1]].forEach((id) => {
+                    cy.makePrivateAdminAPICall("GET", `/api/events/${id}`, null, 200).then(
+                        (resp) => {
+                            expect(resp.body.PinnedCalendars).to.deep.equal([1]);
+                        },
+                    );
+                });
+            });
+        });
+
+        it("Creates monthly repeat events", () => {
+            cy.makePrivateAdminAPICall(
+                "POST",
+                "/api/events/repeat",
+                {
+                    Title: "API Monthly Test " + Date.now(),
+                    Type: eventTypeId,
+                    StartTime: "09:00",
+                    EndTime: "10:00",
+                    RecurType: "monthly",
+                    RecurDOM: 1,
+                    RangeStart: "2025-01-01",
+                    RangeEnd: "2025-12-31",
+                    PinnedCalendars: [],
+                },
+                200,
+            ).then((response) => {
+                expect(response.body.success).to.be.true;
+                // Monthly on 1st Jan–Dec = 12 events
+                expect(response.body.count).to.equal(12);
+                expect(response.body.eventIds.length).to.equal(12);
+                createdEventIds.push(...response.body.eventIds);
+            });
+        });
+
+        it("Creates yearly repeat events", () => {
+            cy.makePrivateAdminAPICall(
+                "POST",
+                "/api/events/repeat",
+                {
+                    Title: "API Yearly Test " + Date.now(),
+                    Type: eventTypeId,
+                    StartTime: "09:00",
+                    EndTime: "10:00",
+                    RecurType: "yearly",
+                    RecurDOY: "12-25",
+                    RangeStart: "2020-01-01",
+                    RangeEnd: "2025-12-31",
+                    PinnedCalendars: [],
+                },
+                200,
+            ).then((response) => {
+                expect(response.body.success).to.be.true;
+                // Yearly on Dec 25, 2020-2025 = 6 events
+                expect(response.body.count).to.equal(6);
+                createdEventIds.push(...response.body.eventIds);
+            });
+        });
+
+        it("Returns 400 for invalid recurrence type", () => {
+            cy.makePrivateAdminAPICall(
+                "POST",
+                "/api/events/repeat",
+                {
+                    Title: "Bad Recur Test",
+                    Type: eventTypeId,
+                    StartTime: "09:00",
+                    EndTime: "10:00",
+                    RecurType: "invalid_type",
+                    RangeStart: "2025-01-01",
+                    RangeEnd: "2025-12-31",
+                    PinnedCalendars: [],
+                },
+                400,
+            );
+        });
+
+        it("Returns 400 for invalid event type ID", () => {
+            cy.makePrivateAdminAPICall(
+                "POST",
+                "/api/events/repeat",
+                {
+                    Title: "Bad Type Test",
+                    Type: 999999,
+                    StartTime: "09:00",
+                    EndTime: "10:00",
+                    RecurType: "weekly",
+                    RecurDOW: "Sunday",
+                    RangeStart: "2025-01-01",
+                    RangeEnd: "2025-12-31",
+                    PinnedCalendars: [],
+                },
+                400,
+            );
+        });
+
+        it("Returns 401 when not authenticated", () => {
+            cy.apiRequest({
+                method: "POST",
+                url: "/api/events/repeat",
+                body: {
+                    Title: "Unauth Test",
+                    Type: 1,
+                    StartTime: "09:00",
+                    EndTime: "10:00",
+                    RecurType: "weekly",
+                    RecurDOW: "Sunday",
+                    RangeStart: "2025-01-01",
+                    RangeEnd: "2025-12-31",
+                    PinnedCalendars: [],
+                },
+                failOnStatusCode: false,
+            }).then((response) => {
+                expect(response.status).to.eq(401);
+            });
+        });
+    });
+});

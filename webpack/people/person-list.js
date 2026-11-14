@@ -1,0 +1,72 @@
+/* JS for People List moved from template
+   This file contains the initialization and filter wiring previously inline
+   in src/v2/templates/people/person-list.php
+*/
+import $ from "jquery";
+import "tom-select/dist/css/tom-select.bootstrap5.css";
+import "./person-list.css";
+import TomSelect from "tom-select";
+
+// Expose TomSelect to global scope for inline template initialization
+window.TomSelect = TomSelect;
+
+// Expose a global initializer for server-rendered variables
+window.initializePeopleListFromServer = (serverVars) => {
+  const { RoleList, PropertyList, CustomList, GroupList } = serverVars;
+
+  // Classification — each entry is {id, name}; use the real DB OptionId as the
+  // option value so that setValue(optionId) from URL params maps correctly (issue #9182).
+  if (Array.isArray(serverVars.ClassificationList)) {
+    for (let i = 0; i < serverVars.ClassificationList.length; i++) {
+      const item = serverVars.ClassificationList[i];
+      $("<option>").val(item.id).text(item.name).appendTo(".filter-Classification");
+    }
+  }
+
+  if (Array.isArray(serverVars.GradeList)) {
+    for (const item of serverVars.GradeList) {
+      $("<option>").val(item.id).text(item.name).appendTo(".filter-Grade");
+    }
+  }
+
+  // Role — same {id, name} structure; use OptionId as value for consistent URL → filter mapping.
+  if (Array.isArray(RoleList)) {
+    for (let i = 0; i < RoleList.length; i++) {
+      const item = RoleList[i];
+      $("<option>").val(item.id).text(item.name).appendTo(".filter-Role");
+    }
+  }
+
+  // Properties
+  if (Array.isArray(PropertyList)) {
+    for (let i = 0; i < PropertyList.length; i++) {
+      $("<option>").val(i).text(PropertyList[i]).appendTo(".filter-Properties");
+    }
+  }
+
+  // CustomList can be an object (mapping) - use the keys for the dropdown
+  const CustomListKeys = Array.isArray(CustomList) ? CustomList : Object.keys(CustomList || {});
+  for (let i = 0; i < CustomListKeys.length; i++) {
+    $("<option>").val(i).text(CustomListKeys[i]).appendTo(".filter-Custom");
+  }
+
+  // Family Status (use server-provided, localized list when available)
+  const FamilyStatusList = Array.isArray(serverVars.FamilyStatusList)
+    ? serverVars.FamilyStatusList
+    : ["Active", "Inactive"];
+  for (let i = 0; i < FamilyStatusList.length; i++) {
+    $("<option>").val(FamilyStatusList[i]).text(FamilyStatusList[i]).appendTo(".filter-FamilyStatus");
+  }
+
+  // Groups
+  if (Array.isArray(GroupList)) {
+    for (let i = 0; i < GroupList.length; i++) {
+      $("<option>").val(i).text(GroupList[i]).appendTo(".filter-Group");
+    }
+  }
+
+  // Note: TomSelect initialization and initial filter value setting is handled inline in person-list.php
+  // This webpack bundle only handles populating the select options
+};
+
+export default window.initializePeopleListFromServer;

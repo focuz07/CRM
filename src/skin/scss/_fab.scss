@@ -1,0 +1,70 @@
+// Floating action buttons: bottom-right fixed stack.
+.fab-container {
+  position: fixed;
+  bottom: 4.5rem; // Clear the Tabler footer
+  right: 1.5rem;
+  z-index: 1035; // above fixed and sticky bars (1030), below offcanvas and modal backdrops (1040, 1050)
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+
+.fab-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  background-color: var(--tblr-primary);
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(32, 107, 196, 0.35);
+  text-decoration: none;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+
+  &.fab-hidden {
+    display: none;
+  }
+
+  .fab-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    border-radius: 50%;
+    box-shadow: none;
+    color: inherit;
+    font-size: 1.125rem;
+  }
+
+  .fab-label {
+    display: none;
+  }
+
+  &:hover {
+    background-color: #1a5ca8;
+    box-shadow: 0 6px 20px rgba(32, 107, 196, 0.45);
+    transform: translateY(-2px);
+    color: #fff;
+  }
+
+  &.fab-family {
+    background-color: var(--tblr-success);
+    box-shadow: 0 4px 12px rgba(47, 179, 68, 0.35);
+
+    &:hover {
+      background-color: #1f8c3b;
+      box-shadow: 0 6px 20px rgba(47, 179, 68, 0.45);
+    }
+  }
+}
+
+@media (max-width: 767.98px) {
+  .fab-button {
+    width: 3.5rem;
+    height: 3.5rem;
+  }
+}

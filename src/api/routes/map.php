@@ -1,0 +1,352 @@
+<?php
+
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Service\FamilyService;
+use ChurchCRM\model\ChurchCRM\FamilyQuery;
+use ChurchCRM\model\ChurchCRM\Person2group2roleP2g2rQuery;
+use ChurchCRM\model\ChurchCRM\PersonQuery;
+use ChurchCRM\Slim\Middleware\Request\Auth\EditRecordsRoleAuthMiddleware;
+use ChurchCRM\Slim\SlimUtils;
+use ChurchCRM\Slim\Middleware\Api\FamilyMiddleware;
+use ChurchCRM\Utils\GeoUtils;
+use Propel\Runtime\ActiveQuery\Criteria;
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\Routing\RouteCollectorProxy;
+
+$app->group('/map', function (RouteCollectorProxy $group): void {
+    $group->get('/families', 'getMapFamilies');
+    $group->get('/families/', 'getMapFamilies');
+    $group->get('/neighbors/{familyId:[0-9]+}', 'getMapNeighbors')->add(FamilyMiddleware::class);
+    $group->get('/neighbors/{familyId:[0-9]+}/', 'getMapNeighbors')->add(FamilyMiddleware::class);
+    $group->post('/geocode-all', 'geocodeAllFamilies')->add(new EditRecordsRoleAuthMiddleware());
+});
+
+/**
+ * @OA\Get(
+ *     path="/map/families",
+ *     summary="Get geocoded map items — families, group members, or cart persons",
+ *     tags={"Map"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(
+ *         name="groupId",
+ *         in="query",
+ *         required=false,
+ *         @OA\Schema(type="integer"),
+ *         description="When omitted or null: all active geocoded families. When 0: persons in the session cart. When > 0: members of that group."
+ *     ),
+ *     @OA\Response(response=200, description="Array of map items",
+ *         @OA\JsonContent(type="array", @OA\Items(
+ *             @OA\Property(property="id", type="integer"),
+ *             @OA\Property(property="type", type="string", enum={"family","person"}),
+ *             @OA\Property(property="name", type="string"),
+ *             @OA\Property(property="salutation", type="string"),
+ *             @OA\Property(property="address", type="string"),
+ *             @OA\Property(property="latitude", type="number", format="float"),
+ *             @OA\Property(property="longitude", type="number", format="float"),
+ *             @OA\Property(property="classificationId", type="integer"),
+ *             @OA\Property(property="profileUrl", type="string"),
+ *             @OA\Property(property="directionsUrl", type="string"),
+ *             @OA\Property(property="phone", type="string")
+ *         ))
+ *     )
+ * )
+ */
+function getMapFamilies(Request $request, Response $response, array $args): Response
+{
+    $params  = $request->getQueryParams();
+    $groupId = isset($params['groupId']) ? (int) $params['groupId'] : null;
+    $cartIds = $_SESSION['aPeopleCart'] ?? [];
+    session_write_close();
+
+    $items = [];
+
+    if ($groupId !== null && $groupId === 0) {
+        // Cart view — return persons currently in the people cart (session)
+        if (!empty($cartIds)) {
+            $persons = PersonQuery::create()
+                ->filterById($cartIds)
+                ->find();
+
+            foreach ($persons as $person) {
+                $latLng = $person->getLatLng();
+                if (empty($latLng['Latitude']) && empty($latLng['Longitude'])) {
+                    continue;
+                }
+                $items[] = [
+                    'id'               => $person->getId(),
+                    'type'             => 'person',
+                    'name'             => $person->getFullName(),
+                    'salutation'       => $person->getFullName(),
+                    'address'          => $person->getMapAddress(),
+                    'latitude'         => (float) $latLng['Latitude'],
+                    'longitude'        => (float) $latLng['Longitude'],
+                    'classificationId' => (int) $person->getClsId(),
+                    'profileUrl'       => $person->getViewURI(),
+                    'directionsUrl'    => $person->getMapDirectionsUrl(),
+                    'phone'            => $person->getBestPhone(),
+                ];
+            }
+        }
+    } elseif ($groupId !== null && $groupId > 0) {
+        // Build person → role map for this group (single query)
+        $roleMap = [];
+        foreach (Person2group2roleP2g2rQuery::create()->filterByGroupId($groupId)->find() as $p2g2r) {
+            $roleMap[(int) $p2g2r->getPersonId()] = (int) $p2g2r->getRoleId();
+        }
+
+        // Return geocoded members of a specific group
+        $persons = PersonQuery::create()
+            ->usePerson2group2roleP2g2rQuery()
+                ->filterByGroupId($groupId)
+            ->endUse()
+            ->find();
+
+        foreach ($persons as $person) {
+            $latLng = $person->getLatLng();
+            if (empty($latLng['Latitude']) && empty($latLng['Longitude'])) {
+                continue;
+            }
+            $items[] = [
+                'id'               => $person->getId(),
+                'type'             => 'person',
+                'name'             => $person->getFullName(),
+                'salutation'       => $person->getFullName(),
+                'address'          => $person->getMapAddress(),
+                'latitude'         => (float) $latLng['Latitude'],
+                'longitude'        => (float) $latLng['Longitude'],
+                'classificationId' => (int) $person->getClsId(),
+                'roleId'           => $roleMap[(int) $person->getId()] ?? 0,
+                'profileUrl'       => $person->getViewURI(),
+                'directionsUrl'    => $person->getMapDirectionsUrl(),
+                'phone'            => $person->getBestPhone(),
+            ];
+        }
+    } else {
+        // Return all active families that have been geocoded
+        $families = FamilyQuery::create()
+            ->filterByDateDeactivated(null)
+            ->filterByLatitude(0, Criteria::NOT_EQUAL)
+            ->filterByLongitude(0, Criteria::NOT_EQUAL)
+            ->find();
+
+        foreach ($families as $family) {
+            $headPeople       = $family->getHeadPeople();
+            $classificationId = !empty($headPeople) ? (int) $headPeople[0]->GetClsId() : 0;
+
+            $items[] = [
+                'id'               => $family->getId(),
+                'type'             => 'family',
+                'name'             => $family->getName(),
+                'salutation'       => $family->getSalutation(),
+                'address'          => $family->getAddress(),
+                'latitude'         => (float) $family->getLatitude(),
+                'longitude'        => (float) $family->getLongitude(),
+                'classificationId' => $classificationId,
+                'profileUrl'       => $family->getViewURI(),
+                'directionsUrl'    => $family->getDirectionsUrl(),
+                'phone'            => $family->getHomePhone() ?? '',
+            ];
+        }
+    }
+
+    return SlimUtils::renderJSON($response, $items);
+}
+
+/**
+ * @OA\Get(
+ *     path="/map/neighbors/{familyId}",
+ *     summary="Get nearest neighbor families for a given familyId",
+ *     tags={"Map"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\Parameter(
+ *         name="familyId",
+ *         in="path",
+ *         required=true,
+ *         @OA\Schema(type="integer")
+ *     ),
+ *     @OA\Parameter(name="maxNeighbors", in="query", required=false, @OA\Schema(type="integer")),
+ *     @OA\Parameter(name="maxDistance", in="query", required=false, @OA\Schema(type="number", format="float")),
+ *     @OA\Parameter(name="classificationIds", in="query", required=false, @OA\Schema(type="string"), description="Comma-separated classification option IDs to filter listed people by"),
+ *     @OA\Response(response=200, description="Array of neighbor families")
+ * )
+ */
+function getMapNeighbors(Request $request, Response $response, array $args): Response
+{
+    $params       = $request->getQueryParams();
+    $maxNeighbors = isset($params['maxNeighbors']) ? (int)$params['maxNeighbors'] : 15;
+    $maxDistance  = isset($params['maxDistance']) ? (float)$params['maxDistance'] : 10.0;
+    $classificationIds = [];
+    if (!empty($params['classificationIds'])) {
+        $classificationIds = array_map('intval', explode(',', (string)$params['classificationIds']));
+    }
+
+    /** @var \ChurchCRM\model\ChurchCRM\Family $selectedFamily */
+    $selectedFamily = $request->getAttribute('family');
+
+    $familyId = (int)$selectedFamily->getId();
+    $selLat = (float)$selectedFamily->getLatitude();
+    $selLng = (float)$selectedFamily->getLongitude();
+    if ($selLat === 0.0 && $selLng === 0.0) {
+        return SlimUtils::renderErrorJSON($response->withStatus(400), gettext('selected family has no coordinates'));
+    }
+
+    // Compute a conservative bounding box (30 units/degree) to pre-filter candidates in SQL.
+    // This always produces a box larger than the true maxDistance circle, ensuring no valid
+    // neighbors are excluded before the per-record distance calculation in PHP.
+    $deltaDeg  = $maxDistance / 30.0;
+    $minLat    = max(-90.0,  $selLat - $deltaDeg);
+    $maxLat    = min(90.0,   $selLat + $deltaDeg);
+    $minLng    = max(-180.0, $selLng - $deltaDeg);
+    $maxLng    = min(180.0,  $selLng + $deltaDeg);
+
+    $families = FamilyQuery::create()
+        ->filterByDateDeactivated(null)
+        ->filterByLatitude(0, Criteria::NOT_EQUAL)
+        ->filterByLongitude(0, Criteria::NOT_EQUAL)
+        ->filterByLatitude(['min' => $minLat, 'max' => $maxLat])
+        ->filterByLongitude(['min' => $minLng, 'max' => $maxLng])
+        ->find();
+
+    $items = [];
+
+    foreach ($families as $family) {
+        $fid = $family->getId();
+        if ($fid === $familyId) {
+            continue;
+        }
+
+        $lat = (float)$family->getLatitude();
+        $lng = (float)$family->getLongitude();
+
+        $distanceText = GeoUtils::latLonDistance($selLat, $selLng, $lat, $lng);
+        $distance     = (float)$distanceText;
+
+        if ($distance > $maxDistance) {
+            continue;
+        }
+
+        $people = [];
+        foreach ($family->getPeopleSorted() as $person) {
+            $clsId = (int)$person->getClsId();
+            if (!empty($classificationIds) && !in_array($clsId, $classificationIds, true)) {
+                continue;
+            }
+            $people[] = [
+                'id'               => $person->getId(),
+                'name'             => $person->getFullName(),
+                'classificationId' => $clsId,
+            ];
+        }
+
+        if (empty($people)) {
+            continue;
+        }
+
+        $items[] = [
+            'id'           => $fid,
+            'type'         => 'family',
+            'name'         => $family->getName(),
+            'address'      => $family->getAddress(),
+            'latitude'     => $lat,
+            'longitude'    => $lng,
+            'distance'     => $distance,
+            'distanceText' => $distanceText,
+            'bearing'      => GeoUtils::latLonBearing($selLat, $selLng, $lat, $lng),
+            'profileUrl'   => $family->getViewURI(),
+            'directionsUrl' => $family->getDirectionsUrl(),
+            'people'       => $people,
+        ];
+    }
+
+    // sort by numeric distance
+    usort($items, function ($a, $b) {
+        return $a['distance'] <=> $b['distance'];
+    });
+
+    // limit to maxNeighbors
+    $items = array_slice($items, 0, max(0, $maxNeighbors));
+
+    return SlimUtils::renderJSON($response, [
+        'origin' => [
+            'id'        => $familyId,
+            'name'      => $selectedFamily->getName(),
+            'address'   => $selectedFamily->getAddress(),
+            'latitude'  => $selLat,
+            'longitude' => $selLng,
+        ],
+        'neighbors' => $items,
+    ]);
+}
+
+/**
+ * @OA\Post(
+ *     path="/map/geocode-all",
+ *     summary="Geocode all active families and people with their own address missing coordinates",
+ *     description="Iterates active families that have a street address but no usable coordinates, geocoding each via the configured geocoding services (Map Settings) at ~1 request/second. Families are taken in ID order; up to 50 per call. Pass 'skip' = the number of families that failed in earlier calls so those are not re-queried, and repeat while 'remaining' > 'skip'. Requires the Edit Records role.",
+ *     tags={"Map"},
+ *     security={{"ApiKeyAuth":{}}},
+ *     @OA\RequestBody(
+ *         required=false,
+ *         @OA\JsonContent(
+ *             @OA\Property(property="skip", type="integer", minimum=0, default=0, description="Families (in ID order) to skip before the batch — the running count of failures from previous calls")
+ *         )
+ *     ),
+ *     @OA\Response(
+ *         response=200,
+ *         description="Geocoding batch summary",
+ *         @OA\JsonContent(
+ *             @OA\Property(property="total",     type="integer", description="Total families missing coordinates before this run"),
+ *             @OA\Property(property="skip",      type="integer", description="Offset applied to this batch (echoed back)"),
+ *             @OA\Property(property="processed", type="integer", description="Families examined in this batch (0 when skip >= total)"),
+ *             @OA\Property(property="geocoded",  type="integer", description="Families successfully geocoded in this batch"),
+ *             @OA\Property(property="failed",    type="integer", description="Families that could not be geocoded"),
+ *             @OA\Property(property="remainingNotFound", type="integer", description="Of the remaining, how many were tried and found no match; the rest were never tried"),
+ *             @OA\Property(property="remaining", type="integer", description="Families still missing coordinates after this batch, including the ones that failed (run again while remaining > failures so far)"),
+ *             @OA\Property(
+ *                 property="failures",
+ *                 type="array",
+ *                 description="Per-family failure details (capped at 20 entries). Empty array when all families were geocoded.",
+ *                 @OA\Items(
+ *                     type="object",
+ *                     @OA\Property(property="id",      type="integer", description="Family ID"),
+ *                     @OA\Property(property="name",    type="string",  description="Family name"),
+ *                     @OA\Property(property="address", type="string",  description="Full street address"),
+ *                     @OA\Property(property="editUrl", type="string",  description="URL to the family editor page"),
+ *                     @OA\Property(property="reason",  type="string",  description="Machine code: 'incomplete_address' | 'no_result' | 'unavailable' | 'error'")
+ *                 )
+ *             ),
+ *             @OA\Property(property="failuresTruncated", type="boolean", description="True when failed > 20 and some failures are omitted from the array")
+ *         )
+ *     ),
+ *     @OA\Response(response=401, description="Unauthorized"),
+ *     @OA\Response(response=403, description="Edit Records role required")
+ * )
+ */
+function geocodeAllFamilies(Request $request, Response $response, array $args): Response
+{
+    // Allow extended execution time for the throttled Nominatim loop (~1 req/sec × up to 50 families)
+    set_time_limit(240);
+    // Release the session lock so the user's other requests do not wait for the batch.
+    session_write_close();
+
+    $input = $request->getParsedBody();
+    $skip = is_array($input) && isset($input['skip']) && is_numeric($input['skip']) ? (int) $input['skip'] : 0;
+    if ($skip < 0) {
+        return SlimUtils::renderErrorJSON($response, gettext('skip must be zero or a positive integer'), [], 400, null, $request);
+    }
+
+    try {
+        $summary = (new FamilyService())->geocodeAllMissingFamilies($skip);
+        return SlimUtils::renderJSON($response, $summary);
+    } catch (\Throwable $e) {
+        return SlimUtils::renderErrorJSON(
+            $response,
+            gettext('Failed to update family coordinates'),
+            [],
+            500,
+            $e,
+            $request
+        );
+    }
+}

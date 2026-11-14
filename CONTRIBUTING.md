@@ -1,0 +1,193 @@
+# How to Contribute to ChurchCRM
+
+ChurchCRM is a community project. Every church that uses it benefits from the time given by volunteers, developers, designers, translators, testers, documentation writers, and church staff.
+
+**You don't need to write code to make a meaningful contribution.** The project needs people who improve the product, documentation, translations, testing, design, and community experience.
+
+---
+
+## Every Skill Matters
+
+| Your skill | How you help |
+|------------|-------------|
+| **Developer** | Fix bugs, add features, build community plugins |
+| **Plugin builder** | Create integrations ChurchCRM doesn't include yet |
+| **QA tester** | Find bugs, test new features, validate fixes |
+| **Designer** | UI/UX improvements, logo work, social graphics |
+| **Writer / content creator** | Blog posts, tutorials, case studies |
+| **Documentation writer** | User guides, admin docs, developer documentation |
+| **Translator** | Translate ChurchCRM into your language |
+| **Social media manager** | Grow ChurchCRM's presence and reach |
+| **Marketer** | Help churches discover ChurchCRM |
+| **Photographer / image creator** | Screenshots, promotional images, social assets |
+| **Community helper** | Answer questions on Discord and GitHub |
+
+---
+
+## No Code Required
+
+### Write Content
+
+Clear, accurate content helps congregations understand what ChurchCRM can do and helps existing users succeed.
+
+**What's needed:**
+- Blog posts about ChurchCRM features and use cases
+- Church testimonials ("how we use ChurchCRM at our church")
+- Tutorial articles for common workflows
+- Evaluation guides based on verified ChurchCRM workflows and current product behavior
+
+**Where to contribute:** Open an issue on [GitHub](https://github.com/ChurchCRM/CRM/issues) with the `Documentation` label, or share your draft on [Discord](https://discord.gg/tuWyFzj3Nj). Keep public claims aligned with the current application and approved website messaging.
+
+---
+
+### Improve Documentation
+
+The [official documentation site](https://docs.churchcrm.io) covers every feature but always needs clearer explanations and better examples. The docs are Markdown files in the [docs.churchcrm.io repository](https://github.com/ChurchCRM/docs.churchcrm.io).
+
+**What's needed:**
+- Clearer guides that lead with the outcome, the decisions, and the gotchas
+- New guides for features that lack documentation
+- Correcting outdated information after releases
+- Screenshots where they make a page clearly easier to follow (a workflow story, a result screen, a before/after), not for every form
+
+**No GitHub experience required** — you can [edit pages directly in the browser](https://docs.github.com/en/repositories/working-with-files/managing-files/editing-files) on GitHub.
+
+---
+
+### Translate
+
+The supported locales are listed in `src/locale/locales.json`. Translation coverage varies by locale, and every improvement helps more churches use the application in a familiar language.
+
+Translations live in this repo, one file per language: `src/locale/i18n/<locale>.json` (for example `fr_FR.json`), keyed by the English text.
+
+**Fix or add a translation with a pull request:**
+1. Edit the value next to the English text in your language's file (you can [edit it in the browser](https://docs.github.com/en/repositories/working-with-files/managing-files/editing-files) on GitHub)
+2. Open a pull request; a maintainer rebuilds the gettext files (`npm run locale:apply`) and merges it
+3. It ships in the next release
+
+Missing terms are listed by `npm run locale:missing`. To ask for a new language, open an issue.
+
+**See:** [Localization for Translators](https://github.com/ChurchCRM/CRM/wiki/Localization-For-Translators)
+
+---
+
+### Test the Application
+
+You don't need to be a developer to test ChurchCRM. Browser testing, accessibility checks, and feature validation catch real bugs before they reach churches.
+
+**What's needed:**
+- Test new releases on different browsers and devices
+- Try common workflows (adding families, recording attendance, generating reports)
+- Report anything confusing or broken on [GitHub Issues](https://github.com/ChurchCRM/CRM/issues)
+- Test the [live demo](https://churchcrm.io/demo.html?utm_source=github&utm_medium=referral&utm_campaign=github_content&utm_content=crm_contributing_demo) and report issues
+
+**Use the [Bug Reporting Guide](https://docs.churchcrm.io/administration/bug-reporting-and-diagnostics)** to include useful information when filing issues.
+
+---
+
+### Design & Create Images
+
+ChurchCRM's marketing site, documentation, and social presence all need visual assets — screenshots, promotional graphics, social media images, and UI design feedback.
+
+**What's needed:**
+- Social media graphics for feature announcements
+- Promotional images for blog posts
+- UI/UX feedback on the application — what feels confusing, what could be clearer
+- Logo usage and brand asset improvements
+
+**Share your work** on [Discord](https://discord.gg/tuWyFzj3Nj) in the `#design` channel or open a GitHub issue with the `UI` label.
+
+---
+
+### Share ChurchCRM
+
+Churches discover ChurchCRM through people who share clear, accurate information about the project.
+
+**What's needed:**
+- Share ChurchCRM on social media (Facebook church groups, LinkedIn, X/Twitter, Instagram)
+- Write reviews on software directories (Capterra, G2, SourceForge, AlternativeTo)
+- Tell other churches in your denomination or network about ChurchCRM
+- Help with ChurchCRM's own social media presence by suggesting content or post ideas
+
+**Connect:** Share what you're doing on [Discord](https://discord.gg/tuWyFzj3Nj) so the team knows.
+
+---
+
+### Help the Community
+
+People get stuck. A quick, helpful answer on Discord can save a church administrator hours of frustration and keep them using ChurchCRM.
+
+**Where to help:**
+- [Discord server](https://discord.gg/tuWyFzj3Nj) — questions and collaboration
+- [GitHub Issues](https://github.com/ChurchCRM/CRM/issues) — confirmed bugs and planned work
+
+No expertise required for most questions — if you've used ChurchCRM for a while, your experience is valuable.
+
+---
+
+## Developer Contributions
+
+### Contribute to the Core Application
+
+Fix bugs, add features, improve performance, and expand test coverage in the main ChurchCRM codebase.
+
+**Quick start:**
+1. Make sure you have a [GitHub account](https://github.com/signup/free)
+2. Join [Discord](https://discord.gg/tuWyFzj3Nj) and introduce yourself
+3. Ask in Discord what's a good place to start — maintainers will point you to something concrete
+4. Set up your [development environment](DEVELOPING.md)
+5. Open a pull request
+
+**Using Claude Code?** If you're using [Claude Code](https://claude.com/claude-code), start with [ONBOARDING.md](ONBOARDING.md) for a guided setup and workflow tailored to this project.
+
+**PRs that change user-visible behavior (features, bug fixes) must link an open issue.** CI, docs, tooling, dependency, and trivial PRs don't; say why in the description.
+
+**Quick rule:** Check for existing work, agree on the outcome and how to verify it, resolve blocking design/security questions, and claim the issue before coding. Keep the PR focused; a human maintainer owns approval and merge.
+
+Before starting work, read the [issue readiness and sizing guide](docs/contributing/issue-readiness.md) to check for existing work, understand when to split an epic, and see what qualifies as a `good first issue`. Before opening a PR, read [What maintainers look for](docs/contributing/pr-review.md), which defines hard blocks versus follow-ups. Matching the guides does not guarantee merge. Approve and merge are always a human maintainer decision.
+
+### Propose a feature, review an RFC, or help set priorities
+
+ChurchCRM can **accept a design without scheduling its implementation**. Ideas, architecture reviews, community demand and ready-to-code tasks have different statuses. Before opening a large feature proposal, read the [community feedback policy](docs/decisions/0003-rfc-community-prioritization.md).
+
+- Explain the real church problem and link any existing issue rather than opening duplicates.
+- Join an RFC discussion when user workflows, privacy, security, data structures or cross-module choices need decisions.
+- A community vote may help indicate demand, but does not make the design approved, promise a release, or override maintainer review.
+- Volunteer to implement or test **focused, scoped child issues** when ready; unplanned proposals are not automatically available as implementation tasks.
+- The [RFC portfolio](https://github.com/ChurchCRM/CRM/issues/10550) indexes active proposals and their review stages; decisions remain in the linked GitHub issues or PRs.
+
+---
+
+### Build a Community Plugin
+
+Add a feature ChurchCRM doesn't include yet — a third-party API integration, a custom workflow, a specialized report — without modifying core code. Plugins survive upgrades and can be shared in the community registry.
+
+**Best for:** Service integrations (MailChimp, SMS, OpenLP, etc.), church-specific workflows, optional features not every installation needs.
+
+**Start here:** [Creating Community Plugins](https://github.com/ChurchCRM/CRM/wiki/Creating-Community-Plugins)
+
+> **Upgrade safety:** Upgrades overwrite changes to ChurchCRM source files. Keep custom features in plugins so they survive releases.
+
+---
+
+## Setting Up Your Development Environment
+
+Follow [DEVELOPING.md](DEVELOPING.md) for the primary local-tool setup, Docker-based testing, current requirements, build commands, architecture rules, and the pull-request checklist.
+
+The default development login is `admin` / `changeme`. Change it in any real deployment.
+
+---
+
+## First Steps for Any Contributor
+
+1. **Join Discord** — [discord.gg/tuWyFzj3Nj](https://discord.gg/tuWyFzj3Nj) — introduce yourself and tell us what you'd like to help with
+2. **Browse open issues** — [github.com/ChurchCRM/CRM/issues](https://github.com/ChurchCRM/CRM/issues) — filter by label to find work that matches your skill
+3. **Try the demo** — [churchcrm.io/demo.html](https://churchcrm.io/demo.html?utm_source=github&utm_medium=referral&utm_campaign=github_content&utm_content=crm_contributing_demo) — use ChurchCRM so you understand what you're helping with
+
+---
+
+## Code of Conduct
+
+All contributors are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md). We are a welcoming, respectful community.
+
+Thank you — every contribution, no matter how small, helps a church somewhere run a little better.

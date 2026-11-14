@@ -1,0 +1,970 @@
+<?php
+
+namespace ChurchCRM\Service;
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\Bootstrapper;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\Utils\MICRUtils;
+use ChurchCRM\model\ChurchCRM\Deposit;
+use ChurchCRM\model\ChurchCRM\DepositQuery;
+use ChurchCRM\model\ChurchCRM\DonationFundQuery;
+use ChurchCRM\model\ChurchCRM\FamilyQuery;
+use ChurchCRM\model\ChurchCRM\Map\DonationFundTableMap;
+use ChurchCRM\model\ChurchCRM\Map\PledgeTableMap;
+use ChurchCRM\model\ChurchCRM\Pledge;
+use ChurchCRM\model\ChurchCRM\PledgeQuery;
+use ChurchCRM\Plugin\Hook\HookManager;
+use ChurchCRM\Plugin\Hooks;
+use ChurchCRM\Utils\CurrencyFormatter;
+use ChurchCRM\Utils\FiscalYearUtils;
+use ChurchCRM\Utils\FunctionsUtils;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\Service\AuthService;
+use ChurchCRM\Service\DonationFundService;
+use Propel\Runtime\ActiveQuery\Criteria;
+use Propel\Runtime\Collection\ObjectCollection;
+use Propel\Runtime\Map\TableMap;
+use Propel\Runtime\Propel;
+
+class FinancialService
+{
+    public function deletePayment(string $groupKey): void
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+        $pledge = PledgeQuery::create()->findOneByGroupKey($groupKey);
+        if ($pledge === null) {
+            return;
+        }
+        $pledge->delete();
+    }
+
+    public function getPayments(?string $depID = null): array
+    {
+        $query = PledgeQuery::create();
+        
+        // If a specific deposit ID is provided, filter by that deposit
+        if (!empty($depID)) {
+            $query->filterByDepositId($depID);
+        } else {
+            // Filter by user permissions (only when getting all payments)
+            if (!empty(AuthenticationManager::getCurrentUser()->getShowSince())) {
+                $query->filterByDate(AuthenticationManager::getCurrentUser()->getShowSince(), Criteria::GREATER_EQUAL);
+            }
+            if (!AuthenticationManager::getCurrentUser()->isShowPayments()) {
+                $query->filterByPledgeOrPayment('Payment', Criteria::NOT_EQUAL);
+            }
+            if (!AuthenticationManager::getCurrentUser()->isShowPledges()) {
+                $query->filterByPledgeOrPayment('Pledge', Criteria::NOT_EQUAL);
+            }
+        }
+        
+        $query->innerJoinDonationFund()->addAsColumn('PledgeName', DonationFundTableMap::COL_FUN_NAME);
+        $data = $query->find();
+
+        $rows = [];
+        foreach ($data as $row) {
+            $newRow['FormattedFY'] = $row->getFormattedFY();
+            $newRow['GroupKey'] = $row->getGroupKey();
+            $newRow['Amount'] = $row->getAmount();
+            $newRow['Amount_formatted'] = CurrencyFormatter::format($row->getAmount());
+            $newRow['Nondeductible'] = $row->getNondeductible();
+            $newRow['Nondeductible_formatted'] = CurrencyFormatter::format($row->getNondeductible());
+            $newRow['Schedule'] = $row->getSchedule();
+            $newRow['Method'] = $row->getMethod();
+            $newRow['Comment'] = InputUtils::sanitizeAndEscapeText($row->getComment() ?? '');
+            $newRow['PledgeOrPayment'] = $row->getPledgeOrPayment();
+            $newRow['Date'] = $row->getDate('Y-m-d');
+            $newRow['DateLastEdited'] = $row->getDateLastEdited('Y-m-d');
+            $newRow['EditedBy'] = $row->getPerson() ? $row->getPerson()->getFullName() : '';
+            $newRow['Fund'] = $row->getPledgeName();
+            $rows[] = $newRow;
+        }
+
+        return $rows;
+    }
+
+    public function getMemberByScanString(string $tScanString): array
+    {
+        if (!SystemConfig::getBooleanValue('bUseScannedChecks')) {
+            throw new \Exception('Scanned Checks is disabled');
+        }
+
+        $micrObj = new MICRUtils(); // Instantiate the MICR class
+        $routeAndAccount = $micrObj->findRouteAndAccount($tScanString); // use routing and account number for matching
+        if (!$routeAndAccount) {
+            throw new \Exception('error in locating family');
+        }
+        $family = FamilyQuery::create()->filterByScanCheck($routeAndAccount)->findOne();
+        $iCheckNo = $micrObj->findCheckNo($tScanString);
+
+        return [
+            'ScanString'      => $tScanString,
+            'RouteAndAccount' => $routeAndAccount,
+            'CheckNumber'     => $iCheckNo,
+            'fam_ID'          => $family?->getId(),
+            'fam_Name'        => $family?->getName(),
+        ];
+    }
+
+    public function setDeposit(string $depositType, string $depositComment, string $depositDate, $iDepositSlipID = null, $depositClosed = false): void
+    {
+        if ($iDepositSlipID) {
+            $deposit = DepositQuery::create()->findOneById($iDepositSlipID);
+            $deposit
+                ->setDate($depositDate)
+                ->setComment(InputUtils::sanitizeText($depositComment))
+                ->setEnteredby(AuthenticationManager::getCurrentUser()->getId())
+                ->setClosed(intval($depositClosed));
+            $deposit->save();
+            if ($depositClosed) {
+                HookManager::doAction(Hooks::DEPOSIT_CLOSED, $deposit);
+            }
+            if ($depositClosed && ($depositType === 'CreditCard' || $depositType === 'BankDraft')) {
+                // Delete any failed transactions on this deposit slip now that it is closing
+                PledgeQuery::create()
+                    ->filterByDepId((int) $iDepositSlipID)
+                    ->filterByPledgeOrPayment('Payment')
+                    ->filterByAutCleared(0)
+                    ->delete();
+            }
+        } else {
+            $deposit = new Deposit();
+            $deposit
+                ->setDate($depositDate)
+                ->setComment(InputUtils::sanitizeText($depositComment))
+                ->setEnteredby(AuthenticationManager::getCurrentUser()->getId())
+                ->setType($depositType);
+            $deposit->save();
+            $deposit->reload();
+
+            $iDepositSlipID = $deposit->getId();
+        }
+        $_SESSION['iCurrentDeposit'] = $iDepositSlipID;
+    }
+
+    public function getDepositTotal($id, $type = null)
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+        $query = PledgeQuery::create()
+            ->filterByDepId((int) $id)
+            ->filterByPledgeOrPayment('Payment');
+        if ($type) {
+            $query->filterByMethod($type);
+        }
+        $query->addAsColumn('deposit_total', 'SUM(' . PledgeTableMap::COL_PLG_AMOUNT . ')')
+            ->select(['deposit_total']);
+        $deposit_total = $query->findOne();
+
+        return $deposit_total;
+    }
+        // ...existing code...
+
+    public function getPaymentViewURI(string $groupKey): string
+    {
+        return SystemURLs::getRootPath() . '/finance/pledge/' . urlencode($groupKey);
+    }
+
+    /**
+     * Return all pledge rows for a given GroupKey as a structured array.
+     *
+     * Includes family info, fund name, per-row amounts, and deposit association.
+     *
+     * @param string $groupKey
+     * @return array{
+     *   groupKey: string,
+     *   familyId: int,
+     *   familyName: string,
+     *   date: string,
+     *   fyId: int,
+     *   method: string,
+     *   checkNo: string|null,
+     *   depositId: int|null,
+     *   pledgeOrPayment: string,
+     *   schedule: string|null,
+     *   total: float,
+     *   funds: list<array{
+     *     fundId: int, fundName: string, amount: float,
+     *     nonDeductible: float, comment: string
+     *   }>
+     * }
+     * @throws \InvalidArgumentException when the group key does not exist
+     */
+    public function getPledgesByGroupKey(string $groupKey): array
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+
+        $pledges = PledgeQuery::create()
+            ->filterByGroupKey($groupKey)
+            ->leftJoinWithDonationFund()
+            ->leftJoinWithFamily()
+            ->find();
+
+        if ($pledges->count() === 0) {
+            throw new \InvalidArgumentException('Pledge group not found');
+        }
+
+        $funds = [];
+        $total = 0.0;
+        $header = null;
+
+        foreach ($pledges as $pledge) {
+            if ($header === null) {
+                $family = $pledge->getFamily();
+                $header = [
+                    'groupKey'        => $pledge->getGroupKey(),
+                    'familyId'        => (int) $pledge->getFamId(),
+                    'familyName'      => $family ? $family->getFamilyString() : '',
+                    'date'            => $pledge->getDate('Y-m-d'),
+                    'fyId'            => (int) $pledge->getFyId(),
+                    'method'          => $pledge->getMethod() ?? '',
+                    'checkNo'         => $pledge->getCheckNo(),
+                    'depositId'       => $pledge->getDepId() ? (int) $pledge->getDepId() : null,
+                    'pledgeOrPayment' => $pledge->getPledgeOrPayment() ?? '',
+                    'schedule'        => $pledge->getSchedule(),
+                ];
+            }
+
+            $fund = $pledge->getDonationFund();
+            $amount = (float) $pledge->getAmount();
+            $total += $amount;
+
+            $funds[] = [
+                'fundId'               => (int) $pledge->getFundId(),
+                'fundName'             => $fund ? $fund->getName() : '',
+                'amount'               => $amount,
+                'amount_formatted'     => CurrencyFormatter::format($amount),
+                'nonDeductible'        => (float) $pledge->getNondeductible(),
+                'nonDeductible_formatted' => CurrencyFormatter::format($pledge->getNondeductible()),
+                'comment'              => $pledge->getComment() ?? '',
+            ];
+        }
+
+        $header['total'] = $total;
+        $header['total_formatted'] = CurrencyFormatter::format($total);
+        $header['funds'] = $funds;
+
+        return $header;
+    }
+
+    /**
+     * Delete ALL pledge rows sharing a GroupKey (multi-fund aware).
+     *
+     * Unlike deletePayment() which only removes the first match, this method
+     * deletes every row with the given GroupKey.
+     *
+     * @param string $groupKey
+     * @throws \InvalidArgumentException when the group key does not exist
+     */
+    public function deletePledgeGroup(string $groupKey): void
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+
+        $count = PledgeQuery::create()
+            ->filterByGroupKey($groupKey)
+            ->delete();
+
+        if ($count === 0) {
+            throw new \InvalidArgumentException('Pledge group not found');
+        }
+    }
+
+    public function getViewURI(string $Id): string
+    {
+        return SystemURLs::getRootPath() . '/finance/deposit/' . $Id;
+    }
+
+    private function validateDate(object $payment): void
+    {
+        // Validate Date
+        if (isset($payment->Date) && strlen($payment->Date) > 0) {
+            [$iYear, $iMonth, $iDay] = sscanf($payment->Date, '%04d-%02d-%02d');
+            if (!checkdate($iMonth, $iDay, $iYear)) {
+                throw new \Exception('Invalid Date');
+            }
+        }
+    }
+
+    private function validateFund(object $payment): void
+    {
+        //Validate that the fund selection is valid:
+        //If a single fund is selected, that fund must exist, and not equal the default "Select a Fund" selection.
+        //If a split is selected, at least one fund must be non-zero, the total must add up to the total of all funds, and all funds in the split must be valid funds.
+        $FundSplit = $payment->FundSplit;
+        if (count($FundSplit) >= 1 && $FundSplit[0]->FundID !== 'None') { // split
+            $nonZeroFundAmountEntered = 0;
+            foreach ($FundSplit as $fund) {
+                //$fun_active = $fundActive[$fun_id];
+                if ($fund->Amount > 0) {
+                    $nonZeroFundAmountEntered++;
+                }
+                if (SystemConfig::getBooleanValue('bEnableNonDeductible') && isset($fund->NonDeductible)) {
+                    //Validate the NonDeductible Amount
+                    if ($fund->NonDeductible > $fund->Amount) { //Validate the NonDeductible Amount
+                        throw new \Exception(gettext("NonDeductible amount can't be greater than total amount."));
+                    }
+                }
+            } // end foreach
+            if (!$nonZeroFundAmountEntered) {
+                throw new \Exception(gettext('At least one fund must have a non-zero amount.'));
+            }
+        } else {
+            throw new \Exception('Must select a valid fund');
+        }
+    }
+
+    public function locateFamilyCheck(string $checkNumber, string $fam_ID, ?string $excludeGroupKey = null)
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+
+        $query = PledgeQuery::create()
+            ->filterByCheckNo($checkNumber)
+            ->filterByFamId((int) $fam_ID);
+
+        if ($excludeGroupKey !== null) {
+            $query->filterByGroupKey($excludeGroupKey, Criteria::NOT_EQUAL);
+        }
+
+        return $query->count();
+    }
+
+    /**
+     * @param ?string $excludeGroupKey when editing an existing pledge/payment, exclude its own
+     *                                  rows from the duplicate-check-number lookup
+     */
+    public function validateChecks(object $payment, ?string $excludeGroupKey = null): void
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+        if (empty($payment->type) || $payment->type !== 'Payment') {
+            return;
+        }
+        $method = $payment->iMethod ?? '';
+        $checkNumber = trim((string) ($payment->iCheckNo ?? ''));
+        // Blank and 0 mean "no check number": churches that do not record numbers enter 0 for every check.
+        $hasCheckNumber = ltrim($checkNumber, '0') !== '';
+
+        if ($method === 'CHECK' && !$hasCheckNumber && SystemConfig::getBooleanValue('bRequireCheckNumber')) {
+            throw new \Exception(gettext('Must specify non-zero check number'));
+        }
+        if (!$hasCheckNumber) {
+            return;
+        }
+        if ($method === 'CASH') {
+            throw new \Exception(gettext("Check number not valid for 'CASH' payment"));
+        }
+        if ($method === 'CHECK' && !empty($payment->FamilyID) && $this->locateFamilyCheck($checkNumber, (string) $payment->FamilyID, $excludeGroupKey)) {
+            throw new \Exception("Check number '" . $checkNumber . "' for selected family already exists.");
+        }
+    }
+
+    public function processCurrencyDenominations(object $payment, string $groupKey): void
+    {
+        if (empty($payment->cashDenominations)) {
+            return;
+        }
+        $connection = Bootstrapper::getMysqliConnection();
+        $currencyDenoms = json_decode($payment->cashDenominations, null, 512);
+        foreach ($currencyDenoms as $cdom) {
+            if (empty($payment->DepositID) || empty($cdom->currencyID) || empty($cdom->Count)) {
+                continue;
+            }
+            $escapedGroupKey = mysqli_real_escape_string($connection, $groupKey);
+            $sSQL = "INSERT INTO pledge_denominations_pdem (pdem_plg_GroupKey, plg_depID, pdem_denominationID, pdem_denominationQuantity)
+      VALUES ('" . $escapedGroupKey . "','" . (int) $payment->DepositID . "','" . (int) $cdom->currencyID . "','" . (int) $cdom->Count . "')";
+            FunctionsUtils::runQuery($sSQL);
+        }
+    }
+
+    public function insertPledgeorPayment(object $payment, ?string $presetGroupKey = null)
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+        // Only set PledgeOrPayment when the record is first created.
+        // Loop through all funds and create a pledge row for every non-zero amount.
+        //
+        // FundSplit may arrive as a JSON string (legacy callers) or as an already-
+        // decoded array (when called via submitPledgeOrPayment after normalisation).
+        $FundSplit = is_string($payment->FundSplit)
+            ? json_decode($payment->FundSplit, false, 512)
+            : $payment->FundSplit;
+
+        // $presetGroupKey reuses the caller's GroupKey (updatePledgeOrPayment) instead of
+        // generating a new one — the loop below only auto-generates when this is null.
+        $sGroupKey = $presetGroupKey;
+
+        foreach ($FundSplit as $Fund) {
+            if ($Fund->Amount > 0) {  // Only insert a row if this fund has a non-zero amount.
+                if ($sGroupKey === null) {  // GroupKey is shared across all fund rows for one payment.
+                    $iAutID = $payment->iAutID ?? null;
+                    // Normalize to string: null/absent FamilyID becomes '' so generateGroupKey
+                    // (typed string) doesn't receive null and trigger a PHP 8 deprecation.
+                    $famIdStr = (string) ($payment->FamilyID ?? '');
+                    if ($payment->iMethod === 'CHECK') {
+                        $sGroupKey = $this->generateGroupKey($payment->iCheckNo ?? 'check', $famIdStr, $Fund->FundID, $payment->Date);
+                    } elseif ($payment->iMethod === 'BANKDRAFT') {
+                        $sGroupKey = $this->generateGroupKey($iAutID ?? 'draft', $famIdStr, $Fund->FundID, $payment->Date);
+                    } elseif ($payment->iMethod === 'CREDITCARD') {
+                        $sGroupKey = $this->generateGroupKey($iAutID ?? 'credit', $famIdStr, $Fund->FundID, $payment->Date);
+                    } else {
+                        $sGroupKey = $this->generateGroupKey('cash', $famIdStr, $Fund->FundID, $payment->Date);
+                    }
+                }
+
+                $pledge = new Pledge();
+                $pledge
+                    ->setFamId(!empty($payment->FamilyID) ? (int) $payment->FamilyID : null)
+                    ->setFyId($payment->FYID)
+                    ->setDate($payment->Date)
+                    ->setAmount($Fund->Amount)
+                    ->setMethod($payment->iMethod)
+                    ->setComment($Fund->Comment ?? '')
+                    ->setDateLastEdited(date('YmdHis'))
+                    ->setEditedBy(AuthenticationManager::getCurrentUser()->getId())
+                    ->setPledgeOrPayment($payment->type)
+                    ->setFundId($Fund->FundID)
+                    ->setDepId($payment->DepositID)
+                    ->setGroupKey($sGroupKey);
+                if (!empty($payment->schedule)) {
+                    $pledge->setSchedule($payment->schedule);
+                }
+                if (!empty($payment->iCheckNo)) {
+                    $pledge->setCheckNo($payment->iCheckNo);
+                }
+                if (!empty($payment->tScanString)) {
+                    $pledge->setScanString($payment->tScanString);
+                }
+                if (!empty($payment->iAutID)) {
+                    $pledge->setAutId($payment->iAutID);
+                }
+                // Always set NonDeductible — the column is NOT NULL with no default.
+                // Using empty() here would skip 0, leaving the property null and
+                // causing a MySQL constraint error on INSERT.
+                $pledge->setNondeductible((float) ($Fund->NonDeductible ?? 0));
+                $pledge->save();
+                HookManager::doAction(Hooks::DONATION_RECEIVED, $pledge);
+                // Do NOT return here — continue to save all fund rows before returning.
+            }
+        }
+
+        return $sGroupKey;
+    }
+
+    /**
+     * Returns method|n|family|fund|date with the lowest n that no pledge_plg row uses,
+     * pledge or payment: delete and edit act on every row with the key.
+     */
+    private function generateGroupKey(string $methodSpecificId, string $famId, string $fundId, string $date): string
+    {
+        $uniqueNum = 0;
+        do {
+            $groupKey = implode('|', [$methodSpecificId, $uniqueNum++, $famId, $fundId, $date]);
+        } while (PledgeQuery::create()->filterByGroupKey($groupKey)->exists());
+
+        return $groupKey;
+    }
+
+    /**
+     * Normalise $payment->FundSplit to an array of stdClass objects.
+     *
+     * The legacy API and the new MVC editor both send FundSplit as a
+     * JSON-encoded string.  validateFund() needs an array (it calls count()
+     * and arrow-accesses ->FundID / ->Amount), while insertPledgeorPayment()
+     * historically json_decoded the string itself.  Normalising once here
+     * lets both methods share a single, already-decoded representation and
+     * avoids a PHP 8 TypeError from count()-on-string.
+     *
+     * Accepts: JSON string  →  decoded to array of stdClass
+     *          array        →  used as-is (future callers passing native arrays)
+     *          stdClass     →  wrapped in a single-element array
+     */
+    private function normalizeFundSplit(object $payment): void
+    {
+        $raw = $payment->FundSplit ?? [];
+        if (is_string($raw)) {
+            $raw = json_decode($raw, false, 512);
+        }
+        if ($raw instanceof \stdClass) {
+            $raw = [$raw];
+        }
+        $payment->FundSplit = is_array($raw) ? array_values($raw) : [];
+    }
+
+    public function submitPledgeOrPayment(object $payment): string
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+        $this->normalizeFundSplit($payment);
+        $this->validateFund($payment);
+        $this->validateChecks($payment);
+        $this->validateDate($payment);
+        $groupKey = $this->insertPledgeorPayment($payment);
+
+        return $this->getPledgeorPayment($groupKey);
+    }
+
+    /**
+     * Update an existing pledge/payment group in place.
+     *
+     * GroupKey is a plain string column, not the table's primary key (plg_plgID is),
+     * so replaying insertPledgeorPayment() against an existing GroupKey would create
+     * duplicate rows rather than updating them. Instead, replace the group's rows
+     * atomically: delete the existing rows for $groupKey, then re-insert the submitted
+     * fund rows under that same GroupKey.
+     *
+     * @throws \InvalidArgumentException when the group key does not exist
+     */
+    public function updatePledgeOrPayment(object $payment, string $groupKey): string
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+        $this->normalizeFundSplit($payment);
+        $this->validateFund($payment);
+        $this->validateChecks($payment, $groupKey);
+        $this->validateDate($payment);
+
+        $con = Propel::getWriteConnection(PledgeTableMap::DATABASE_NAME);
+        $con->beginTransaction();
+        try {
+            // Existence check is inside the transaction so the check, denomination
+            // cleanup, and pledge delete are all atomic — avoids a TOCTOU race.
+            $existingCount = PledgeQuery::create()->filterByGroupKey($groupKey)->count($con);
+            if ($existingCount === 0) {
+                // No explicit rollBack() here — the catch (\Throwable) block below
+                // handles rollback for every exception thrown inside this try{},
+                // including \InvalidArgumentException.  Calling rollBack() here first
+                // and then rethrowing would close the transaction before catch fires,
+                // causing a second rollBack() on an inactive transaction (PDOException).
+                throw new \InvalidArgumentException('Pledge group not found');
+            }
+            // Guard: refuse edits when any row of the group is in a closed deposit.
+            // This check runs inside the transaction so it is safe against concurrent
+            // deposit-close operations (no TOCTOU gap).
+            $inClosedDeposit = PledgeQuery::create()
+                ->filterByGroupKey($groupKey)
+                ->useDepositQuery()
+                    ->filterByClosed(true)
+                ->endUse()
+                ->exists($con);
+            if ($inClosedDeposit) {
+                throw new \DomainException(gettext('Cannot edit a payment in a closed deposit'));
+            }
+            // Remove orphaned denomination rows. pledge_denominations_pdem has no FK
+            // constraint and no Propel model, so we use a parameterized statement on
+            // the same connection to keep the deletion within this transaction.
+            // The table is an optional legacy feature and may not exist in all
+            // installations (it is absent from the default Install.sql), so we
+            // swallow any PDOException here rather than aborting the whole update.
+            try {
+                $stmt = $con->prepare(
+                    'DELETE FROM pledge_denominations_pdem WHERE pdem_plg_GroupKey = :groupKey'
+                );
+                $stmt->execute([':groupKey' => $groupKey]);
+            } catch (\PDOException $e) {
+                // Only suppress SQLSTATE 42S02 / MySQL error 1146 (table does not exist).
+                // All other PDO errors (deadlock, timeout, disk-full, permission denied, …)
+                // must propagate so the outer \Throwable catch can roll back the transaction.
+                $sqlState = $e->getCode();
+                $mysqlCode = $e->errorInfo[1] ?? null;
+                if ($sqlState !== '42S02' || $mysqlCode !== 1146) {
+                    throw $e;
+                }
+            }
+            PledgeQuery::create()->filterByGroupKey($groupKey)->delete($con);
+            $this->insertPledgeorPayment($payment, $groupKey);
+            $con->commit();
+        } catch (\Throwable $e) {
+            $con->rollBack();
+            throw $e;
+        }
+
+        return $this->getPledgeorPayment($groupKey);
+    }
+
+    public function getPledgeorPayment(string $GroupKey): string
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+        $total = 0;
+        $pledges = PledgeQuery::create()->filterByGroupKey($GroupKey)->find();
+        $payment = new \stdClass();
+        $payment->funds = [];
+        foreach ($pledges as $row) {
+            $family = FamilyQuery::create()->findOneById($row->getFamId());
+            $payment->Family = $family?->getFamilyString() ?? '';
+            $payment->Date = $row->getDate('Y-m-d');
+            $payment->FYID = $row->getFyId();
+            $payment->iMethod = $row->getMethod();
+            $fund = [];
+            $fund['FundID'] = $row->getFundId();
+            $fund['Amount'] = $row->getAmount();
+            $fund['amount_formatted'] = CurrencyFormatter::format($row->getAmount());
+            $fund['NonDeductible'] = $row->getNondeductible();
+            $fund['nonDeductible_formatted'] = CurrencyFormatter::format($row->getNondeductible());
+            $fund['Comment'] = $row->getComment();
+            $payment->funds[] = $fund;
+            $total += $row->getAmount();
+            $onePlgID = $row->getId();
+            $oneFundID = $row->getFundId();
+            $iOriginalSelectedFund = $oneFundID; // remember the original fund in case we switch to splitting
+            $fund2PlgIds[$oneFundID] = $onePlgID;
+        }
+        $payment->GroupKey = $GroupKey;
+        $payment->total = $total;
+        $payment->total_formatted = CurrencyFormatter::format($total);
+
+        return json_encode($payment);
+    }
+
+    public function getDepositPDF($depID): void
+    {
+    }
+
+    public function getCurrencyTypeOnDeposit(string $currencyID, string $depositID)
+    {
+        // Get the list of Currency denominations
+        $sSQL = 'SELECT SUM(pdem_denominationQuantity) FROM pledge_denominations_pdem
+                 WHERE plg_depID = ' . (int) $depositID . '
+                 AND pdem_denominationID = ' . (int) $currencyID;
+        $rscurrencyDenomination = FunctionsUtils::runQuery($sSQL);
+
+        return mysqli_fetch_array($rscurrencyDenomination)[0];
+    }
+
+    /**
+     * @return \stdClass[]
+     */
+    public function getCurrency(): array
+    {
+        $currencies = [];
+        // Get the list of Currency denominations
+        $sSQL = 'SELECT * FROM currency_denominations_cdem';
+        $rscurrencyDenomination = FunctionsUtils::runQuery($sSQL);
+        mysqli_data_seek($rscurrencyDenomination, 0);
+        while ($row = mysqli_fetch_array($rscurrencyDenomination)) {
+            $currency = new \stdClass();
+            $currency->id = $row['cdem_denominationID'];
+            $currency->Name = $row['cdem_denominationName'];
+            $currency->Value = $row['cdem_denominationValue'];
+            $currency->cClass = $row['cdem_denominationClass'];
+            $currencies[] = $currency;
+        } // end while
+
+        return $currencies;
+    }
+
+    /**
+     * Format a fiscal year ID into a human-readable string.
+     *
+     * @param int $fyId Fiscal year ID
+     * @return string Formatted fiscal year (e.g., "2024" or "2023/24")
+     */
+    public static function formatFiscalYear(int $fyId): string
+    {
+        return FiscalYearUtils::getFiscalYearDatesById($fyId)['label'];
+    }
+
+    // =========================================================================
+    // Dashboard Methods
+    // =========================================================================
+
+    /**
+     * Get deposit statistics (total, open, closed counts).
+     *
+     * @return array{total: int, open: int, closed: int}
+     */
+    public function getDepositStatistics(): array
+    {
+        return [
+            'total' => DepositQuery::create()->count(),
+            'open' => DepositQuery::create()->filterByClosed(false)->count(),
+            'closed' => DepositQuery::create()->filterByClosed(true)->count(),
+        ];
+    }
+
+    /**
+     * Get recent deposits, optionally scoped to a specific fiscal year.
+     *
+     * @param int $limit Maximum number of deposits to return
+     * @param int|null $fyid Fiscal year ID to filter by; null or 0 returns all time
+     * @return ObjectCollection Collection of Deposit objects
+     */
+    public function getRecentDeposits(int $limit = 5, ?int $fyid = null): ObjectCollection
+    {
+        $query = DepositQuery::create()
+            ->orderByDate(Criteria::DESC)
+            ->limit($limit);
+
+        if ($fyid !== null && $fyid > 0) {
+            $fyDates = FiscalYearUtils::getFiscalYearDatesById($fyid);
+            $query->filterByDate(['min' => $fyDates['startDate'], 'max' => $fyDates['endDate']]);
+        }
+
+        return $query->find();
+    }
+
+    /**
+     * Get the oldest fiscal year ID that has deposit data.
+     *
+     * Used to build the FY selector on the Finance Dashboard and Find Deposit Slip.
+     *
+     * @return int Oldest fiscal year ID (falls back to current FY when no deposits exist)
+     */
+    public function getOldestDepositFyId(): int
+    {
+        $oldest = DepositQuery::create()
+            ->orderByDate(Criteria::ASC)
+            ->findOne();
+        if ($oldest === null) {
+            return FiscalYearUtils::getCurrentFiscalYearId();
+        }
+        $dateStr = $oldest->getDate('Y-m-d');
+        return FiscalYearUtils::getFiscalYearIdForDate(is_string($dateStr) ? $dateStr : '');
+    }
+
+    /**
+     * Get available fiscal years for the deposit-based FY selector.
+     *
+     * @return array<int, array{id: int, label: string}>
+     */
+    public function getAvailableDepositFiscalYears(): array
+    {
+        return FiscalYearUtils::buildFiscalYearList($this->getOldestDepositFyId());
+    }
+
+    /**
+     * Get the oldest fiscal year ID that has pledge/payment data (plg_date).
+     *
+     * Used to build the FY selector on the Finance Dashboard, where YTD stat
+     * methods filter by pledge date — not deposit date. FYs that have pledges
+     * but no deposit slips would be absent from the dropdown if we used the
+     * deposit-based helper instead.
+     *
+     * @return int Oldest pledge FY ID (falls back to current FY when no pledges exist)
+     */
+    public function getOldestPledgeFyId(): int
+    {
+        $oldest = PledgeQuery::create()
+            ->orderByFyId()          // plg_FYID is integer — no NULL risk (unlike plg_date)
+            ->select(['FyId'])
+            ->findOne();
+        return $oldest !== null ? (int) $oldest : FiscalYearUtils::getCurrentFiscalYearId();
+    }
+
+    /**
+     * Get available fiscal years for the pledge-based FY selector (Finance Dashboard).
+     *
+     * @return array<int, array{id: int, label: string}>
+     */
+    public function getAvailablePledgeFiscalYears(): array
+    {
+        return FiscalYearUtils::buildFiscalYearList($this->getOldestPledgeFyId());
+    }
+
+    /**
+     * Get Year-to-Date payment total for a fiscal year (or all time when dates are null).
+     *
+     * @param string|null $fyStartDate Fiscal year start date; null = all time
+     * @param string|null $fyEndDate   Fiscal year end date;   null = all time
+     * @return float|null
+     */
+    public function getYtdPaymentTotal(?string $fyStartDate = null, ?string $fyEndDate = null): ?float
+    {
+        $query = PledgeQuery::create()
+            ->filterByPledgeOrPayment('Payment');
+        if ($fyStartDate !== null && $fyEndDate !== null) {
+            $query->filterByDate(['min' => $fyStartDate, 'max' => $fyEndDate]);
+        }
+        return $query
+            ->addAsColumn('TotalAmount', 'SUM(' . PledgeTableMap::COL_PLG_AMOUNT . ')')
+            ->select(['TotalAmount'])
+            ->findOne();
+    }
+
+    /**
+     * @return array<int, array{fundId: int, name: string, amount: float}>
+     */
+    public function getYtdByFund(?string $fyStartDate = null, ?string $fyEndDate = null): array
+    {
+        $query = PledgeQuery::create()
+            ->filterByPledgeOrPayment('Payment')
+            ->leftJoinDonationFund()
+            ->addAsColumn('FundName', DonationFundTableMap::COL_FUN_NAME)
+            ->addAsColumn('TotalAmount', 'SUM(' . PledgeTableMap::COL_PLG_AMOUNT . ')')
+            ->groupByFundId()
+            ->groupBy(DonationFundTableMap::COL_FUN_NAME)
+            ->orderBy('TotalAmount', Criteria::DESC)
+            ->orderByFundId()
+            ->select(['FundId', 'FundName', 'TotalAmount']);
+        if ($fyStartDate !== null && $fyEndDate !== null) {
+            $query->filterByDate(['min' => $fyStartDate, 'max' => $fyEndDate]);
+        }
+
+        $funds = [];
+        foreach ($query->find() as $row) {
+            $funds[] = [
+                'fundId' => (int) $row['FundId'],
+                'name'   => $row['FundName'] ?? gettext('Unknown Fund'),
+                'amount' => (float) $row['TotalAmount'],
+            ];
+        }
+
+        return $funds;
+    }
+
+    /**
+     * Get Year-to-Date pledge total for a fiscal year (or all time when dates are null).
+     *
+     * @param string|null $fyStartDate Fiscal year start date; null = all time
+     * @param string|null $fyEndDate   Fiscal year end date;   null = all time
+     * @return float|null
+     */
+    public function getYtdPledgeTotal(?string $fyStartDate = null, ?string $fyEndDate = null): ?float
+    {
+        $query = PledgeQuery::create()
+            ->filterByPledgeOrPayment('Pledge');
+        if ($fyStartDate !== null && $fyEndDate !== null) {
+            $query->filterByDate(['min' => $fyStartDate, 'max' => $fyEndDate]);
+        }
+        return $query
+            ->addAsColumn('TotalAmount', 'SUM(' . PledgeTableMap::COL_PLG_AMOUNT . ')')
+            ->select(['TotalAmount'])
+            ->findOne();
+    }
+
+    /**
+     * Get Year-to-Date payment count for a fiscal year (or all time when dates are null).
+     *
+     * @param string|null $fyStartDate Fiscal year start date; null = all time
+     * @param string|null $fyEndDate   Fiscal year end date;   null = all time
+     * @return int
+     */
+    public function getYtdPaymentCount(?string $fyStartDate = null, ?string $fyEndDate = null): int
+    {
+        $query = PledgeQuery::create()
+            ->filterByPledgeOrPayment('Payment');
+        if ($fyStartDate !== null && $fyEndDate !== null) {
+            $query->filterByDate(['min' => $fyStartDate, 'max' => $fyEndDate]);
+        }
+        return $query->count();
+    }
+
+    /**
+     * Get count of unique donor families for a fiscal year (or all time when dates are null).
+     *
+     * @param string|null $fyStartDate Fiscal year start date; null = all time
+     * @param string|null $fyEndDate   Fiscal year end date;   null = all time
+     * @return int|null
+     */
+    public function getYtdDonorFamilyCount(?string $fyStartDate = null, ?string $fyEndDate = null): ?int
+    {
+        $query = PledgeQuery::create()
+            ->filterByPledgeOrPayment('Payment');
+        if ($fyStartDate !== null && $fyEndDate !== null) {
+            $query->filterByDate(['min' => $fyStartDate, 'max' => $fyEndDate]);
+        }
+        return $query
+            ->addAsColumn('FamilyCount', 'COUNT(DISTINCT ' . PledgeTableMap::COL_PLG_FAMID . ')')
+            ->select(['FamilyCount'])
+            ->findOne();
+    }
+
+    /**
+     * Get current deposit from session.
+     *
+     * @return Deposit|null
+     */
+    public function getCurrentDeposit(): ?Deposit
+    {
+        $currentDepositId = $_SESSION['iCurrentDeposit'] ?? null;
+        if ($currentDepositId) {
+            return DepositQuery::create()->findOneById((int) $currentDepositId);
+        }
+        return null;
+    }
+
+    /**
+     * Get current deposit ID from session.
+     *
+     * @return int|null
+     */
+    public function getCurrentDepositId(): ?int
+    {
+        return $_SESSION['iCurrentDeposit'] ?? null;
+    }
+
+    /**
+     * Get all dashboard data in a single call.
+     *
+     * - null  → current fiscal year (backward-compatible default for callers with no opinion)
+     * - 0     → "All Time": no date-range filter on stats or recent-deposits
+     * - n > 0 → specific fiscal year n
+     *
+     * @param int|null $fyid Fiscal year ID (null = current FY, 0 = All Time, >0 = specific FY)
+     * @return array Dashboard data including fiscal year info, statistics, and deposits
+     */
+    public function getDashboardData(?int $fyid = null): array
+    {
+        $allTime    = ($fyid === 0);
+        $actualFyid = $allTime
+            ? null
+            : (($fyid !== null && $fyid > 0) ? $fyid : FiscalYearUtils::getCurrentFiscalYearId());
+
+        $fiscalYear = $allTime
+            ? ['startDate' => null, 'endDate' => null, 'label' => gettext('All Time'), 'month' => 1]
+            : FiscalYearUtils::getFiscalYearDatesById($actualFyid);
+
+        $depositStats        = $this->getDepositStatistics();
+        $currentDeposit      = $this->getCurrentDeposit();
+        $donationFundService = new DonationFundService();
+        $activeFunds         = $donationFundService->getAll();
+
+        return [
+            'fiscalYear'       => $fiscalYear,
+            'selectedFyid'     => $allTime ? 0 : $actualFyid,
+            'availableYears'   => $this->getAvailablePledgeFiscalYears(),
+            'currentFyid'      => FiscalYearUtils::getCurrentFiscalYearId(),
+            'depositStats'     => $depositStats,
+            'recentDeposits'   => $this->getRecentDeposits(5, $allTime ? null : $actualFyid),
+            'activeFunds'      => $activeFunds,
+            'activeFundCount'  => $activeFunds->count(),
+            'totalFundCount'   => $donationFundService->getCount(),
+            'paymentsByFund'   => $this->getYtdByFund($fiscalYear['startDate'], $fiscalYear['endDate']),
+            'ytdPaymentTotal'  => $this->getYtdPaymentTotal($fiscalYear['startDate'], $fiscalYear['endDate']),
+            'ytdPledgeTotal'   => $this->getYtdPledgeTotal($fiscalYear['startDate'], $fiscalYear['endDate']),
+            'ytdPaymentCount'  => $this->getYtdPaymentCount($fiscalYear['startDate'], $fiscalYear['endDate']),
+            'ytdDonorFamilies' => $this->getYtdDonorFamilyCount($fiscalYear['startDate'], $fiscalYear['endDate']),
+            'currentDeposit'   => $currentDeposit,
+            'currentDepositId' => $this->getCurrentDepositId(),
+        ];
+    }
+
+    /**
+     * Get distinct calendar years with payments for a specific family.
+     *
+     * Returns years in descending order (most recent first), limited to $maxYears.
+     * Pass 0 for $maxYears for no limit.
+     *
+     * @param int $familyId
+     * @param int $maxYears Maximum years to return (0 = no limit)
+     * @return int[] Array of 4-digit calendar years
+     */
+    public function getFamilyPaymentYears(int $familyId, int $maxYears = 5): array
+    {
+        AuthService::requireUserGroupMembership('bFinance');
+
+        $payments = PledgeQuery::create()
+            ->filterByFamId($familyId)
+            ->filterByPledgeOrPayment('Payment')
+            ->filterByDate(null, Criteria::ISNOTNULL)
+            ->find();
+
+        $years = [];
+        foreach ($payments as $payment) {
+            $endYear = FiscalYearUtils::getEndYearForDate($payment->getDate('Y-m-d'));
+            if ($endYear > 1990) {
+                $years[$endYear] = true;
+            }
+        }
+        $years = array_keys($years);
+        rsort($years);
+
+        return $maxYears > 0 ? array_slice($years, 0, $maxYears) : $years;
+    }
+}

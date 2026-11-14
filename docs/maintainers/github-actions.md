@@ -1,0 +1,95 @@
+# GitHub Actions
+
+What each workflow in `.github/workflows/` does, what starts it, and what it starts next. The locale loop is explained in [locale-pipeline.md](locale-pipeline.md) and the release in [release-process.md](release-process.md); this page is the map that ties them together.
+
+## Rules every workflow follows
+
+- **Deterministic work only.** Actions logs on a public repo are world-readable, and a model API key handed to a job is reachable from its steps, forked-PR runs and leaked logs. AI agents (translation, reviews, release notes) run outside Actions with their own credentials.
+- **Name the stage.** A workflow's display name is `<Area>: <what>` (`Locale: extract terms`). Its file name is `<area>-<what>.yml`.
+- **Least privilege.** Every workflow sets a top-level `permissions:` (default `contents: read`) and raises it per job only where needed.
+- **One chain, no loops.** A workflow may start the next stage; nothing may start an earlier one. Triggers are scoped by `paths:` to what only the previous stage produces (see [Chains](#chains-and-why-they-do-not-loop)).
+- **Settle bursts once, at the start of a chain.** A run started by a merge waits (15 minutes by default) and restarts the wait on each newer merge, so several merges become one run (`Locale: extract terms`). Later stages in the same chain do not wait again. A manual run skips the wait. Give each workflow a `run-name:` that says what the run does, so the Actions list does not show the triggering commit's title.
+- **Idempotent steps.** A re-run, a manual run and a scheduled run must be safe. A trigger decides *when* a workflow runs, not *what* it does.
+- **Events from `GITHUB_TOKEN` do not chain.** A push, PR or merge made with `GITHUB_TOKEN` starts no other workflow (only `workflow_dispatch` / `repository_dispatch` do). One exception: `pull_request` events (`opened`, `synchronize`, `reopened`) on a PR that `GITHUB_TOKEN` opened or updated create runs that wait for approval instead of starting. Stages that must chain are started by a person's merge, a GitHub App, or an explicit `gh workflow run`.
+- **Queue what publishes, cancel what is superseded.** Builds and checks cancel an older run when a newer one starts. `Locale: extract terms` cancels only its wait and queues the extraction. Release, bookkeeping and Docker publish queue instead (`cancel-in-progress: false`).
+
+## Branches
+
+The prefix says who made the branch and what it is for.
+
+| Branch | Made by | Purpose |
+|---|---|---|
+| `locale/**` | Locale workflows and the translation agent | See [locale-pipeline.md](locale-pipeline.md#branches) |
+| `build/<version>` | `Release: start next version` | The "Start `<version>` release" PR that bumps `package.json` |
+| `release/**`, `hotfix/**` | maintainers | Build, test and nightly run on every push |
+| `fix/issue-N-short`, `fix/short`, `ci/short`, `feature/short` | contributors | See `.agents/skills/churchcrm/git-workflow.md` |
+| `dependabot/**` | Dependabot | Dependency bumps; `Dependabot: PR fact-check` comments on them |
+
+## Workflows
+
+### Build, test and quality
+
+| Workflow (file) | Starts on | Does |
+|---|---|---|
+| `Build, Test and Package` (`build-test-package.yml`) | PR to `master`/`develop`/`hotfix/**`; push to those and `release/**`. Skips docs, agent files, Playwright artifacts, tooling config and every workflow file except the two test workflows. A pull request also skips generated translations (`src/locale/i18n`, `src/locale/textdomain`); a push builds them, because the release ZIP ships them | Runs `lint` and `build` first, then the Cypress suites at the site root (`api`, `admin-ui` and `ui` as duration-balanced shards, plus the setup wizard). `build` uploads `ChurchCRM-<version>.zip`, which the release flow reuses. The subdirectory suite runs in the nightly. Details and triage: [`ci-test-infrastructure.md`](../../.agents/skills/churchcrm/ci-test-infrastructure.md) |
+| `Build, Test and Package (Nightly)` (`build-test-nightly.yml`) | 03:17, 11:17 and 19:17 UTC, manual, release published, push to `release/**`. A scheduled run with no testable change since the last green run ends green without testing (`scripts/ci/nightly-needed.js`) | The heavy sweeps: PHP 8.4 and 8.5, the full suite at the root and under `/churchcrm`, full locale sweep (root and subdirectory), upgrade tests |
+| `CI — Typecheck, Lint & Format` (`code-quality.yml`) | push to `master`/`develop`/`hotfix/**`; PRs | `npm run lint` (`scripts/lint/lint.js`): `tsc`, Biome format and lint, UI, icon and Cypress checks, seed data only, install-path URLs, shard timings, MySQL upgrade syntax, locale script tests |
+| `Documentation` (`docs.yml`) | push or PR touching API routes or `docs/openapi/**` | Generates and validates the OpenAPI specs; on `master` it commits the regenerated specs back (its own output paths are excluded from the trigger) |
+
+### Security and Docker
+
+| Workflow (file) | Starts on | Does |
+|---|---|---|
+| `Security: CodeQL` (`security-analysis.yml`) | push to `master`/`develop`, PR to `master`, Mondays 06:00 UTC, manual | CodeQL (JS/TS) and Semgrep (PHP/JS/config) |
+| `Dependabot: PR fact-check` (`dependabot-review.yml`) | Dependabot PRs opened, updated or reopened; manual | One facts-only comment: packages bumped, major or minor, backing alert, transitive changes. Comments only; approval, merge and labels stay with maintainers |
+| `Validate Docker development boundaries` (`docker-security-check.yml`) | PR touching the compose files | Checks the development compose files keep their security boundaries |
+| `Validate production Docker images` (`docker-release-check.yml`) | PR touching `docker/**` or the docker release workflows | Archive validation and non-root startup of the production image |
+| `Build & Push Docker Images` (`docker-release.yml`) | release published, manual | Downloads and verifies the published release, builds and pushes the image to DockerHub (`DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`) |
+
+### Locale
+
+`Locale: extract terms`: see [locale-pipeline.md](locale-pipeline.md#workflows). `Locale: sync POEditor` and `Locale: upload translations` are retired (manual only, removed by the follow-up to [#11416](https://github.com/ChurchCRM/CRM/issues/11416)); translations live in the repo.
+
+### Release
+
+| Workflow (file) | Starts on | Does |
+|---|---|---|
+| `Release & Start Next` (`release-publish.yml`) | manual | Finds the latest green `master` build for the expected version, creates a **draft** release from its zip, writes the release-notes context artifact, then calls `Release: start next version` |
+| `Release: start next version` (`release-prepare.yml`) | manual, or called by `Release & Start Next` | Bumps the version, pushes `build/<version>` and opens the "Start `<version>` release" PR |
+| `Release: bookkeeping` (`release-bookkeeping.yml`) | release published, manual | Stops on a placeholder tag, syncs the changelog file and `CHANGELOG.md` table, advances the CRM release milestone, then sends `crm-released` to the docs repo (`DOCS_RELEASE_TOKEN`), which owns its own milestones and merge |
+
+Publishing the draft is a person's click. That `release: published` event then starts `Build & Push Docker Images`, `Release: bookkeeping` and the nightly upgrade tests.
+
+### Repository upkeep
+
+| Workflow (file) | Starts on | Does |
+|---|---|---|
+| `Issues: weekly metrics` (`weekly-issue-metrics.yml`) | Mondays 00:00 UTC, manual | Attaches responsiveness for issues created in the past 30 days (open and closed), full open-backlog metrics, age buckets, and the ten oldest issues to the run summary and a downloadable `weekly-issue-metrics.md` artifact (90 days). Scheduled runs cover all milestones, including unassigned issues. Manual runs accept an optional exact milestone title, including closed milestones, applied to both queries and the age table. Excludes `automated-report` issues and uses read-only repository permissions. |
+| `Issues: hygiene` (`issue-management.yml`) | issue opened, Mondays 02:00 UTC, manual | Security guard on new issues, stale marking, review of closed stale issues. After 45 quiet days it asks the reporter to reply (that keeps it open). No reply closes it 14 days later. Exempt: `Security`, `security-delete-required`, `Epic`, `good first issue`. At most 30 items per Monday. |
+| `Issues: stamp milestone on merge` (`pr-milestone-stamp.yml`) | PR merged, manual | Puts the merged PR and every issue it `Fixes` on the PR milestone, or on the `package.json` version when the PR has none, and closes those issues if they are still open. Only `Fixes` counts; a mention does not |
+| `Marketing: capture screenshots & videos` (`marketing-capture-assets.yml`) | manual, release start | Captures English first, then 7 more locales (3 devices each), merges them, uploads the artifact `marketing-visuals-<run id>` (30 days) and, on `master` only, starts `Publish visuals` in `ChurchCRM/visuals`, which serves it at https://cdn.churchcrm.io/. Started by `Release & Start Next` as a non-blocking job. Opens no PR |
+| `Marketing: check English captures` (`marketing-capture-check.yml`) | 05:17 UTC daily, manual | English only: setup videos and English screenshots. Uploads `marketing-locale-en-<run id>` for the run. Does not capture other locales and does not publish. Follows the 03:17 UTC nightly |
+
+### Shared building blocks
+
+Composite actions in `.github/actions/`: `checkout-node-npm` (Node from `.nvmrc`, cached `npm ci`), `composer-install` (PHP 8.4, cached Composer), `wait-for-server` (poll a URL), `run-cypress-tests` (Cypress with JUnit and debug artifacts).
+
+## Chains and why they do not loop
+
+The locale chains and their merge table are in [locale-pipeline.md](locale-pipeline.md#why-it-does-not-loop).
+
+```
+Release   Release & Start Next ─► draft release + build/<next> PR
+          person publishes ─► Build & Push Docker Images · Release: bookkeeping · nightly upgrade tests
+```
+
+| Merge or event | Starts | Does not start | Why |
+|---|---|---|---|
+| `Documentation` commits specs | nothing | itself | commit made with `GITHUB_TOKEN`, and `docs/openapi/generated/**` is excluded |
+| draft release created | nothing | docker, bookkeeping | `published` fires only when a person publishes |
+
+## Planned
+
+- Locale items: see [locale-pipeline.md](locale-pipeline.md#planned).
+- One READY / BLOCKED report before releasing.
+- Rename workflows whose display names lack the `<Area>: <what>` form (`Build, Test and Package`, `CI — Typecheck, Lint & Format`, `Documentation`, `Release & Start Next`, `Validate …`, `Build & Push Docker Images`) when you next touch them.

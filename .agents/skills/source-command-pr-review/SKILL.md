@@ -1,0 +1,34 @@
+---
+name: "source-command-pr-review"
+description: "Migrated source command `pr-review`"
+---
+
+# source-command-pr-review
+
+Use this skill when the user asks to run the migrated source command `pr-review`.
+
+## Command Template
+
+# /pr-review
+
+Review a ChurchCRM pull request using the maintainer gates.
+
+**Arguments:** a PR number or URL. If omitted, use the PR already in context.
+
+Read in order:
+
+1. `.agents/skills/churchcrm/maintainer-review-gates.md`
+2. `.agents/skills/churchcrm/pr-review.md`
+3. `.agents/skills/churchcrm/church-review.md`
+
+## Rules
+
+- Draft in chat first. Do not post until a maintainer says to post.
+- Every draft includes the church-user impact line from `pr-review.md` Phase 6.
+- Do not approve. Do not merge.
+- Hard blocks → Request changes. Everything else → Comment.
+- UI changes: require a tablet/mobile manual pass. Ask for screenshots if they exist. Do not block only because shots are missing.
+- Dates, times, numbers, currency, timezone: follow `timezone-handling.md`. API/storage is ISO or naive `sTimeZone` wall-clock. Display settings are not parse formats. Wrong contract is Request changes.
+- Posted reviews include a checkbox list of what is still open.
+- Do not ask for `locale:build`.
+- Be thankful. Do not nitpick.

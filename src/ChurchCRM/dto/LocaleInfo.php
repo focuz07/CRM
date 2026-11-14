@@ -1,0 +1,284 @@
+<?php
+
+namespace ChurchCRM\dto;
+
+use ChurchCRM\model\ChurchCRM\UserSetting;
+
+class LocaleInfo
+{
+    public $systemLocale;
+    public $locale;
+    public $language;
+    public $country;
+    public $dataTables;
+    private $name;
+    private $poLocaleId;
+    private $localeConfig;
+    
+    /**
+     * Static cache for translation data from poeditor.json
+     * Loaded once per request/session since file doesn't change
+     * @var array<int, array<string, mixed>>|null
+     */
+    private static $translationDataCache = null;
+
+    /**
+     * @param UserSetting|string|null $userLocale a staff account's `ui.locale` setting, or a member's language
+     */
+    public function __construct($locale, $userLocale)
+    {
+        $this->systemLocale = $locale;
+        $this->locale = $locale;
+        if ($userLocale instanceof UserSetting) {
+            $userLocale = $userLocale->getValue();
+        }
+        if (is_string($userLocale) && $userLocale !== '') {
+            $this->locale = $userLocale;
+        }
+        
+        // Load locales.json - throw exception if missing (broken installation)
+        $localesPath = SystemURLs::getDocumentRoot() . '/locale/locales.json';
+        $localesFile = file_get_contents($localesPath);
+        $locales = json_decode($localesFile, true, 512);
+        
+        foreach ($locales as $key => $value) {
+            if ($value['locale'] == $this->locale) {
+                $this->name = $key;
+                $this->language = $value['languageCode'];
+                $this->country = $value['countryCode'];
+                $this->dataTables = $value['dataTables'] ?? null;
+                $this->poLocaleId = $value['poEditor'];
+                $this->localeConfig = $value;
+            }
+        }
+    }
+
+    /**
+     * GNU gettext reads the catalog named by LANGUAGE but ignores LANGUAGE while LC_MESSAGES is C/POSIX
+     * (C.UTF-8 included). A host without this OS locale would show every string in English, so LC_MESSAGES
+     * moves to an installed English UTF-8 locale instead.
+     *
+     * @return string|false the OS locale now in effect, or false when this host does not have it
+     */
+    public function activate(): string|false
+    {
+        putenv('LANGUAGE=' . $this->locale);
+        $set = setlocale(LC_ALL, $this->locale, $this->locale . '.UTF-8', $this->locale . '.utf8');
+        if ($set === false) {
+            setlocale(LC_MESSAGES, 'en_US.UTF-8', 'en_US.utf8', 'en_GB.UTF-8', 'en_GB.utf8');
+        }
+
+        return $set;
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getSystemLocale()
+    {
+        return $this->systemLocale;
+    }
+
+    /**
+     * @return string
+     */
+    public function getName()
+    {
+        return $this->name;
+    }
+
+    /**
+     * @return string
+     */
+    public function getPoLocaleId()
+    {
+        return $this->poLocaleId;
+    }
+
+    public function getLocale()
+    {
+        return $this->locale;
+    }
+
+    public function getShortLocale(): string
+    {
+        return substr($this->getLocale(), 0, 2);
+    }
+
+    public function getLanguageCode()
+    {
+        return $this->language;
+    }
+
+    public function getCountryCode()
+    {
+        return $this->country;
+    }
+
+    public function getDataTables()
+    {
+        return $this->dataTables;
+    }
+
+    public function getThousandSeparator(): string
+    {
+        $sep = ',';
+        if ($this->language == 'it_IT') {
+            $sep = '.';
+        }
+
+        return $sep;
+    }
+
+    public function getLocaleArray(): array
+    {
+        $utfList = ['.utf8', '.UTF8', '.utf-8', '.UTF-8'];
+        $localArray = [];
+        $localArray[] = $this->getLanguageCode();
+        foreach ($utfList as $item) {
+            $localArray[] = $this->getLanguageCode() . $item;
+        }
+
+        return $localArray;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function getLocaleInfo(): array
+    {
+        $localeInfo = localeconv();
+        // patch some missing data for Italian.  This shouldn't be necessary!
+        if ($this->language == 'it_IT') {
+            $localeInfo['thousands_sep'] = '.';
+            $localeInfo['frac_digits'] = '2';
+        }
+
+        return $localeInfo;
+    }
+
+    /**
+     * Get the full locale configuration array for JavaScript
+     * @return array<string, mixed>
+     */
+    public function getLocaleConfigArray(): array
+    {
+        return $this->localeConfig ?? [];
+    }
+
+    /**
+     * Get lowercase country code for flag icons (e.g., 'us', 'de', 'fr')
+     */
+    public function getCountryFlagCode(): string
+    {
+        return strtolower($this->country ?? 'us');
+    }
+
+    /**
+     * Check if translation completion percentage should be displayed
+     * (only for locales not marked with skip_audit)
+     */
+    public function shouldShowTranslationPercentage(): bool
+    {
+        // Don't show for locales marked with skip_audit flag (non-translation locales)
+        if ($this->localeConfig && isset($this->localeConfig['skip_audit']) && $this->localeConfig['skip_audit'] === true) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Get the translation completion percentage from POEditor.
+     * Returns 100 if locale is English or not found.
+     */
+    public function getTranslationPercentage(): int
+    {
+        if (!$this->shouldShowTranslationPercentage()) {
+            return 100;
+        }
+
+        $translationData = self::loadTranslationData();
+
+        foreach ($translationData as $poLocale) {
+            if (strtolower($this->poLocaleId ?? '') === strtolower($poLocale['code'])) {
+                return (int) $poLocale['percentage'];
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Load translation data from POEditor file with static caching
+     * File is loaded once per request since it doesn't change during execution
+     * Throws exception if file is missing (indicates broken installation)
+     * @return array<int, array<string, mixed>>
+     */
+    private static function loadTranslationData(): array
+    {
+        // Return cached data if already loaded
+        if (self::$translationDataCache !== null) {
+            return self::$translationDataCache;
+        }
+
+        // Load poeditor.json - throw exception if missing (broken installation)
+        $poeditorPath = SystemURLs::getDocumentRoot() . '/locale/poeditor.json';
+        $poLocalesFile = file_get_contents($poeditorPath);
+        $poLocales = json_decode($poLocalesFile, true, 512);
+
+        if (!isset($poLocales['result']['languages']) || !is_array($poLocales['result']['languages'])) {
+            self::$translationDataCache = [];
+            return [];
+        }
+
+        self::$translationDataCache = $poLocales['result']['languages'];
+        return self::$translationDataCache;
+    }
+
+    /**
+     * Check if translation badge should be shown (non-English and < 90% complete)
+     */
+    public function shouldShowTranslationBadge(): bool
+    {
+        return $this->shouldShowTranslationPercentage() && $this->getTranslationPercentage() < 90;
+    }
+
+    /**
+     * Check if the current locale uses right-to-left text direction
+     * (e.g., Arabic, Hebrew)
+     *
+     * @return bool
+     */
+    public function isRTL(): bool
+    {
+        return isset($this->localeConfig['isRTL']) && $this->localeConfig['isRTL'] === true;
+    }
+
+    /**
+     * Language label in its own script (e.g. "Deutsch", "中文（简体）", "العربية").
+     * Falls back to the English display key when the locales.json entry
+     * has no nativeName (forward-compatible with older data files).
+     */
+    public function getNativeName(): string
+    {
+        $native = $this->localeConfig['nativeName'] ?? null;
+        if (is_string($native) && $native !== '') {
+            return $native;
+        }
+
+        return $this->name ?? '';
+    }
+
+    /**
+     * Geographic region for grouped pickers — one of:
+     * Americas, Europe, Asia, Africa, Middle East, Oceania.
+     * Returns empty string when the entry is missing the field.
+     */
+    public function getRegion(): string
+    {
+        $region = $this->localeConfig['region'] ?? null;
+
+        return is_string($region) ? $region : '';
+    }
+}

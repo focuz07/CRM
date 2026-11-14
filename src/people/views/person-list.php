@@ -1,0 +1,1030 @@
+<?php
+
+use ChurchCRM\Authentication\AuthenticationManager;
+use ChurchCRM\dto\SystemConfig;
+use ChurchCRM\dto\SystemURLs;
+use ChurchCRM\model\ChurchCRM\Family;
+use ChurchCRM\model\ChurchCRM\GroupQuery;
+use ChurchCRM\model\ChurchCRM\ListOptionQuery;
+use ChurchCRM\model\ChurchCRM\PersonCustomMasterQuery;
+use ChurchCRM\model\ChurchCRM\PropertyQuery;
+use ChurchCRM\Service\CustomFieldService;
+use ChurchCRM\Service\GradeService;
+use ChurchCRM\Utils\InputUtils;
+use ChurchCRM\view\PersonDeleteGuard;
+
+/**
+ * This will avoid to call the db twice one to check if empty the other one to return the value
+ * no caching was being done by the ORM so lets keep the value and return if not empty
+ *
+ * @var mixed $stuff
+ */
+function emptyOrUnassigned($stuff)
+{
+    return empty($stuff) ? gettext('Unassigned') : $stuff;
+}
+
+/**
+ * Same as previous but return json encoded
+ *
+ * @var mixed $stuff
+ */
+function emptyOrUnassignedJSON($stuff): string
+{
+    return empty($stuff) ? 'Unassigned' : InputUtils::escapeHTML(json_encode($stuff, JSON_UNESCAPED_UNICODE));
+}
+
+$sPageTitle = gettext(ucfirst($sMode)) . ' ' . gettext('Listing');
+require SystemURLs::getDocumentRoot() . '/Include/Header.php';
+// Load compiled webpack assets for people list
+echo '<link rel="stylesheet" href="' . SystemURLs::getRootPath() . '/skin/v2/people-list.min.css">';
+echo '<script src="' . SystemURLs::getRootPath() . '/skin/v2/people-list.min.js"></script>';
+// Server-side "Send email" needs the Email permission and a working, enabled SMTP setup.
+$canSendEmail = AuthenticationManager::getCurrentUser()->isEmailEnabled() && SystemConfig::isEmailEnabled();
+if ($canSendEmail) {
+    echo '<script src="' . SystemURLs::assetVersioned('/skin/v2/email-composer.min.js') . '" defer nonce="' . SystemURLs::getCSPNonce() . '"></script>';
+}
+// Classification list — each entry is {id, name} so the JS can set option values to
+// the real DB OptionId (not a positional index). This fixes mismatched Classification
+// filter links when OptionId and insertion-sequence diverge (issue #9182).
+$ListItem = ListOptionQuery::create()->select(['OptionId', 'OptionName'])->filterById(1)->find()->toArray();
+$ClassificationList = [];
+$ClassificationList[] = ['id' => 0, 'name' => gettext('Unassigned')];
+foreach ($ListItem as $element) {
+    $ClassificationList[] = ['id' => $element['OptionId'], 'name' => $element['OptionName']];
+}
+// Role list — same {id, name} structure so setValue(OptionId) matches correctly.
+$ListItem = ListOptionQuery::create()->select(['OptionId', 'OptionName'])->filterById(2)->find()->toArray();
+$RoleList = [];
+$RoleList[] = ['id' => 0, 'name' => gettext('Unassigned')];
+foreach ($ListItem as $element) {
+    $RoleList[] = ['id' => $element['OptionId'], 'name' => $element['OptionName']];
+}
+// Person properties list
+$ListItem = PropertyQuery::create()->filterByProClass("p")->find();
+$PropertyList = [];
+foreach ($ListItem as $element) {
+    $PropertyList[] = $element->getProName();
+}
+
+$option_name = fn (string $t1, string $t2): string => $t1 . ':' . $t2;
+
+$allPersonCustomFields = PersonCustomMasterQuery::create()->find();
+
+// Build ordered, security-filtered custom field list for export columns.
+// Each entry becomes its own DataTables column (real name as header, formatted value as cell)
+// in the CSV and Print/PDF export.  The existing single 'Custom' filter column is marked
+// no-export so the raw JSON name-list no longer pollutes the export output.
+// We reuse the already-fetched $allPersonCustomFields collection (sorted in PHP) to avoid
+// an extra DB round-trip.
+$exportCustomFields = iterator_to_array($allPersonCustomFields, false);
+usort($exportCustomFields, fn($a, $b) => $a->getOrder() <=> $b->getOrder());
+$customFieldService = new CustomFieldService();
+$exportCustomFields = array_values(array_filter(
+    $exportCustomFields,
+    fn($cf) => $customFieldService->canView($cf->getFieldSecurity())
+));
+
+// Person custom list
+$ListItem = PersonCustomMasterQuery::create()->select(['Name', 'FieldSecurity', 'Id', 'TypeId', 'Special'])->find();
+
+// CREATE A MAPPING FOR CUSTOMS LIKE THIS
+// CustomMapping = {"c1":{"Name":"Father of confession","Elements":{23:"option1", 24:"option2"}}, c2.... }
+// allowing not only for search if has a custom set but also if is set to a given value.
+$CustomMapping = [];
+
+$CustomList = [];
+
+foreach ($ListItem as $element) {
+    if ($customFieldService->canView($element["FieldSecurity"])) {
+        $CustomList[$element["Name"]] = 0;
+        $CustomMapping[$element["Id"]] = ["Name" => $element["Name"],"Elements" => []];
+        if (in_array($element["TypeId"], [12])) {
+            $ListElements = ListOptionQuery::create()->select(['OptionName', 'OptionId'])->filterById($element["Special"])->find()->toArray();
+            foreach ($ListElements as $element2) {
+                $CustomList[$option_name($element["Name"], $element2["OptionName"])] = 0;
+                $CustomMapping[$element["Id"]]["Elements"][$element2["OptionId"]] = $element2["OptionName"];
+            }
+        }
+    }
+}
+
+// Get person group list
+$GradeList = [['id' => 0, 'name' => gettext('Unassigned')]];
+foreach (GradeService::names() as $gradeId => $gradeName) {
+    $GradeList[] = ['id' => $gradeId, 'name' => $gradeName];
+}
+$ListItem = GroupQuery::create()->find();
+$GroupList = [];
+$GroupList[] ="Unassigned";
+foreach ($ListItem as $element) {
+    $GroupList[] = $element->getName();
+}
+
+// Person list column definitions - defines which columns appear and their data source
+// Note: Some columns are hidden but still needed for DataTable filtering functionality
+// Note: Column names used in filters (Gender, Role, Classification, Properties, Custom, Group) 
+//       must be plain strings (not gettext) for the $columnIdMap to work correctly
+$personListColumns = [
+    (object) ['name' => 'Id', 'displayFunction' => 'getId', 'visible' => 'false', 'emptyOrUnassigned' => 'false'],
+    (object) ['name' => 'Name', 'displayFunction' => 'getFullName', 'visible' => 'true', 'emptyOrUnassigned' => 'false'],
+    (object) ['name' => 'Family Name', 'displayFunction' => 'getFamilyName', 'visible' => 'true', 'emptyOrUnassigned' => 'false'],
+    (object) ['name' => 'Family Status', 'displayFunction' => '', 'visible' => 'false', 'emptyOrUnassigned' => 'false', 'isFamilyStatus' => true],
+    (object) ['name' => 'Phone', 'displayFunction' => 'getPhones', 'visible' => 'true', 'emptyOrUnassigned' => 'false'],
+    (object) ['name' => 'Email', 'displayFunction' => 'getEmail', 'visible' => 'true', 'emptyOrUnassigned' => 'false'],
+    (object) ['name' => 'Classification', 'displayFunction' => 'getClassificationName', 'visible' => 'true', 'emptyOrUnassigned' => 'true'],
+    (object) ['name' => 'Gender', 'displayFunction' => 'getGenderName', 'visible' => 'false', 'emptyOrUnassigned' => 'true'],
+    (object) ['name' => 'Role', 'displayFunction' => 'getFamilyRoleName', 'visible' => 'false', 'emptyOrUnassigned' => 'true'],
+    (object) ['name' => 'Grade', 'displayFunction' => 'getGradeName', 'visible' => 'false', 'emptyOrUnassigned' => 'true'],
+    (object) ['name' => 'Birth Date', 'displayFunction' => 'getFormattedBirthDate', 'visible' => 'false', 'emptyOrUnassigned' => 'false'],
+    (object) ['name' => 'Address', 'displayFunction' => 'getAddress', 'visible' => 'false', 'emptyOrUnassigned' => 'false'],
+    (object) ['name' => 'Properties', 'displayFunction' => 'getPropertiesString', 'visible' => 'false', 'emptyOrUnassigned' => 'true'],
+    (object) ['name' => 'Custom', 'displayFunction' => 'getCustomFields', 'visible' => 'false', 'emptyOrUnassigned' => 'true'],
+    (object) ['name' => 'Group', 'displayFunction' => 'getGroups', 'visible' => 'true', 'emptyOrUnassigned' => 'true'],
+    (object) ['name' => 'Deceased Status', 'displayFunction' => '', 'visible' => 'false', 'emptyOrUnassigned' => 'false', 'isDeceasedStatus' => true],
+];
+
+?>
+
+<?php
+// Calculate data quality status
+$hasDataQualityIssues = $genderDataCheckCount > 0 || $roleDataCheckCount > 0 ||
+                        $classificationDataCheckCount > 0;
+?>
+
+<?php if ($hasDataQualityIssues): ?>
+<!-- Data Quality Alert -->
+<div class="alert alert-warning alert-dismissible fade show mb-3" role="alert">
+    <div class="d-flex align-items-center">
+        <div class="me-3">
+            <i class="fa-solid fa-clipboard-check fa-2x"></i>
+        </div>
+        <div>
+            <strong><?= gettext('Data Quality') ?>:</strong>
+            <?php
+            $issues = [];
+            if ($genderDataCheckCount > 0) {
+                $issues[] = '<a href="' . SystemURLs::getRootPath() . '/people/list?Gender=0" class="alert-link">' .
+                            sprintf(gettext('%d missing gender'), $genderDataCheckCount) . '</a>';
+            }
+            if ($roleDataCheckCount > 0) {
+                $issues[] = '<a href="' . SystemURLs::getRootPath() . '/people/list?FamilyRole=0" class="alert-link">' .
+                            sprintf(gettext('%d missing role'), $roleDataCheckCount) . '</a>';
+            }
+            if ($classificationDataCheckCount > 0) {
+                $issues[] = '<a href="' . SystemURLs::getRootPath() . '/people/list?Classification=0" class="alert-link">' .
+                            sprintf(gettext('%d missing classification'), $classificationDataCheckCount) . '</a>';
+            }
+            echo implode(' · ', $issues);
+            ?>
+        </div>
+    </div>
+    <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+</div>
+<?php endif; ?>
+
+<?php if ($personActiveStatus !== 'all'): ?>
+<div class="alert alert-info d-flex align-items-center mb-3 py-2">
+    <i class="fa-solid fa-info-circle me-2"></i>
+    <div>
+        <?php if ($personActiveStatus === 'active'): ?>
+            <?= gettext('Showing active persons only.') ?>
+            <a href="<?= SystemURLs::getRootPath() ?>/people/list?personActiveStatus=all" class="alert-link ms-1"><?= gettext('View all (including inactive)') ?></a>
+            &middot;
+            <a href="<?= SystemURLs::getRootPath() ?>/people/list?personActiveStatus=inactive" class="alert-link"><?= gettext('View inactive only') ?></a>
+        <?php else: ?>
+            <?= gettext('Showing inactive persons only.') ?>
+            <a href="<?= SystemURLs::getRootPath() ?>/people/list" class="alert-link ms-1"><?= gettext('View active only') ?></a>
+            &middot;
+            <a href="<?= SystemURLs::getRootPath() ?>/people/list?personActiveStatus=all" class="alert-link"><?= gettext('View All') ?></a>
+        <?php endif; ?>
+    </div>
+</div>
+<?php endif; ?>
+
+<div class="card mb-3">
+    <div class="card-header">
+        <h3 class="card-title"><i class="fa-solid fa-filter me-1"></i> <span id="filters-title"></span></h3>
+    </div>
+    <div class="card-body">
+        <div class="row g-3">
+            <!-- Demographics and Classification Row -->
+            <div class="col-12 col-sm-6 col-lg-3">
+                <div class="mb-0">
+                    <label class="form-label" id="label-family-status"></label>
+                    <select class="form-select filter-FamilyStatus" multiple="multiple"></select>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-lg-3">
+                <div class="mb-0">
+                    <label class="form-label" id="label-gender"></label>
+                    <select class="form-select filter-Gender" multiple="multiple"></select>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-lg-3">
+                <div class="mb-0">
+                    <label class="form-label" id="label-classification"></label>
+                    <select class="form-select filter-Classification" multiple="multiple"></select>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-lg-3">
+                <div class="mb-0">
+                    <label class="form-label" id="label-role"></label>
+                    <select class="form-select filter-Role" multiple="multiple"></select>
+                </div>
+            </div>
+            <!-- Extended Attributes Row -->
+            <div class="col-12 col-sm-6 col-lg-4">
+                <div class="mb-0">
+                    <label class="form-label" id="label-properties"></label>
+                    <select class="form-select filter-Properties" multiple="multiple"></select>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-lg-4">
+                <div class="mb-0">
+                    <label class="form-label" id="label-custom"></label>
+                    <select class="form-select filter-Custom" multiple="multiple"></select>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-lg-4">
+                <div class="mb-0">
+                    <label class="form-label" id="label-group"></label>
+                    <select class="form-select filter-Group" multiple="multiple"></select>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-lg-4">
+                <div class="mb-0">
+                    <label class="form-label"><?= gettext('Deceased') ?></label>
+                    <select class="form-select filter-DeceasedStatus" multiple="multiple">
+                        <option value="<?= gettext('Living') ?>"><?= gettext('Living') ?></option>
+                        <option value="<?= gettext('Deceased') ?>"><?= gettext('Deceased') ?></option>
+                    </select>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-lg-4">
+                <div class="mb-0">
+                    <label class="form-label"><?= gettext('Grade') ?></label>
+                    <select class="form-select filter-Grade" multiple="multiple"></select>
+                </div>
+            </div>
+        </div>
+        <div class="mt-3">
+            <button id="ClearFilter" type="button" class="btn btn-secondary w-100">
+                <i class="fa-solid fa-xmark me-1"></i> <span id="clear-filter-text"></span>
+            </button>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3 class="card-title"><i class="fa-solid fa-users me-1"></i> <span id="people-title"></span></h3>
+        <div class="card-actions btn-list">
+            <button id="AddAllToCart" type="button" class="btn btn-sm btn-primary">
+                <i class="fa-solid fa-cart-plus me-1"></i> <span id="add-all-cart-text"></span>
+            </button>
+            <button id="RemoveAllFromCart" type="button" class="btn btn-sm btn-outline-danger">
+                <i class="fa-solid fa-trash me-1"></i> <span id="remove-all-cart-text"></span>
+            </button>
+        </div>
+    </div>
+    <div class="card-body">
+        <table id="members" class="table table-vcenter table-hover data-table mb-0">
+            <thead>
+                <tr>
+                    <?php 
+                    // Map of column names to localized display titles
+                    $htmlColumnTitleMap = [
+                        'Id' => gettext('ID'),
+                        'Name' => gettext('Name'),
+                        'Family Name' => gettext('Family Name'),
+                        'Family Status' => gettext('Family Status'),
+                        'Phone' => gettext('Phone'),
+                        'Email' => gettext('Email'),
+                        'Classification' => gettext('Classification'),
+                        'Gender' => gettext('Gender'),
+                        'Role' => gettext('Role'),
+                        'Grade' => gettext('Grade'),
+                        'Birth Date' => gettext('Birth Date'),
+                        'Address' => gettext('Address'),
+                        'Properties' => gettext('Properties'),
+                        'Custom' => gettext('Custom'),
+                        'Group' => gettext('Group'),
+                        'Deceased Status' => gettext('Deceased'),
+                    ];
+                    foreach ($personListColumns as $column) {
+                        // Output all columns - DataTables JS config controls visibility
+                        $localizedHeader = $htmlColumnTitleMap[$column->name] ?? $column->name;
+                        // The 'Custom' column holds filter JSON (field names), not user data;
+                        // exclude it from export and add per-field columns below instead.
+                        if ($column->name === 'Custom') {
+                            echo '<th class="no-export">' . $localizedHeader . '</th>';
+                        } else {
+                            echo '<th>' . $localizedHeader . '</th>';
+                        }
+                    }
+                    // Export columns: one <th> per accessible custom field with real name as header.
+                    // These are hidden on-screen (DataTables visibility config below) but included
+                    // in CSV/Print export so users see actual field values, not the filter JSON.
+                    foreach ($exportCustomFields as $cf) {
+                        echo '<th>' . InputUtils::escapeHTML($cf->getName()) . '</th>';
+                    } ?>
+                    <th class="no-export w-1"><?= gettext('Actions') ?></th>
+                </tr>
+            </thead>
+            <tbody>
+            <!--Populate the table with person details -->
+            <?php foreach ($members as $person) {
+              /* @var $members ChurchCRM\people */
+
+                ?>
+            <tr>
+                <?php
+                $columns = $personListColumns;
+                // Fetch custom-field data once per person (single DB round-trip):
+                // returns both the filter name-list (for the hidden 'Custom' column)
+                // and the per-field formatted values (for the export columns).
+                $customFieldsResult  = $person->getCustomFieldsAll(
+                    $allPersonCustomFields,
+                    $CustomMapping,
+                    $CustomList,
+                    $option_name,
+                    $exportCustomFields
+                );
+                $customFilterNames   = $customFieldsResult['filterNames'];
+                $customExportValues  = $customFieldsResult['exportValues'];
+                foreach ($columns as $column) {
+                    // Output ALL columns - DataTables JS config controls visibility
+                    
+                    echo '<td>';
+                    
+                    // Handle special Phone column (merged Home + Cell)
+                    if ($column->displayFunction === 'getPhones') {
+                        $homePhone = $person->getHomePhone();
+                        $cellPhone = $person->getCellPhone();
+                        $hasPhone = false;
+                        if (!empty($homePhone)) {
+                            echo '<i class="fa-solid fa-house text-body-secondary me-1" title="' . gettext('Home') . '"></i>' . InputUtils::escapeHTML($homePhone);
+                            $hasPhone = true;
+                        }
+                        if (!empty($cellPhone)) {
+                            if ($hasPhone) echo '<br>';
+                            echo '<i class="fa-solid fa-mobile-screen text-body-secondary me-1" title="' . gettext('Cell') . '"></i>' . InputUtils::escapeHTML($cellPhone);
+                            $hasPhone = true;
+                        }
+                        if (!$hasPhone) {
+                            echo '<span class="text-body-secondary">—</span>';
+                        }
+                    }
+                    // Handle other columns
+                    else {
+                        // Skip method call for Family Status or Deceased Status columns (handled separately below)
+                        if (!isset($column->isFamilyStatus) || $column->isFamilyStatus !== true) {
+                            if (isset($column->isDeceasedStatus) && $column->isDeceasedStatus === true) {
+                                $columnData = '';
+                            } elseif ($column->displayFunction === 'getCustomFields') {
+                                // Use pre-fetched result from getCustomFieldsAll (no extra DB query)
+                                $columnData = $customFilterNames;
+                            } else {
+                                $columnData = [$person, $column->displayFunction]();
+                            }
+                        } else {
+                            // For Family Status, compute status from the Family object
+                            if (isset($column->isFamilyStatus) && $column->isFamilyStatus === true) {
+                                $family = $person->getFamily();
+                                $columnData = ($family) ? $family->getStatusText() : gettext('Active');
+                            }
+                        }
+                        
+                        // Make family name clickable to family view
+                        if ($column->displayFunction === 'getFamilyName') {
+                            $familyLink = '<a href="' . Family::getFamilyViewURIForId((int) $person->getFamId()) . '">' . InputUtils::escapeHTML($columnData) . '</a>';
+                            // Check if family is inactive using Family::isActive()
+                            $family = $person->getFamily();
+                            if ($family && !$family->isActive()) {
+                                echo $familyLink . ' <span class="badge bg-light text-dark" title="' . gettext('Inactive') . '">';
+                                echo '<i class="fa-solid fa-power-off"></i> ' . gettext('Inactive');
+                                echo '</span>';
+                            } else {
+                                echo $familyLink;
+                            }
+                        }
+                        // Make email clickable with mailto link
+                        elseif ($column->displayFunction === 'getEmail') {
+                            if (!empty($columnData)) {
+                                echo '<a href="mailto:' . InputUtils::escapeAttribute($columnData) . '" target="_blank" rel="noopener noreferrer">' . InputUtils::escapeHTML($columnData) . '</a>';
+                                if ($canSendEmail) {
+                                    echo ' <button type="button" class="btn btn-sm btn-ghost-primary py-0 px-1" data-email-composer'
+                                        . ' data-email-person-id="' . (int) $person->getId() . '"'
+                                        . ' data-email-address="' . InputUtils::escapeAttribute($columnData) . '"'
+                                        . ' data-email-name="' . InputUtils::escapeAttribute($person->getFullName()) . '"'
+                                        . ' data-email-title="' . InputUtils::escapeAttribute(sprintf(gettext('Email %s'), $person->getFullName())) . '"'
+                                        . ' title="' . gettext('Send email from ChurchCRM') . '"><i class="fa-solid fa-paper-plane"></i></button>';
+                                }
+                            } else {
+                                echo '<span class="text-body-secondary">—</span>';
+                            }
+                        }
+                        // Make person name clickable and add gender icon, role, and photo icon
+                        elseif (in_array($column->displayFunction, ['getFullName', 'getFirstName', 'getLastName'], true)) {
+                            echo '<a href="' . $person->getViewURI() . '" class="fw-bold">' . InputUtils::escapeHTML($columnData) . '</a>';
+                            // Add deceased badge
+                            if ($person->isDeceased()) {
+                                echo ' <span class="badge bg-secondary-lt text-secondary" title="' . gettext('Deceased') . '"><i class="fa-solid fa-cross"></i></span>';
+                            }
+                            if ($person->getNeedsReview()) {
+                                echo ' <span class="badge bg-warning-lt text-warning ms-1" title="' . gettext('Pending review') . '"><i class="fa-solid fa-user-clock"></i> ' . gettext('Pending review') . '</span>';
+                            }
+                            // Add role in parentheses
+                            $role = $person->getFamilyRoleName();
+                            if (!empty($role) && $role !== 'Unassigned') {
+                                echo ' <span class="text-body-secondary small">(' . InputUtils::escapeHTML($role) . ')</span>';
+                            }
+                            // Add gender icon
+                            $gender = $person->getGender();
+                            if ($gender == 1) { // Male
+                                echo ' <i class="fa-solid fa-mars text-primary" title="' . gettext('Male') . '"></i>';
+                            } elseif ($gender == 2) { // Female
+                                echo ' <i class="fa-solid fa-venus text-danger" title="' . gettext('Female') . '"></i>';
+                            }
+                            // Add photo icon if person has photo
+                            if ($column->displayFunction === 'getFullName' && $person->getPhoto()->hasUploadedPhoto()) {
+                                echo ' <button class="btn btn-sm btn-outline-secondary view-person-photo ms-1" data-person-id="' . $person->getId() . '" title="' . gettext('View Photo') . '">';
+                                echo '<i class="fa-solid fa-camera"></i>';
+                                echo '</button>';
+                            }
+                            // Add inactive badge if person is deactivated
+                            if ($column->displayFunction === 'getFullName' && !$person->isActive()) {
+                                echo ' <span class="badge bg-light text-dark ms-1" title="' . gettext('Inactive') . '">';
+                                echo '<i class="fa-solid fa-power-off"></i> ' . gettext('Inactive');
+                                echo '</span>';
+                            }
+                        }
+                        // Format groups nicely as badges - include hidden JSON for filtering
+                        elseif ($column->displayFunction === 'getGroups') {
+                            if (is_array($columnData) && !empty($columnData)) {
+                                // Always render badges for display
+                                foreach ($columnData as $group) {
+                                    echo '<span class="badge bg-info-lt text-info me-1">' . InputUtils::escapeHTML($group) . '</span>';
+                                }
+                                // Add hidden span with JSON for DataTables filtering
+                                echo '<span class="d-none">' . InputUtils::escapeHTML(json_encode($columnData, JSON_UNESCAPED_UNICODE)) . '</span>';
+                            } else {
+                                echo '<span class="text-body-secondary">—</span>';
+                            }
+                        }
+                        // Handle Family Status column (hidden for filter)
+                        elseif (isset($column->isFamilyStatus) && $column->isFamilyStatus === true) {
+                            $family = $person->getFamily();
+                            echo ($family) ? InputUtils::escapeHTML($family->getStatusText()) : InputUtils::escapeHTML(gettext('Active'));
+                        }
+                        // Handle Deceased Status column (hidden for filter)
+                        elseif (isset($column->isDeceasedStatus) && $column->isDeceasedStatus === true) {
+                            echo $person->isDeceased() ? InputUtils::escapeHTML(gettext('Deceased')) : InputUtils::escapeHTML(gettext('Living'));
+                        }
+                        // Handle Gender column (hidden for filter) 
+                        elseif ($column->displayFunction === 'getGenderName') {
+                            $genderValue = $person->getGender();
+                            if ($genderValue == 1) {
+                                echo 'Male';
+                            } elseif ($genderValue == 2) {
+                                echo 'Female';
+                            } else {
+                                echo 'Unassigned';
+                            }
+                        }
+                        // Handle Role column (hidden for filter)
+                        elseif ($column->displayFunction === 'getFamilyRoleName') {
+                            echo InputUtils::escapeHTML((string) emptyOrUnassigned($columnData));
+                        }
+                        // Handle Properties column (hidden for filter)
+                        elseif ($column->displayFunction === 'getPropertiesString') {
+                            if (is_array($columnData) && !empty($columnData)) {
+                                // Output as JSON for quote-based filter matching (HTML-escaped to prevent XSS)
+                                echo InputUtils::escapeHTML(json_encode($columnData, JSON_UNESCAPED_UNICODE));
+                            } else {
+                                echo 'Unassigned';
+                            }
+                        }
+                        // Handle Custom column (hidden for filter)
+                        elseif ($column->displayFunction === 'getCustomFields') {
+                            if (is_array($columnData) && !empty($columnData)) {
+                                // Output as JSON for quote-based filter matching (HTML-escaped to prevent XSS)
+                                echo InputUtils::escapeHTML(json_encode($columnData, JSON_UNESCAPED_UNICODE));
+                            } else {
+                                echo 'Unassigned';
+                            }
+                        }
+                        // Handle Family Status column (hidden for filter)
+                        elseif ($column->emptyOrUnassigned === 'true') {
+                            if (is_array($columnData)) {
+                                echo emptyOrUnassignedJSON($columnData);
+                            } else {
+                                echo InputUtils::escapeHTML((string) emptyOrUnassigned($columnData));
+                            }
+                        } else {
+                            echo InputUtils::escapeHTML((string) $columnData);
+                        }
+                    }
+                    echo '</td>';
+                }
+                ?>
+                <?php
+                // Export columns: per-custom-field values for CSV/Print export.
+                // One <td> per accessible custom field, with the field's real formatted value.
+                // Values come from getCustomFieldsAll() called above (no extra DB query).
+                foreach ($exportCustomFields as $cf) {
+                    echo '<td>' . InputUtils::escapeHTML($customExportValues[$cf->getId()] ?? '') . '</td>';
+                }
+                ?>
+                <td>
+                    <div class="dropdown">
+                        <button class="btn btn-sm btn-ghost-secondary" type="button" data-bs-toggle="dropdown" data-bs-display="static" aria-expanded="false">
+                            <i class="fa-solid fa-ellipsis-vertical"></i>
+                        </button>
+                        <div class="dropdown-menu dropdown-menu-end">
+                            <a class="dropdown-item" href="<?= $person->getViewURI() ?>">
+                                <i class="fa-solid fa-eye me-2"></i><?= gettext('View') ?>
+                            </a>
+                            <?php if (AuthenticationManager::getCurrentUser()->isEditRecordsEnabled()): ?>
+                            <a class="dropdown-item" href="<?= SystemURLs::getRootPath() ?>/PersonEditor.php?PersonID=<?= $person->getId() ?>">
+                                <i class="fa-solid fa-pencil me-2"></i><?= gettext('Edit') ?>
+                            </a>
+                            <?php endif; ?>
+                            <?php if ($person->getFamId()): ?>
+                            <a class="dropdown-item" href="<?= Family::getFamilyViewURIForId((int) $person->getFamId()) ?>">
+                                <i class="fa-solid fa-users me-2"></i><?= gettext('View Family') ?>
+                            </a>
+                            <?php endif; ?>
+                            <div class="dropdown-divider"></div>
+                            <?php $inCart = isset($_SESSION['aPeopleCart']) && in_array($person->getId(), $_SESSION['aPeopleCart'], false); ?>
+                            <button type="button"
+                                class="dropdown-item <?= $inCart ? 'RemoveFromCart text-danger' : 'AddToCart' ?>"
+                                data-cart-id="<?= $person->getId() ?>"
+                                data-cart-type="person"
+                                data-label-add="<?= gettext('Add to Cart') ?>"
+                                data-label-remove="<?= gettext('Remove from Cart') ?>">
+                                <i class="<?= $inCart ? 'fa-solid fa-trash' : 'fa-solid fa-cart-plus' ?> me-2"></i>
+                                <span class="cart-label"><?= $inCart ? gettext('Remove from Cart') : gettext('Add to Cart') ?></span>
+                            </button>
+                            <?php if (AuthenticationManager::getCurrentUser()->isDeleteRecordsEnabled()): ?>
+                            <div class="dropdown-divider"></div>
+                            <button type="button"
+                                class="dropdown-item text-danger delete-person"
+                                data-person_id="<?= $person->getId() ?>"
+                                data-person_name="<?= InputUtils::escapeAttribute($person->getFullName()) ?>"<?= PersonDeleteGuard::attributes((int) $person->getId()) ?>>
+                                <i class="fa-solid fa-trash me-2"></i><?= gettext('Delete') ?>
+                            </button>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </td>
+            </tr>
+            <?php
+            }
+            //lets clean all the customs that don't have anyone associated.
+            foreach ($CustomList as $key => $value) {
+                if ($value > 0) {
+                    $tmp[] = $key;
+                }
+            }
+            $CustomList = $tmp;
+
+            ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script nonce="<?= SystemURLs::getCSPNonce() ?>" >
+
+    var oTable;
+
+    function initializePeopleList() {
+        // Prevent double initialization
+        if (oTable) {
+            return;
+        }
+
+        // setup filters
+        var filterByClsId = '<?= $filterByClsId ?>';
+        var filterByFmrId = '<?= $filterByFmrId ?>';
+        var filterByGender = '<?= $filterByGender ?>';
+
+        // Set all i18next translations
+        $('#filters-title').text(i18next.t('Filters'));
+        $('#label-gender').text(i18next.t('Gender'));
+        $('#label-classification').text(i18next.t('Classification'));
+        $('#label-role').text(i18next.t('Role'));
+        $('#label-properties').text(i18next.t('Properties'));
+        $('#label-custom').text(i18next.t('Custom'));
+        $('#label-family-status').text(i18next.t('Family Status'));
+        $('#label-group').text(i18next.t('Group'));
+        $('#clear-filter-text').text(i18next.t('Clear Filter'));
+        $('#people-title').text(i18next.t('People'));
+        $('#add-all-cart-text').text(i18next.t('Add All to Cart'));
+        $('#remove-all-cart-text').text(i18next.t('Remove All from Cart'));
+
+        // setup datatables
+        'use strict';
+        let dataTableConfig = {
+            deferRender: true,
+            search: { regex: true },
+            columnDefs: [
+                <?php
+                $columnId = -1;
+                $columns = $personListColumns;
+                foreach ($columns as $column) {
+                    $columnId++;
+                    if ($column->visible === 'false') {
+                        echo"{ targets:" . $columnId .", visible: false },\n";
+                    }
+                }
+                // Export custom-field columns are hidden on-screen but included in the export
+                foreach ($exportCustomFields as $cf) {
+                    $columnId++;
+                    echo "{ targets:" . $columnId . ", visible: false },\n";
+                }
+                ?>
+            ],
+            columns: [
+                <?php
+                $firstVisibleColumnId = PHP_INT_MAX;
+                $columnId = -1;
+                $columnIdMap = [];
+                $columns = $personListColumns;
+                // Map of column names to localized display titles
+                $columnTitleMap = [
+                    'Id' => gettext('ID'),
+                    'Name' => gettext('Name'),
+                    'Family Name' => gettext('Family Name'),
+                    'Family Status' => gettext('Family Status'),
+                    'Phone' => gettext('Phone'),
+                    'Email' => gettext('Email'),
+                    'Classification' => gettext('Classification'),
+                    'Gender' => gettext('Gender'),
+                    'Role' => gettext('Role'),
+                    'Grade' => gettext('Grade'),
+                    'Birth Date' => gettext('Birth Date'),
+                    'Address' => gettext('Address'),
+                    'Properties' => gettext('Properties'),
+                    'Custom' => gettext('Custom'),
+                    'Group' => gettext('Group'),
+                    'Deceased Status' => gettext('Deceased'),
+                ];
+                foreach ($columns as $column) {
+                    // Include ALL columns - DataTables needs config for each <th>
+                    $columnId++;
+                    $columnIdMap[$column->name] = $columnId;
+                    // Use localized title for display, but keep plain name for filtering
+                    $localizedTitle = $columnTitleMap[$column->name] ?? $column->name;
+                    $columnTitle = ['title' => $localizedTitle];
+                    if ($column->visible !== 'false') {
+                        if ($firstVisibleColumnId > $columnId) {
+                            $firstVisibleColumnId = $columnId;
+                        }
+                    }
+                    echo json_encode($columnTitle) .",\n";
+                }
+                // Export custom-field columns: one title entry per accessible custom field.
+                // These columns are hidden on-screen (see columnDefs above) but exported.
+                foreach ($exportCustomFields as $cf) {
+                    $columnId++;
+                    echo json_encode(['title' => $cf->getName()]) . ",\n";
+                }
+                ?>
+                {
+                    title:i18next.t('Actions'),
+                    orderable: false,
+                    searchable: false
+                }
+            ],
+            // sort by first visible column
+            order: [[ <?php echo $firstVisibleColumnId ?> ,"asc" ]]
+        }
+
+        $.extend(dataTableConfig, window.CRM.plugin.dataTable);
+
+        oTable = $('#members').DataTable(dataTableConfig);
+
+        // Store TomSelect instances and filter configuration for later use
+        var tomSelectInstances = {};
+        var filterConfigs = [
+            { sel: '.filter-Gender', colName: 'Gender', regex: true },
+            { sel: '.filter-Classification', colName: 'Classification', regex: true },
+            { sel: '.filter-Role', colName: 'Role', regex: true },
+            { sel: '.filter-Grade', colName: 'Grade', regex: true },
+            { sel: '.filter-Properties', colName: 'Properties', regex: false },
+            { sel: '.filter-Custom', colName: 'Custom', regex: false },
+            { sel: '.filter-FamilyStatus', colName: 'Family Status', regex: true },
+            { sel: '.filter-Group', colName: 'Group', regex: false },
+            { sel: '.filter-DeceasedStatus', colName: 'Deceased Status', regex: true }
+        ];
+
+        // Function to initialize TomSelect instances (will be called after options are populated)
+        function initializeTomSelectFilters() {
+            filterConfigs.forEach(function(cfg) {
+                $(cfg.sel).each(function () {
+                    if (!this.tomselect) {
+                        var ts = new TomSelect(this, {
+                            plugins: ['remove_button', 'input_autogrow'],
+                            hideSelected: true
+                        });
+                        tomSelectInstances[cfg.colName] = { ts: ts, el: this, regex: cfg.regex };
+                    }
+                });
+            });
+        }
+
+        // Helper to get selected items from TomSelect (returns array of {text, value} objects)
+        function getTomSelectData(colName) {
+            var instance = tomSelectInstances[colName];
+            if (!instance) return [];
+
+            var ts = instance.ts;
+            var selectedValues = ts.getValue();
+
+            // Handle both string and array values
+            if (!Array.isArray(selectedValues)) {
+                selectedValues = selectedValues ? [selectedValues] : [];
+            }
+
+            return selectedValues.map(function(val) {
+                // Find the option element in the underlying select to get its text
+                var optionEl = Array.from(instance.el.options).find(function(o) {
+                    return o.value === val;
+                });
+                return {
+                    value: val,
+                    text: optionEl ? optionEl.textContent : val
+                };
+            });
+        }
+
+        // Prepare filter map for use after TomSelect initialization
+        var filterMap = {
+            'Gender': <?php echo $columnIdMap['Gender'] ?>,
+            'Classification': <?php echo $columnIdMap['Classification'] ?>,
+            'Role': <?php echo $columnIdMap['Role'] ?>,
+            'Grade': <?php echo $columnIdMap['Grade'] ?>,
+            'Properties': <?php echo $columnIdMap['Properties'] ?>,
+            'Custom': <?php echo $columnIdMap['Custom'] ?>,
+            'Family Status': <?php echo $columnIdMap['Family Status'] ?>,
+            'Group': <?php echo $columnIdMap['Group'] ?>,
+            'Deceased Status': <?php echo $columnIdMap['Deceased Status'] ?>
+        };
+
+        function escapeRegExp(string) {
+            return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+        }
+
+        // apply filters
+        function filterColumn(col, search, regEx) {
+            if (!search || search.length === 0) {
+                oTable.column(col).search('', 1, 0, 1).draw();
+                return;
+            }
+
+            var searchTerms = [];
+            search.forEach(function(item) {
+                var text = item.text || item.value;
+                if (regEx) {
+                    searchTerms.push('^' + escapeRegExp(text) + '$');
+                } else {
+                    searchTerms.push('"' + escapeRegExp(text) + '"');
+                }
+            });
+
+            // join array into string with regex or (|)
+            var val = searchTerms.join('|');
+            // apply search
+            oTable.column(col).search(val, 1, 0, 1).draw();
+        }
+
+        // Populate filter option lists via webpack-included initializer + Gender options
+        var Gender = ['Unassigned', 'Male', 'Female'];  // order: 0=Unassigned, 1=Male, 2=Female
+
+        // Append Gender options directly to the Gender select before webpack initializer runs
+        for (var i = 0; i < Gender.length; i++) {
+            $('<option>').val(i).text(Gender[i]).appendTo('.filter-Gender');
+        }
+
+        // Call webpack initializer to populate other filter lists
+        var serverVars = {
+            RoleList: <?= InputUtils::jsonEncodeForScript($RoleList) ?>,
+            PropertyList: <?= InputUtils::jsonEncodeForScript($PropertyList) ?>,
+            CustomList: <?= InputUtils::jsonEncodeForScript($CustomList) ?>,
+            GroupList: <?= InputUtils::jsonEncodeForScript($GroupList) ?>,
+            ClassificationList: <?= InputUtils::jsonEncodeForScript($ClassificationList) ?>,
+            GradeList: <?= InputUtils::jsonEncodeForScript($GradeList) ?>,
+            FamilyStatusList: <?= InputUtils::jsonEncodeForScript([gettext('Active'), gettext('Inactive')]) ?>,
+            DeceasedStatusList: <?= InputUtils::jsonEncodeForScript([gettext('Living'), gettext('Deceased')]) ?>,
+            filterByGender: <?= InputUtils::jsonEncodeForScript($filterByGender) ?>,
+            filterByGradeId: <?= InputUtils::jsonEncodeForScript($filterByGradeId) ?>,
+            filterByClsId: <?= InputUtils::jsonEncodeForScript($filterByClsOptionId) ?>,
+            filterByFmrId: <?= InputUtils::jsonEncodeForScript($filterByFmrOptionId) ?>,
+            familyActiveStatus: <?= InputUtils::jsonEncodeForScript($familyActiveStatus) ?>
+        };
+        if (window.initializePeopleListFromServer) {
+            window.initializePeopleListFromServer(serverVars);
+        }
+
+        // NOW initialize TomSelect after all options have been populated
+        initializeTomSelectFilters();
+
+        // Setup filter change handlers using TomSelect's onChange event (now that instances exist)
+        filterConfigs.forEach(function(cfg) {
+            var instance = tomSelectInstances[cfg.colName];
+            if (instance && instance.ts) {
+                instance.ts.on('change', function(value) {
+                    var searchData = getTomSelectData(cfg.colName);
+                    var colId = filterMap[cfg.colName];
+                    filterColumn(colId, searchData, cfg.regex);
+                });
+            }
+        });
+
+        // Determine which filters need to be triggered based on URL params
+        var shouldTriggerClassificationFilter = (serverVars.filterByClsId !== '');
+        var shouldTriggerRoleFilter = (serverVars.filterByFmrId !== '');
+        var shouldTriggerGenderFilter = (serverVars.filterByGender !== '');
+        var shouldTriggerFamilyStatusFilter = false;
+        if (serverVars.familyActiveStatus === 'active' || serverVars.familyActiveStatus === 'inactive') {
+            shouldTriggerFamilyStatusFilter = true;
+        }
+
+        // clear external filters
+        document.getElementById("ClearFilter").addEventListener("click", function() {
+            // Clear all TomSelect instances
+            Object.keys(tomSelectInstances).forEach(function(colName) {
+                var instance = tomSelectInstances[colName];
+                if (instance && instance.ts) {
+                    instance.ts.clear(); // default silent=false: onChange fires and filterColumn() resets the DataTable
+                }
+            });
+        });
+
+        // Helper function to collect all filtered people IDs from the table
+        function collectFilteredPeople() {
+            // Guard: ensure oTable is initialized
+            if (!oTable || typeof oTable.rows !== 'function') {
+                return [];
+            }
+            
+            var listPeople = [];
+            var currentPage = oTable.page();
+            var currentPageLength = oTable.page.len();
+            
+            // Temporarily show all rows to ensure all are in DOM
+            oTable.page.len(-1).draw(false);
+            
+            // Get all matching rows and collect their person IDs
+            oTable.rows({ search: 'applied' }).every(function () {
+                var node = this.node();
+                // Find any button with data-cart-id (works for both AddToCart and RemoveFromCart)
+                var personId = $(node).find('[data-cart-id]').first().data('cart-id');
+                
+                if (personId) {
+                    listPeople.push(personId);
+                }
+            });
+            
+            // Restore pagination to original state
+            oTable.page.len(currentPageLength).draw(false);
+            oTable.page(currentPage).draw(false);
+            
+            return listPeople;
+        }
+
+        $("#AddAllToCart").click(function(){
+            var filteredCount = oTable.rows({ search: 'applied' }).count();
+            
+            if (filteredCount === 0) {
+                window.CRM.cartManager.showNotification('warning', i18next.t('No people to add - filter returned no results'));
+                return;
+            }
+            
+            var listPeople = collectFilteredPeople();
+            
+            if (listPeople.length > 0) {
+                window.CRM.cartManager.addPerson(listPeople, {
+                    showNotification: true,
+                    reloadPage: false,
+                    callback: function() {
+                        updateCartButtonStates();
+                    }
+                });
+            } else {
+                window.CRM.cartManager.showNotification('warning', i18next.t('No people to add - all are already in cart'));
+            }
+        });
+
+        $("#RemoveAllFromCart").click(function(){
+            // Get the count and list of filtered rows that will be removed
+            var listPeople = collectFilteredPeople();
+            var filteredCount = listPeople.length;
+            
+            window.CRM.confirmAction(
+              i18next.t("Remove from Cart"),
+              i18next.t("Remove") +"" + filteredCount +"" + i18next.t("people from cart?"),
+              () => {
+                if (listPeople.length > 0) {
+                    // Don't pass confirm: true since we already showed bootbox confirmation above
+                    window.CRM.cartManager.removePerson(listPeople, {
+                        showNotification: true,
+                        reloadPage: false,
+                        confirm: false,
+                        callback: function() {
+                            updateCartButtonStates();
+                        }
+                    });
+                }
+              },
+              { confirmLabel: i18next.t("Yes, Remove"), cancelLabel: i18next.t("Cancel") },
+            );
+        });
+
+        // Update button cart states after DataTable draws (page change, filter change, etc)
+        oTable.on('draw.dt', function() {
+            updateCartButtonStates();
+        });
+        
+        // Function to update button states for all visible rows based on cart status
+        function updateCartButtonStates() {
+            // Guard: only run if oTable is initialized
+            if (!oTable || !window.CRM.APIRequest) {
+                return;
+            }
+            
+            // Fetch current cart state from server
+            window.CRM.APIRequest({
+                method:"GET",
+                path:"cart/",
+                suppressErrorDialog: true,
+            }).done(function(data) {
+                // Use CartManager's syncButtonStates to update all buttons
+                if (window.CRM.cartManager && window.CRM.cartManager.syncButtonStates) {
+                    window.CRM.cartManager.syncButtonStates(
+                        data.PeopleCart || [],
+                        data.FamiliesInCart || [],
+                        data.GroupsInCart || []
+                    );
+                }
+            });
+        }
+        
+        // Apply initial filters from URL parameters via TomSelect API
+        // This ensures filters are set and properly trigger DataTable updates.
+        // NOTE: setValue(value, false) — silent=false so onChange fires and filterColumn() is called.
+        // Using silent=true would visually select the option but never apply the DataTable search.
+        setTimeout(function() {
+            // Set Gender filter if specified
+            if (shouldTriggerGenderFilter && filterByGender) {
+                var genderIndex = Gender.indexOf(filterByGender);
+                if (genderIndex !== -1 && tomSelectInstances['Gender']) {
+                    tomSelectInstances['Gender'].ts.setValue(String(genderIndex), false);
+                }
+            }
+
+            // Set Classification filter if specified
+            if (shouldTriggerClassificationFilter && tomSelectInstances['Classification']) {
+                // filterByClsOptionId comes from the route and is an integer
+                tomSelectInstances['Classification'].ts.setValue(String(serverVars.filterByClsId), false);
+            }
+
+            if (serverVars.filterByGradeId !== '' && tomSelectInstances['Grade']) {
+                tomSelectInstances['Grade'].ts.setValue(String(serverVars.filterByGradeId), false);
+            }
+
+            // Set Role filter if specified
+            if (shouldTriggerRoleFilter && tomSelectInstances['Role']) {
+                // filterByFmrOptionId comes from the route and is an integer
+                tomSelectInstances['Role'].ts.setValue(String(serverVars.filterByFmrId), false);
+            }
+
+            // Set Family Status filter if specified
+            if (shouldTriggerFamilyStatusFilter && tomSelectInstances['Family Status']) {
+                if (serverVars.familyActiveStatus === 'active') {
+                    tomSelectInstances['Family Status'].ts.setValue(serverVars.FamilyStatusList[0], false);
+                } else if (serverVars.familyActiveStatus === 'inactive') {
+                    tomSelectInstances['Family Status'].ts.setValue(serverVars.FamilyStatusList[1], false);
+                }
+            }
+
+            // Default: hide deceased — only show Living persons unless filter is cleared
+            if (tomSelectInstances['Deceased Status']) {
+                tomSelectInstances['Deceased Status'].ts.setValue(serverVars.DeceasedStatusList[0], false);
+            }
+        }, 100);
+    } // end initializePeopleList
+
+    // Wait for locales to load before initializing
+    $(document).ready(function () {
+        window.CRM.onLocalesReady(initializePeopleList);
+        // Photo viewer click handlers are registered globally in avatar-loader.ts
+        // .delete-person clicks are handled globally by CRMJSOM.js
+    });
+
+</script>
+<?php
+require SystemURLs::getDocumentRoot() .  '/Include/Footer.php';

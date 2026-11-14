@@ -1,0 +1,317 @@
+/**
+ * Sunday School class view — Copy/Move members to another group.
+ *
+ * Uses BS5 modals with TomSelect (same pattern as person-group-manager.js).
+ * Reads person IDs from `.ss-member[data-person-id][data-role]` elements.
+ */
+(() => {
+  var SS_MODAL_ID = "ssActionModal";
+
+  function createModal(title, bodyHtml) {
+    var existing = document.getElementById(SS_MODAL_ID);
+    if (existing) {
+      existing.querySelectorAll("select").forEach((sel) => {
+        try {
+          if (sel.tomselect) sel.tomselect.destroy();
+        } catch (e) {}
+      });
+      var old = window.bootstrap.Modal.getInstance(existing);
+      if (old) old.dispose();
+      existing.remove();
+    }
+
+    var wrapper = document.createElement("div");
+    wrapper.id = SS_MODAL_ID;
+    wrapper.className = "modal fade";
+    wrapper.innerHTML =
+      '<div class="modal-dialog modal-dialog-centered">' +
+      '<div class="modal-content">' +
+      '<div class="modal-header"><h5 class="modal-title">' +
+      title +
+      "</h5>" +
+      '<button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>' +
+      '<div class="modal-body">' +
+      bodyHtml +
+      "</div>" +
+      '<div class="modal-footer">' +
+      '<button type="button" class="btn btn-ghost-secondary" data-bs-dismiss="modal">' +
+      i18next.t("Cancel") +
+      "</button>" +
+      '<button type="button" class="btn btn-primary" id="ssModalConfirmBtn" disabled>' +
+      i18next.t("Save") +
+      "</button>" +
+      "</div></div></div>";
+
+    document.body.appendChild(wrapper);
+    var modal = new window.bootstrap.Modal(wrapper);
+    var confirmBtn = wrapper.querySelector("#ssModalConfirmBtn");
+
+    wrapper.addEventListener(
+      "hidden.bs.modal",
+      () => {
+        modal.dispose();
+        wrapper.remove();
+      },
+      { once: true },
+    );
+
+    return { modal: modal, el: wrapper, confirm: confirmBtn };
+  }
+
+  function populateSelect(selectEl, items) {
+    selectEl.innerHTML = "";
+    for (var i = 0; i < items.length; i++) {
+      var opt = document.createElement("option");
+      opt.value = items[i].value;
+      opt.textContent = items[i].text;
+      selectEl.appendChild(opt);
+    }
+  }
+
+  function showGroupAndRoleModal(title, callback) {
+    var body =
+      '<div class="mb-3"><label class="form-label">' +
+      i18next.t("Group") +
+      "</label>" +
+      '<select id="ss-group-select"></select></div>' +
+      '<div class="mb-3 d-none" id="ss-role-wrapper"><label class="form-label">' +
+      i18next.t("Role") +
+      "</label>" +
+      '<select id="ss-role-select"></select></div>';
+
+    var result = createModal(title, body);
+    var selectedGroupId = null;
+    var selectedRoleId = null;
+
+    window.CRM.groups.get().done((groups) => {
+      var groupEl = document.getElementById("ss-group-select");
+      populateSelect(
+        groupEl,
+        groups.map((g) => ({ value: String(g.Id), text: g.Name })),
+      );
+
+      result.el.addEventListener(
+        "shown.bs.modal",
+        () => {
+          var roleWrapper = document.getElementById("ss-role-wrapper");
+          var roleEl = document.getElementById("ss-role-select");
+          var tsGroup = null;
+          var tsRole = null;
+          // Guard: if the modal closes before getRoles() AJAX resolves, bail out
+          // of the .done() callback to prevent creating a TomSelect on a detached
+          // element (which would leave orphaned body > .ts-dropdown nodes).
+          var isOpen = true;
+
+          tsGroup = new window.TomSelect(groupEl, {
+            placeholder: i18next.t("Search groups..."),
+            items: [],
+            dropdownParent: "body",
+            onChange: (value) => {
+              selectedGroupId = value || null;
+              if (!value) {
+                roleWrapper.classList.add("d-none");
+                result.confirm.disabled = true;
+                return;
+              }
+              if (tsRole) {
+                try {
+                  tsRole.destroy();
+                } catch (e) {}
+                tsRole = null;
+              }
+              roleEl.innerHTML = "";
+              roleWrapper.classList.add("d-none");
+
+              window.CRM.groups.getRoles(value).done((roles) => {
+                if (!isOpen) return; // modal closed before AJAX resolved
+                if (roles.length === 0) {
+                  selectedRoleId = null;
+                  result.confirm.disabled = false;
+                  return;
+                }
+                if (roles.length === 1) {
+                  selectedRoleId = String(roles[0].OptionId);
+                  result.confirm.disabled = false;
+                  return;
+                }
+                populateSelect(
+                  roleEl,
+                  roles.map((r) => ({ value: String(r.OptionId), text: i18next.t(r.OptionName) })),
+                );
+                roleWrapper.classList.remove("d-none");
+                result.confirm.disabled = false;
+                tsRole = new window.TomSelect(roleEl, {
+                  dropdownParent: "body",
+                  onChange: (v) => {
+                    selectedRoleId = v || null;
+                  },
+                });
+                selectedRoleId = String(roles[0].OptionId);
+              });
+            },
+          });
+          // Destroy TomSelect instances on close so body > .ts-dropdown is removed.
+          result.el.addEventListener(
+            "hidden.bs.modal",
+            () => {
+              isOpen = false; // prevent in-flight getRoles() from creating orphaned TomSelect
+              try {
+                if (tsGroup) tsGroup.destroy();
+              } catch (e) {}
+              try {
+                if (tsRole) tsRole.destroy();
+              } catch (e) {}
+            },
+            { once: true },
+          );
+        },
+        { once: true },
+      );
+
+      result.modal.show();
+    });
+
+    result.confirm.addEventListener("click", () => {
+      if (!selectedGroupId) return;
+      result.confirm.disabled = true;
+      result.modal.hide();
+      callback({ GroupID: selectedGroupId, RoleID: selectedRoleId });
+    });
+  }
+
+  function getPersonIdsByRole(role) {
+    var ids = [];
+    $(".ss-member").each(function () {
+      var $el = $(this);
+      if (role === "all" || $el.data("role") === role) {
+        ids.push(Number($el.data("person-id")));
+      }
+    });
+    return ids;
+  }
+
+  $(document).ready(() => {
+    // Note: email action is handled by the email-composer.min.js bundle
+    // which auto-wires the [data-email-composer] button on the toolbar.
+
+    // ------------------------------------------------------------------ //
+    // Text dropdown: populate on first open
+    // ------------------------------------------------------------------ //
+    var ssTextLoaded = false;
+    $("#ssTextDropdownBtn")
+      .parent()
+      .on("show.bs.dropdown", () => {
+        if (ssTextLoaded) return;
+        ssTextLoaded = true;
+        window.CRM.APIRequest({
+          method: "GET",
+          path: "groups/" + window.CRM.currentGroup + "/sundayschool/phones",
+        }).done((data) => {
+          var menu = $("#ssTextDropdownMenu");
+          menu.empty();
+          if (!data.all || !data.all.phones || !data.all.phones.length) {
+            menu.html('<span class="dropdown-item text-muted">' + i18next.t("No phone numbers available") + "</span>");
+            return;
+          }
+          // All section
+          menu.append(
+            $("<button>", { class: "dropdown-item", "data-action": "copy-phones" })
+              .data("phones", data.all.displayList)
+              .html('<i class="fa-solid fa-copy me-2"></i>' + i18next.t("Copy All Numbers")),
+          );
+          menu.append(
+            $("<button>", { class: "dropdown-item", "data-action": "sms" })
+              .data("phones", data.all.phones)
+              .html('<i class="fa-solid fa-comment-sms me-2"></i>' + i18next.t("Text All")),
+          );
+          // Per-role sections
+          var roleMap = {
+            teachers: { label: i18next.t("Teachers"), icon: "fa-person-chalkboard" },
+            students: { label: i18next.t("Students"), icon: "fa-child" },
+            parents: { label: i18next.t("Parents"), icon: "fa-users" },
+          };
+          $.each(roleMap, (key, meta) => {
+            if (!data[key] || !data[key].phones || !data[key].phones.length) return;
+            menu.append('<div class="dropdown-divider"></div>');
+            menu.append('<h6 class="dropdown-header">' + meta.label + "</h6>");
+            menu.append(
+              $("<button>", { class: "dropdown-item", "data-action": "copy-phones" })
+                .data("phones", data[key].displayList)
+                .html('<i class="fa-solid fa-copy me-2"></i>' + i18next.t("Copy")),
+            );
+            menu.append(
+              $("<button>", { class: "dropdown-item", "data-action": "sms" })
+                .data("phones", data[key].phones)
+                .html('<i class="fa-solid fa-comment-sms me-2"></i>' + i18next.t("Text")),
+            );
+          });
+        });
+      });
+
+    // Handle text actions (delegated)
+    $("#ss-action-toolbar").on("click", "[data-action='copy-phones']", function () {
+      window.CRM.comm.copyPhones($(this).data("phones"));
+    });
+    $("#ss-action-toolbar").on("click", "[data-action='sms']", function () {
+      var phones = $(this).data("phones");
+      if (typeof phones === "string") {
+        try {
+          phones = JSON.parse(phones);
+        } catch (e) {
+          phones = [phones];
+        }
+      }
+      window.CRM.comm.openSms(phones);
+    });
+
+    window.CRM.onLocalesReady(() => {
+      // Copy to Group
+      $(document).on("click", ".ss-copy-role", function (e) {
+        e.preventDefault();
+        var role = $(this).data("role");
+        showGroupAndRoleModal(i18next.t("Copy Members to Group"), (data) => {
+          var ids = getPersonIdsByRole(role);
+          ids.forEach((personId) => {
+            window.CRM.groups.addPerson(data.GroupID, personId, data.RoleID);
+          });
+          if (ids.length > 0) {
+            window.CRM.notify(i18next.t("Members copied: {{total}}", { total: ids.length }), {
+              type: "success",
+              delay: 3000,
+            });
+          }
+        });
+      });
+
+      // Move to Group
+      $(document).on("click", ".ss-move-role", function (e) {
+        e.preventDefault();
+        var role = $(this).data("role");
+        var label = role === "all" ? i18next.t("all members") : $(this).text().trim();
+        window.CRM.confirmAction(
+          i18next.t("Move Members"),
+          i18next.t("Are you sure you want to move") +
+            " <strong>" +
+            window.CRM.escapeHtml(label) +
+            "</strong> " +
+            i18next.t("to another group?"),
+          () => {
+            showGroupAndRoleModal(i18next.t("Move Members to Group"), (data) => {
+              var ids = getPersonIdsByRole(role);
+              ids.forEach((personId) => {
+                window.CRM.groups.addPerson(data.GroupID, personId, data.RoleID);
+                window.CRM.groups.removePerson(window.CRM.currentGroup, personId);
+              });
+              if (ids.length > 0) {
+                setTimeout(() => {
+                  location.reload();
+                }, 1500);
+              }
+            });
+          },
+          { tone: "warning", confirmLabel: i18next.t("Move"), cancelLabel: i18next.t("Cancel") },
+        );
+      });
+    });
+  });
+})();

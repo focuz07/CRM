@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# ChurchCRM pre-commit hook — fast checks scoped to what is staged:
+#   1. Translatable-string rules (.agents/skills/churchcrm/i18n-localization.md)
+#   2. PHP syntax, namespace/use-statement case, and Propel base classes
+# Whole-repo checks run in the pre-push hook (`npm run lint`) and in CI.
+#
+# Enabled automatically by `npm install` (the `prepare` script in
+# package.json points core.hooksPath at this directory). To bypass for
+# emergency hot-fixes only, run with `git commit --no-verify` — but you
+# MUST justify it in the PR description.
+
+set -e
+
+# Skip the hook in CI environments
+if [ -n "$CI" ] || [ -n "$GITHUB_ACTIONS" ]; then
+    exit 0
+fi
+
+# Skip if there is no package.json (e.g. detached worktree)
+if [ ! -f package.json ]; then
+    exit 0
+fi
+
+# run_check <label> <failure message> <command...>
+run_check() {
+    label=$1
+    failure=$2
+    shift 2
+    echo "→ pre-commit: ${label}…"
+    if ! "$@"; then
+        echo ""
+        echo "✘ pre-commit: $failure"
+        echo "  Fix the issues above and re-stage, or bypass in an emergency with:"
+        echo "  git commit --no-verify (justify in PR)."
+        exit 1
+    fi
+    echo "✓ pre-commit: $label passed."
+}
+
+run_check "staged Composer files" "Composer configuration and lock file validation failed." \
+    node scripts/lint/validate-composer-lock.js --staged
+
+run_check "staged translatable strings" "locale-check found issues in the strings you staged." \
+    node scripts/lint/locale-check.js --staged
+run_check "changed PHP files" "PHP validation failed in a changed file." \
+    npm run --silent build:php:validate
+
+exit 0
